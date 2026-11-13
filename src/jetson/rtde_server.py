@@ -7,6 +7,7 @@ Jetson AGX Orin RTDE relay
 
 Protocol (JSON Lines, one message per '\\n'):
   W->J  {"type":"move_joint","positions":[6 floats],"speed":f,"accel":f}
+  W->J  {"type":"move_joint_vel","velocities":[6 floats],"accel":f,"duration":f}
   W->J  {"type":"stop"}   # soft: stopScript
   W->J  {"type":"estop"}  # hard: dashboard "stop"
   J->W  {"type":"robot_state","joints":[...],"tcp_pose":[...],"timestamp":f}
@@ -75,6 +76,16 @@ def process_command(cmd):
             rtde_c.moveJ([float(x) for x in q], speed, accel, True)   # async
         except Exception as e:
             log.warning(f"moveJ failed: {e}")
+    elif t == "move_joint_vel":
+        qd = cmd.get("velocities")
+        if not (isinstance(qd, list) and len(qd) == 6):
+            log.warning(f"move_joint_vel with bad velocities: {qd}"); return
+        accel = float(cmd.get("accel", 3.0))
+        duration = float(cmd.get("duration", 0.1))
+        try:
+            rtde_c.speedJ([float(x) for x in qd], accel, duration)
+        except Exception as e:
+            log.warning(f"speedJ failed: {e}")
     elif t == "stop":
         try: rtde_c.stopScript()
         except Exception as e: log.warning(f"stopScript failed: {e}")

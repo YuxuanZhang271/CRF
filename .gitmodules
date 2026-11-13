@@ -1,0 +1,3 @@
+[submodule "dependencies/kdl_parser"]
+	path = dependencies/kdl_parser
+	url = https://github.com/jvytee/kdl_parser.git

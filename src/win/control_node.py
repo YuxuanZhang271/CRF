@@ -6,7 +6,7 @@ control_node.py — non-ROS Windows port of Ur5EndoFlexNode.
 Same kinematics, modes, flex horizon-twist, hybrid RCM tracking, semi-auto
 commands as robot_node.py. Only the ROS transport is replaced:
   - /joint_states subscription      -> TCP "robot_state" messages
-  - JTC trajectory publication      -> TCP "move_joint" message
+  - JTC trajectory publication      -> TCP "move_joint" / "move_joint_vel"
   - /robot_description subscription -> local URDF file load
   - /flex/* + /joint_states pubs    -> flex_state_callback(dict)
   - RViz MarkerArray                -> removed
@@ -323,7 +323,7 @@ class ControlNode:
                     self._q_cmd = None
                 self._q_meas_prev = self.joint_positions.copy()
 
-    # ---------- arm motion (identical logic, only transport changed) ----------
+    # ---------- arm motion ----------
     def _arm_ready(self):
         with self._lock:
             return self.kin.ready and self.joint_received
@@ -331,9 +331,14 @@ class ControlNode:
     def _arm_linear_step(self, dx_m, dy_m, dz_m, traj_duration=None):
         if not self._arm_ready(): return
         if traj_duration is None: traj_duration = self.dt
+        is_teleop = traj_duration <= self.dt * 2.0
+
         with self._lock:
-            q_now = (self._q_cmd.copy() if self._q_cmd is not None
-                     else self.joint_positions.copy())
+            if is_teleop and self.joint_received:
+                q_now = self.joint_positions.copy()
+            else:
+                q_now = (self._q_cmd.copy() if self._q_cmd is not None
+                         else self.joint_positions.copy())
             rcm_on = self.rcm_enabled
             rcm_pt = None if self.rcm_world_point is None else self.rcm_world_point.copy()
         try:
@@ -361,17 +366,25 @@ class ControlNode:
                     else self.kin.ik_position_only(p_target, q_now))
         if q_target is None: return
         q_target = self._auto_solve_wrist1(q_target)
-        self._send_trajectory(q_target, traj_duration=traj_duration, anchor='cmd')
+        if is_teleop:
+            self._send_velocity(q_target, q_now, traj_duration)
+        else:
+            self._send_trajectory(q_target, traj_duration=traj_duration, anchor='cmd')
 
     def _arm_rcm_tilt(self, angle_right_deg, angle_up_deg, traj_duration=None):
         if not self._arm_ready(): return
         if traj_duration is None: traj_duration = self.dt
+        is_teleop = traj_duration <= self.dt * 2.0
+
         with self._lock:
             rcm_on  = self.rcm_enabled
             rcm_pt  = None if self.rcm_world_point is None else self.rcm_world_point.copy()
             ref_axis = None if self.rcm_ref_axis is None else self.rcm_ref_axis.copy()
-            q_now   = (self._q_cmd.copy() if self._q_cmd is not None
-                       else self.joint_positions.copy())
+            if is_teleop and self.joint_received:
+                q_now = self.joint_positions.copy()
+            else:
+                q_now = (self._q_cmd.copy() if self._q_cmd is not None
+                         else self.joint_positions.copy())
         if not rcm_on or rcm_pt is None or ref_axis is None: return
         try: axis, _, p_tip = self.kin.tube_axis_in_base(q_now)
         except Exception: return
@@ -398,7 +411,10 @@ class ControlNode:
         q_target = self.kin.ik_with_rcm(p_target, rcm_pt, q_now)
         if q_target is None: return
         q_target = self._auto_solve_wrist1(q_target)
-        self._send_trajectory(q_target, traj_duration=traj_duration, anchor='cmd')
+        if is_teleop:
+            self._send_velocity(q_target, q_now, traj_duration)
+        else:
+            self._send_trajectory(q_target, traj_duration=traj_duration, anchor='cmd')
 
     def _auto_solve_wrist1(self, q):
         q = np.array(q, float).copy()
@@ -875,6 +891,24 @@ class ControlNode:
             log.info(f"TRACKING locked on {key}: d={dist_m*100:.1f}cm aim={aim_deg:.2f}°")
 
     # ---------- transport (only place that talks to Jetson for motion) ----------
+    def _send_velocity(self, q_target, q_now, dt):
+        """Smooth continuous teleop: send joint velocity instead of a stream of
+        short moveJ segments. UR5 speedJ with `duration` ~3x dt keeps the motion
+        smooth and stops the arm automatically if commands stop arriving."""
+        q_target = np.asarray(q_target, float)
+        q_now    = np.asarray(q_now, float)
+        q_dot = (q_target - q_now) / max(float(dt), 1e-6)
+        # UR5 joint speed limit ~3.14 rad/s; conservative cap.
+        q_dot = np.clip(q_dot, -2.0, 2.0)
+        with self._lock:
+            self._q_cmd = None  # velocity mode has no position accumulator
+        self._send({
+            "type": "move_joint_vel",
+            "velocities": [float(x) for x in q_dot],
+            "accel": 3.0,
+            "duration": max(float(dt) * 3.0, 0.1),
+        })
+
     def _send_trajectory(self, q_target, traj_duration=None, anchor='measured'):
         """Same anchor semantics as robot_node.py. Transport = TCP."""
         if traj_duration is None: traj_duration = self.TRAJ_DURATION_S
