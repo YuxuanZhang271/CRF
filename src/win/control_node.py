@@ -99,6 +99,7 @@ class ControlNode:
 
         self._q_cmd       = None
         self._q_meas_prev = None
+        self._teleop_velocity_active = False   # velocity mode latch
 
         self.flex_steer_yaw = 0.0
         self.flex_base_yaw  = 0.0
@@ -207,6 +208,11 @@ class ControlNode:
 
     def stop(self):
         self._running.clear()
+        # Safety: kill any active velocity motion on shutdown.
+        try:
+            self._send_velocity_stop()
+        except Exception:
+            pass
         for t in (self._recv_thread, self._tick_thread):
             if t and t.is_alive(): t.join(timeout=2.0)
 
@@ -255,6 +261,11 @@ class ControlNode:
                 log.info("FLEX slew cancelled by manual key input.")
             if tracking_active and self._flex_slew_target is not None:
                 self._flex_slew_target = None
+
+        # Velocity mode stop when arm keys released (outside the lock, once
+        # per transition; _teleop_velocity_active is latched by _send_velocity).
+        if not any_arm_key and self._teleop_velocity_active:
+            self._send_velocity_stop()
 
         self._step_flex_slew()
 
@@ -892,21 +903,30 @@ class ControlNode:
 
     # ---------- transport (only place that talks to Jetson for motion) ----------
     def _send_velocity(self, q_target, q_now, dt):
-        """Smooth continuous teleop: send joint velocity instead of a stream of
-        short moveJ segments. UR5 speedJ with `duration` ~3x dt keeps the motion
-        smooth and stops the arm automatically if commands stop arriving."""
         q_target = np.asarray(q_target, float)
         q_now    = np.asarray(q_now, float)
         q_dot = (q_target - q_now) / max(float(dt), 1e-6)
-        # UR5 joint speed limit ~3.14 rad/s; conservative cap.
         q_dot = np.clip(q_dot, -2.0, 2.0)
         with self._lock:
-            self._q_cmd = None  # velocity mode has no position accumulator
+            self._q_cmd = None
+            self._teleop_velocity_active = True
         self._send({
             "type": "move_joint_vel",
             "velocities": [float(x) for x in q_dot],
             "accel": 3.0,
-            "duration": max(float(dt) * 3.0, 0.1),
+            "duration": max(float(dt) * 10.0, 0.3),   # ★ 从 dt*3 改为 dt*10，下限 0.3s
+        })
+
+    def _send_velocity_stop(self):
+        if not self._teleop_velocity_active:
+            return
+        with self._lock:
+            self._teleop_velocity_active = False
+        self._send({
+            "type": "move_joint_vel",
+            "velocities": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "accel": 3.0,
+            "duration": 0.3,          # ★ 与运动指令保持一致
         })
 
     def _send_trajectory(self, q_target, traj_duration=None, anchor='measured'):

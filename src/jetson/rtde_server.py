@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Jetson AGX Orin RTDE relay
+Jetson AGX Orin RTDE relay (fixed)
 - TCP Server : 192.168.55.1:9000  (Windows PC client)
 - RTDE client: 192.168.1.10:30004 (UR5)
 
-Protocol (JSON Lines, one message per '\\n'):
-  W->J  {"type":"move_joint","positions":[6 floats],"speed":f,"accel":f}
-  W->J  {"type":"move_joint_vel","velocities":[6 floats],"accel":f,"duration":f}
-  W->J  {"type":"stop"}   # soft: stopScript
-  W->J  {"type":"estop"}  # hard: dashboard "stop"
-  J->W  {"type":"robot_state","joints":[...],"tcp_pose":[...],"timestamp":f}
+修复点：
+  1. move_joint 前调用 stopJ() 释放运动锁，避免 "Another thread is already controlling the robot"
+  2. stop 命令改为 stopJ()，不再误杀 External Control 程序
+  3. speedJ duration 下限提高到 0.3s，防止看门狗超时
 """
 import socket, json, threading, time, logging, sys
 
@@ -54,6 +52,19 @@ def dashboard_stop():
     except Exception as e:
         log.error(f"Dashboard STOP failed: {e}")
 
+# ---------------- 释放运动锁的辅助函数 ----------------
+def release_motion_lock():
+    """
+    如果当前有 speedJ 线程在控制机器人，先停止它并等待控制器释放运动锁。
+    stopJ 是同步的，返回后运动锁即被释放，后续 moveJ 不会冲突。
+    """
+    try:
+        rtde_c.stopJ(3.0)          # 3 rad/s² 减速度，立即停止关节运动
+        time.sleep(0.05)            # 给控制器一个周期释放锁
+        log.debug("Motion lock released via stopJ()")
+    except Exception as e:
+        log.warning(f"stopJ() failed: {e}")
+
 # ---------------- Client / command handling ----------------
 client_lock = threading.Lock()
 client_conn = None
@@ -66,7 +77,11 @@ def send_json(conn, obj):
 
 def process_command(cmd):
     t = cmd.get("type")
+
     if t == "move_joint":
+        # ★ 关键修复：在 moveJ 之前释放速度控制的运动锁
+        release_motion_lock()
+
         q = cmd.get("positions")
         if not (isinstance(q, list) and len(q) == 6):
             log.warning(f"move_joint with bad positions: {q}"); return
@@ -74,23 +89,33 @@ def process_command(cmd):
         accel = float(cmd.get("accel", 0.5))
         try:
             rtde_c.moveJ([float(x) for x in q], speed, accel, True)   # async
+            log.info("moveJ dispatched after motion-lock release")
         except Exception as e:
             log.warning(f"moveJ failed: {e}")
+
     elif t == "move_joint_vel":
         qd = cmd.get("velocities")
         if not (isinstance(qd, list) and len(qd) == 6):
             log.warning(f"move_joint_vel with bad velocities: {qd}"); return
         accel = float(cmd.get("accel", 3.0))
-        duration = float(cmd.get("duration", 0.1))
+        # ★ 提高 duration 下限，防止看门狗超时
+        duration = max(float(cmd.get("duration", 0.1)), 0.3)
         try:
             rtde_c.speedJ([float(x) for x in qd], accel, duration)
         except Exception as e:
             log.warning(f"speedJ failed: {e}")
+
     elif t == "stop":
-        try: rtde_c.stopScript()
-        except Exception as e: log.warning(f"stopScript failed: {e}")
+        # ★ 只停运动，不杀 External Control 程序
+        try:
+            rtde_c.stopJ(3.0)
+            log.warning("stopJ sent (soft stop)")
+        except Exception as e:
+            log.warning(f"stopJ failed: {e}")
+
     elif t == "estop":
         dashboard_stop()
+
     else:
         log.warning(f"unknown command {t}")
 
@@ -162,5 +187,5 @@ if __name__ == "__main__":
         tcp_server()
     except KeyboardInterrupt:
         log.info("shutdown")
-        try: rtde_c.stopScript()
+        try: rtde_c.stopJ(3.0)
         except Exception: pass
