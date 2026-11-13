@@ -49,7 +49,7 @@ class ControlNode:
     """Non-ROS port of Ur5EndoFlexNode."""
 
     # ---- same tunables as robot_node.py ----
-    STEP_TICK_HZ        = 30.0
+    STEP_TICK_HZ        = 125.0          # ★ 从 30 Hz 提升到 125 Hz，与 UR5 RTDE 伺服节拍对齐
     ARM_LINEAR_VEL      = 0.025
     ARM_AXIS_VEL        = 0.025
     ARM_TILT_VEL_DEG_S  = 4.0
@@ -218,13 +218,20 @@ class ControlNode:
 
     # ---------------- Tick loop ----------------
     def _tick_loop(self):
+        """★ Hybrid sleep + busy-wait 精确节拍控制。
+        Windows 上 time.sleep() 精度约 15 ms，无法满足 125 Hz (8 ms) 周期。
+        先 sleep 到接近目标时刻，再用 busy-wait 补齐最后 ~1 ms 抖动。"""
         next_t = time.monotonic()
         while self._running.is_set():
             now = time.monotonic()
             if now < next_t:
-                time.sleep(next_t - now)
+                sleep_t = next_t - now
+                if sleep_t > 0.002:
+                    time.sleep(sleep_t - 0.001)   # 留 1 ms 给忙等
+                while time.monotonic() < next_t:
+                    pass                           # busy-wait 补偿 Windows 抖动
             next_t += self.dt
-            if next_t < time.monotonic():   # fell behind
+            if next_t < time.monotonic():         # 严重落后，重置节拍
                 next_t = time.monotonic()
             try:
                 self._tick()
@@ -903,21 +910,30 @@ class ControlNode:
 
     # ---------- transport (only place that talks to Jetson for motion) ----------
     def _send_velocity(self, q_target, q_now, dt):
+        """Smooth continuous teleop via speedJ.
+
+        ★ duration 提到 0.5 s，彻底覆盖 Windows 最坏调度抖动，
+          避免 UR 看门狗误触发导致只动 2~3 秒就停。
+        """
         q_target = np.asarray(q_target, float)
         q_now    = np.asarray(q_now, float)
         q_dot = (q_target - q_now) / max(float(dt), 1e-6)
+        # UR5 joint speed limit ~3.14 rad/s; conservative cap.
         q_dot = np.clip(q_dot, -2.0, 2.0)
         with self._lock:
-            self._q_cmd = None
+            self._q_cmd = None  # velocity mode has no position accumulator
             self._teleop_velocity_active = True
         self._send({
             "type": "move_joint_vel",
             "velocities": [float(x) for x in q_dot],
             "accel": 3.0,
-            "duration": max(float(dt) * 10.0, 0.3),   # ★ 从 dt*3 改为 dt*10，下限 0.3s
+            "duration": max(float(dt) * 5.0, 0.5),   # ★ 0.5 s 看门狗窗口
         })
 
     def _send_velocity_stop(self):
+        """Explicitly send a zero-velocity command to stop an active speedJ
+        motion smoothly. Guarded by _teleop_velocity_active so it only fires
+        once per transition (arm-key release / shutdown)."""
         if not self._teleop_velocity_active:
             return
         with self._lock:
@@ -926,7 +942,7 @@ class ControlNode:
             "type": "move_joint_vel",
             "velocities": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             "accel": 3.0,
-            "duration": 0.3,          # ★ 与运动指令保持一致
+            "duration": 0.5,          # ★ 与运动指令保持一致
         })
 
     def _send_trajectory(self, q_target, traj_duration=None, anchor='measured'):
