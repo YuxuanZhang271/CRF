@@ -3,14 +3,11 @@
 """
 control_node.py — non-ROS Windows port of Ur5EndoFlexNode.
 
-Same kinematics, modes, flex horizon-twist, hybrid RCM tracking, semi-auto
-commands as robot_node.py. Only the ROS transport is replaced:
-  - /joint_states subscription      -> TCP "robot_state" messages
-  - JTC trajectory publication      -> TCP "move_joint" / "move_joint_vel"
-  - /robot_description subscription -> local URDF file load
-  - /flex/* + /joint_states pubs    -> flex_state_callback(dict)
-  - RViz MarkerArray                -> removed
-  - /gastrectomy/targets_state sub  -> set_targets() API (web/caller)
+★ 本版本把 teleop 运动指令从 speedJ（速度）改为 servoJ（位置伺服），
+  因为 speedJ 在 ur_rtde 中是阻塞调用，duration 越长实际更新率越低，
+  导致末端轨迹歪斜、按住按钮 2~3 秒后停止。servoJ 是非阻塞位置指令，
+  配合 rtde_server 的独立 servo_thread 可以严格 125 Hz 更新，
+  每 tick 都基于最新 q_now 重新做 IK，末端沿世界坐标直线运动。
 """
 import json, math, threading, time, logging, socket
 from collections import deque
@@ -48,8 +45,7 @@ log = logging.getLogger("ControlNode")
 class ControlNode:
     """Non-ROS port of Ur5EndoFlexNode."""
 
-    # ---- same tunables as robot_node.py ----
-    STEP_TICK_HZ        = 125.0          # ★ 从 30 Hz 提升到 125 Hz，与 UR5 RTDE 伺服节拍对齐
+    STEP_TICK_HZ        = 125.0          # ★ 与 servo_thread 同步
     ARM_LINEAR_VEL      = 0.025
     ARM_AXIS_VEL        = 0.025
     ARM_TILT_VEL_DEG_S  = 4.0
@@ -59,6 +55,9 @@ class ControlNode:
     TRAJ_DURATION_S     = 3.0
     RCM_CONE_HALF_ANGLE = math.radians(20.0)
     TELEOP_RESYNC_RAD   = 0.05
+
+    # ★ 位置伺服单 tick 的最大关节速度限制（rad/s）；防止 IK 偶发跳变
+    SERVO_MAX_JOINT_VEL = 2.0
 
     def __init__(self, jetson_ip, jetson_port, urdf_path,
                  rcm_point_local=(0,0,-0.30),
@@ -99,7 +98,7 @@ class ControlNode:
 
         self._q_cmd       = None
         self._q_meas_prev = None
-        self._teleop_velocity_active = False   # velocity mode latch
+        self._teleop_servo_active = False       # ★ 位置伺服活跃标记
 
         self.flex_steer_yaw = 0.0
         self.flex_base_yaw  = 0.0
@@ -208,9 +207,8 @@ class ControlNode:
 
     def stop(self):
         self._running.clear()
-        # Safety: kill any active velocity motion on shutdown.
         try:
-            self._send_velocity_stop()
+            self._send_servo_stop()
         except Exception:
             pass
         for t in (self._recv_thread, self._tick_thread):
@@ -218,20 +216,18 @@ class ControlNode:
 
     # ---------------- Tick loop ----------------
     def _tick_loop(self):
-        """★ Hybrid sleep + busy-wait 精确节拍控制。
-        Windows 上 time.sleep() 精度约 15 ms，无法满足 125 Hz (8 ms) 周期。
-        先 sleep 到接近目标时刻，再用 busy-wait 补齐最后 ~1 ms 抖动。"""
+        """★ sleep + busy-wait 精确 8 ms 节拍。"""
         next_t = time.monotonic()
         while self._running.is_set():
             now = time.monotonic()
             if now < next_t:
                 sleep_t = next_t - now
                 if sleep_t > 0.002:
-                    time.sleep(sleep_t - 0.001)   # 留 1 ms 给忙等
+                    time.sleep(sleep_t - 0.001)
                 while time.monotonic() < next_t:
-                    pass                           # busy-wait 补偿 Windows 抖动
+                    pass
             next_t += self.dt
-            if next_t < time.monotonic():         # 严重落后，重置节拍
+            if next_t < time.monotonic():
                 next_t = time.monotonic()
             try:
                 self._tick()
@@ -239,8 +235,7 @@ class ControlNode:
                 log.exception(f"tick error: {e}")
 
     # ==================================================================
-    # The following is a faithful port of Ur5EndoFlexNode._tick and every
-    # helper it calls — unchanged except where ROS I/O used to be.
+    # Tick / helpers
     # ==================================================================
 
     def _tick(self):
@@ -269,10 +264,9 @@ class ControlNode:
             if tracking_active and self._flex_slew_target is not None:
                 self._flex_slew_target = None
 
-        # Velocity mode stop when arm keys released (outside the lock, once
-        # per transition; _teleop_velocity_active is latched by _send_velocity).
-        if not any_arm_key and self._teleop_velocity_active:
-            self._send_velocity_stop()
+        # 松开按键时停掉位置伺服
+        if not any_arm_key and self._teleop_servo_active:
+            self._send_servo_stop()
 
         self._step_flex_slew()
 
@@ -309,7 +303,6 @@ class ControlNode:
         if ks['flex_s']: self._flex_curvature_step(+self.FLEX_CURV_VEL*self.dt); flex_updated=True
         if ks['flex_a']: self._flex_yaw_step(+self.FLEX_YAW_VEL*self.dt);       flex_updated=True
         if ks['flex_d']: self._flex_yaw_step(-self.FLEX_YAW_VEL*self.dt);       flex_updated=True
-        # R/F adjust arc length (used by GUI)
         if ks.get('flex_r'):
             with self._lock:
                 self.flex_arc_len = min(FLEX_ARC_MAX, self.flex_arc_len + self.FLEX_ARC_VEL*self.dt)
@@ -322,7 +315,6 @@ class ControlNode:
         if not flex_updated:
             self._update_flex_state()
 
-    # ---------- teleop housekeeping (identical) ----------
     def _teleop_housekeeping(self, any_arm_key):
         with self._lock:
             if self._q_cmd is None:
@@ -341,7 +333,6 @@ class ControlNode:
                     self._q_cmd = None
                 self._q_meas_prev = self.joint_positions.copy()
 
-    # ---------- arm motion ----------
     def _arm_ready(self):
         with self._lock:
             return self.kin.ready and self.joint_received
@@ -385,7 +376,7 @@ class ControlNode:
         if q_target is None: return
         q_target = self._auto_solve_wrist1(q_target)
         if is_teleop:
-            self._send_velocity(q_target, q_now, traj_duration)
+            self._send_servo(q_target, q_now, traj_duration)   # ★
         else:
             self._send_trajectory(q_target, traj_duration=traj_duration, anchor='cmd')
 
@@ -430,7 +421,7 @@ class ControlNode:
         if q_target is None: return
         q_target = self._auto_solve_wrist1(q_target)
         if is_teleop:
-            self._send_velocity(q_target, q_now, traj_duration)
+            self._send_servo(q_target, q_now, traj_duration)   # ★
         else:
             self._send_trajectory(q_target, traj_duration=traj_duration, anchor='cmd')
 
@@ -463,13 +454,11 @@ class ControlNode:
         with self._lock:
             tgt = self._flex_slew_target
             if tgt is None: return
-            # arc len
             a = self.flex_arc_len
             a_t = min(max(FLEX_ARC_MIN, tgt['arc_len']), FLEX_ARC_MAX)
             step_a = self.FLEX_ARC_VEL*self.dt
             a_new = a_t if abs(a_t-a) <= step_a else a + math.copysign(step_a, a_t-a)
             self.flex_arc_len = min(max(FLEX_ARC_MIN, a_new), FLEX_ARC_MAX)
-            # curvature
             c = self.flex_curvature
             eff = max(1e-6, self.flex_arc_len - FLEX_SEG_LEN)
             kmax = FLEX_MAX_BEND/eff
@@ -477,7 +466,6 @@ class ControlNode:
             step_c = self.FLEX_CURV_VEL*self.dt
             c_new = c_t if abs(c_t-c) <= step_c else c + math.copysign(step_c, c_t-c)
             self.flex_curvature = min(max(0.0, c_new), kmax)
-            # yaw
             y = self.flex_steer_yaw
             y_t = tgt['steer_yaw']
             dy = ((y_t-y+math.pi) % (2*math.pi)) - math.pi
@@ -511,8 +499,6 @@ class ControlNode:
             self.flex_ext_yaw  = 0.0
 
     def _update_flex_state(self):
-        """Replaces _publish_flex_joint_states. Recomputes horizon twist and
-        fans out to the flex_state_callback (Control Card / PCIe driver)."""
         with self._lock:
             eff = max(1e-6, self.flex_arc_len - FLEX_SEG_LEN)
             theta_total = min(FLEX_MAX_BEND, eff * max(0.0, self.flex_curvature))
@@ -674,7 +660,7 @@ class ControlNode:
             q_t = self.kin.ik_along_axis(p_tip_t, axis_next, q_now)
             if q_t is not None:
                 q_t = self._auto_solve_wrist1(q_t)
-                self._send_trajectory(q_t, traj_duration=self.dt)
+                self._send_servo(q_t, q_now, self.dt)     # ★ teleop 单步，用 servo
 
             err_actual = math.degrees(math.acos(float(np.clip(np.dot(axis_cur, ref_axis), -1., 1.))))
             aligned = (np.allclose(axis_next, ref_axis, atol=1e-3) and err_actual < 1.0)
@@ -701,7 +687,7 @@ class ControlNode:
             q_t = self.kin.ik_along_axis(p_tip_t, ref_axis, q_now)
             if q_t is not None:
                 q_t = self._auto_solve_wrist1(q_t)
-                self._send_trajectory(q_t, traj_duration=self.dt)
+                self._send_servo(q_t, q_now, self.dt)     # ★
             if s_end_next >= PULL_OUT_BEHIND_RCM_M - 1e-4 and s_end_cur >= PULL_OUT_BEHIND_RCM_M - 0.003:
                 with self._lock:
                     self._pull_out_state = None; self._flex_slew_target = None
@@ -709,6 +695,9 @@ class ControlNode:
 
     def cmd_stop(self):
         self._send({"type":"stop"})
+        with self._lock:
+            self._teleop_servo_active = False
+            self._q_cmd = None
         log.warning("STOP sent to Jetson")
 
     def cmd_dashboard_stop(self):
@@ -723,7 +712,6 @@ class ControlNode:
         self._track_status_msg = None
 
     def set_targets(self, targets_dict):
-        """targets_dict: {key: [x,y,z]} in base_link frame."""
         with self._lock:
             for k, v in targets_dict.items():
                 self._targets_state[k] = np.array(v, float)
@@ -894,7 +882,7 @@ class ControlNode:
             q_t = self.kin.ik_with_rcm(p_tip_t, rcm_pt, q_now)
             if q_t is not None:
                 q_t = self._auto_solve_wrist1(q_t)
-                self._send_trajectory(q_t, traj_duration=self.dt)
+                self._send_servo(q_t, q_now, self.dt)     # ★
             else:
                 log.warning("TRACKING IK failed; flex only this tick")
 
@@ -908,45 +896,45 @@ class ControlNode:
         if newly:
             log.info(f"TRACKING locked on {key}: d={dist_m*100:.1f}cm aim={aim_deg:.2f}°")
 
-    # ---------- transport (only place that talks to Jetson for motion) ----------
-    def _send_velocity(self, q_target, q_now, dt):
-        """Smooth continuous teleop via speedJ.
-
-        ★ duration 提到 0.5 s，彻底覆盖 Windows 最坏调度抖动，
-          避免 UR 看门狗误触发导致只动 2~3 秒就停。
-        """
+    # ---------- transport ----------
+    def _send_servo(self, q_target, q_now, dt):
+        """★ 位置伺服：每 tick 发送目标关节位置 q_target，而非速度。
+        UR 内部位置环闭环，末端轨迹由 IK 的世界坐标 p_target 保证。"""
         q_target = np.asarray(q_target, float)
         q_now    = np.asarray(q_now, float)
-        q_dot = (q_target - q_now) / max(float(dt), 1e-6)
-        # UR5 joint speed limit ~3.14 rad/s; conservative cap.
-        q_dot = np.clip(q_dot, -2.0, 2.0)
+
         with self._lock:
-            self._q_cmd = None  # velocity mode has no position accumulator
-            self._teleop_velocity_active = True
+            q_base = (self._q_cmd.copy() if self._q_cmd is not None
+                      else q_now.copy())
+
+        # 增量限幅：每 tick 最大关节增量 = SERVO_MAX_JOINT_VEL * dt
+        max_step = self.SERVO_MAX_JOINT_VEL * max(float(dt), 1e-6)
+        delta = q_target - q_base
+        md = float(np.max(np.abs(delta))) if delta.size else 0.0
+        if md > max_step:
+            delta *= max_step / md
+            q_target = q_base + delta
+
+        with self._lock:
+            self._q_cmd = q_target.copy()
+            self._teleop_servo_active = True
+
         self._send({
-            "type": "move_joint_vel",
-            "velocities": [float(x) for x in q_dot],
-            "accel": 3.0,
-            "duration": max(float(dt) * 5.0, 0.5),   # ★ 0.5 s 看门狗窗口
+            "type": "servo_joint",
+            "positions": [float(x) for x in q_target],
         })
 
-    def _send_velocity_stop(self):
-        """Explicitly send a zero-velocity command to stop an active speedJ
-        motion smoothly. Guarded by _teleop_velocity_active so it only fires
-        once per transition (arm-key release / shutdown)."""
-        if not self._teleop_velocity_active:
+    def _send_servo_stop(self):
+        """松开方向键时停掉位置伺服。"""
+        if not self._teleop_servo_active:
             return
         with self._lock:
-            self._teleop_velocity_active = False
-        self._send({
-            "type": "move_joint_vel",
-            "velocities": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            "accel": 3.0,
-            "duration": 0.5,          # ★ 与运动指令保持一致
-        })
+            self._teleop_servo_active = False
+            self._q_cmd = None
+        self._send({"type": "stop"})
 
     def _send_trajectory(self, q_target, traj_duration=None, anchor='measured'):
-        """Same anchor semantics as robot_node.py. Transport = TCP."""
+        """整段轨迹（HOME / PULL OUT / RESET 等低频命令）仍走 moveJ。"""
         if traj_duration is None: traj_duration = self.TRAJ_DURATION_S
         with self._lock:
             if anchor == 'cmd' and self._q_cmd is not None:
@@ -976,7 +964,7 @@ class ControlNode:
             with self._lock:
                 self._q_cmd = np.asarray(q_target, float).copy()
 
-    # ---------- key state (called by web UI) ----------
+    # ---------- key state ----------
     def set_key(self, key, down):
         with self._key_lock:
             if key in self._key_state:
@@ -986,7 +974,7 @@ class ControlNode:
         with self._key_lock:
             for k in self._key_state: self._key_state[k] = False
 
-    # ---------- state snapshot for web UI ----------
+    # ---------- state snapshot ----------
     def get_state_dict(self):
         with self._lock:
             q = self.joint_positions.copy() if self.joint_received else None
