@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-control_node.py — non-ROS Windows port of Ur5EndoFlexNode.
+"""Run EndoFlex kinematics and send joint targets to the Jetson relay."""
+import json
+import logging
+import math
+import socket
+import threading
+import time
 
-★ 本版本把 teleop 运动指令从 speedJ（速度）改为 servoJ（位置伺服），
-  因为 speedJ 在 ur_rtde 中是阻塞调用，duration 越长实际更新率越低，
-  导致末端轨迹歪斜、按住按钮 2~3 秒后停止。servoJ 是非阻塞位置指令，
-  配合 rtde_server 的独立 servo_thread 可以严格 125 Hz 更新，
-  每 tick 都基于最新 q_now 重新做 IK，末端沿世界坐标直线运动。
-"""
-import json, math, threading, time, logging, socket
-from collections import deque
 import numpy as np
 
-from kinematics import EndoscopeKinematics, JOINT_NAMES, HOME_DEG
+from kinematics import EndoscopeKinematics, HOME_DEG
 
 # ---------- copy of flex constants ----------
 FLEX_N          = 8
@@ -41,6 +38,9 @@ TRACK_TARGETS = [
 ]
 
 log = logging.getLogger("ControlNode")
+STATE_TIMEOUT_S = 0.3
+KEY_TIMEOUT_S = 2.0
+MAX_LINE_BYTES = 4096
 
 class ControlNode:
     """Non-ROS port of Ur5EndoFlexNode."""
@@ -85,9 +85,12 @@ class ControlNode:
             log.error(f"URDF load failed ({urdf_path}): {e}")
 
         # --- state ---
+        self.control_lock = threading.RLock()
         self._lock = threading.RLock()
         self.joint_positions = np.zeros(6)
         self.joint_received  = False
+        self._last_joint_at = float("-inf")
+        self._motion_fault = None
 
         self.rcm_enabled      = False
         self.rcm_world_point  = None
@@ -97,8 +100,8 @@ class ControlNode:
         self.flex_mode        = 'fixed'
 
         self._q_cmd       = None
-        self._q_meas_prev = None
         self._teleop_servo_active = False       # ★ 位置伺服活跃标记
+        self._servo_sent_this_tick = False
 
         self.flex_steer_yaw = 0.0
         self.flex_base_yaw  = 0.0
@@ -125,7 +128,7 @@ class ControlNode:
             'flex_w':False,'flex_s':False,'flex_a':False,'flex_d':False,
             'flex_r':False,'flex_f':False,
         }
-        self._key_lock = threading.Lock()
+        self._key_updated = {}
 
         # --- TCP ---
         self._sock         = None
@@ -133,52 +136,76 @@ class ControlNode:
         self._recv_thread  = None
         self._tick_thread  = None
         self._running      = threading.Event()
+        self._shutdown     = threading.Event()
 
     # ---------------- TCP plumbing ----------------
     def _connect(self):
         while self._running.is_set():
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.settimeout(3.0)
-                s.connect((self.jetson_ip, self.jetson_port))
-                s.settimeout(None)
-                with self._lock:
-                    self._sock = s
-                log.info(f"Connected to Jetson {self.jetson_ip}:{self.jetson_port}")
-                self._recv_loop(s)
-            except Exception as e:
-                log.warning(f"Jetson connect failed: {e}; retry in 3s")
-                time.sleep(3.0)
-            finally:
-                with self._lock:
-                    self._sock = None
+                with socket.create_connection((self.jetson_ip, self.jetson_port),
+                                              timeout=2.0) as sock:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.settimeout(0.1)
+                    with self.control_lock, self._lock:
+                        if not self._running.is_set():
+                            return
+                        self._sock = sock
+                        self._last_joint_at = time.monotonic()
+                    log.info("Connected to Jetson %s:%d", self.jetson_ip, self.jetson_port)
+                    try:
+                        self._recv_loop(sock)
+                    finally:
+                        with self.control_lock, self._lock:
+                            self._sock = None
+                            self.joint_received = False
+                            self._last_joint_at = float("-inf")
+                            self._motion_fault = None
+                            self._cancel_motion()
+                            self.arm_mode = 'linear'
+                            self.rcm_enabled = False
+                            self.rcm_world_point = None
+                            self.rcm_ref_axis = None
+                            self.rcm_ref_depth = None
+            except (OSError, ValueError) as e:
+                if self._running.is_set():
+                    log.warning("Jetson connection lost or unavailable: %s", e)
+            self._shutdown.wait(3.0)
 
     def _recv_loop(self, sock):
         buf = b""
         while self._running.is_set():
+            if time.monotonic() - self._last_joint_at > STATE_TIMEOUT_S:
+                raise TimeoutError("joint state timed out")
             try:
-                data = sock.recv(4096)
-                if not data: break
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    if not line.strip(): continue
-                    try:
-                        msg = json.loads(line.decode("utf-8"))
-                        if msg.get("type") == "robot_state":
-                            q = msg.get("joints")
-                            if isinstance(q, list) and len(q) == 6:
-                                with self._lock:
-                                    self.joint_positions = np.array(q, float)
-                                    self.joint_received = True
-                    except json.JSONDecodeError:
-                        pass
-            except Exception as e:
-                log.debug(f"recv error: {e}")
-                break
-        try: sock.close()
-        except Exception: pass
+                data = sock.recv(MAX_LINE_BYTES)
+            except TimeoutError:
+                continue
+            if not data:
+                return
+            lines = (buf + data).split(b"\n")
+            buf = lines.pop()
+            if len(buf) > MAX_LINE_BYTES:
+                raise ValueError("unterminated robot state exceeds size limit")
+            for line in lines:
+                if len(line) > MAX_LINE_BYTES:
+                    raise ValueError("robot state exceeds size limit")
+                try:
+                    msg = json.loads(line)
+                    if not isinstance(msg, dict) or msg.get("type") != "robot_state":
+                        continue
+                    q = msg.get("joints")
+                    if not isinstance(q, list) or len(q) != 6:
+                        continue
+                    if not all(type(v) in (int, float) and math.isfinite(v) for v in q):
+                        continue
+                except (ValueError, OverflowError):
+                    continue
+                with self._lock:
+                    self.joint_positions = np.array(q, float)
+                    self.joint_received = True
+                    self._last_joint_at = time.monotonic()
+                    fault = msg.get("motion_fault")
+                    self._motion_fault = fault if isinstance(fault, str) else None
 
     def _send(self, obj):
         with self._send_lock:
@@ -188,14 +215,26 @@ class ControlNode:
                 log.warning(f"send skipped (not connected): {obj.get('type')}")
                 return False
             try:
-                sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+                sock.sendall((json.dumps(obj, allow_nan=False) + "\n").encode("utf-8"))
                 return True
-            except Exception as e:
+            except OSError as e:
                 log.warning(f"send failed: {e}")
+                self._disconnect_socket(sock)
                 return False
+
+    @staticmethod
+    def _disconnect_socket(sock):
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     # ---------------- Lifecycle ----------------
     def start(self):
+        if self._running.is_set():
+            return
+        self._shutdown.clear()
         self._running.set()
         self._recv_thread = threading.Thread(target=self._connect, daemon=True,
                                              name="tcp-recv")
@@ -206,17 +245,21 @@ class ControlNode:
         log.info(f"ControlNode started @ {self.STEP_TICK_HZ:.0f} Hz")
 
     def stop(self):
-        self._running.clear()
-        try:
-            self._send_servo_stop()
-        except Exception:
-            pass
+        with self.control_lock:
+            self._running.clear()
+            self._shutdown.set()
+            with self._lock:
+                sock = self._sock
+            if sock is not None:
+                self.cmd_stop()
+                self._disconnect_socket(sock)
         for t in (self._recv_thread, self._tick_thread):
-            if t and t.is_alive(): t.join(timeout=2.0)
+            if t and t.is_alive():
+                t.join()
 
     # ---------------- Tick loop ----------------
     def _tick_loop(self):
-        """★ sleep + busy-wait 精确 8 ms 节拍。"""
+        """Schedule control ticks at an 8 ms interval."""
         next_t = time.monotonic()
         while self._running.is_set():
             now = time.monotonic()
@@ -230,7 +273,9 @@ class ControlNode:
             if next_t < time.monotonic():
                 next_t = time.monotonic()
             try:
-                self._tick()
+                with self.control_lock:
+                    if self._running.is_set():
+                        self._tick()
             except Exception as e:
                 log.exception(f"tick error: {e}")
 
@@ -239,12 +284,17 @@ class ControlNode:
     # ==================================================================
 
     def _tick(self):
-        with self._key_lock: ks = dict(self._key_state)
+        with self._lock:
+            fault = self._motion_fault
+        if fault and (self._teleop_servo_active or self._pull_out_state is not None
+                      or self._track_target is not None):
+            self.cmd_stop()
+        now = time.monotonic()
+        for key, updated_at in list(self._key_updated.items()):
+            if now - updated_at > KEY_TIMEOUT_S:
+                self.set_key(key, False)
+        ks = self._key_state
 
-        any_arm_key = any(ks[k] for k in
-                          ('arm_up','arm_down','arm_left','arm_right',
-                           'arm_fwd','arm_bwd'))
-        self._teleop_housekeeping(any_arm_key)
         any_manual_key = any(ks.values())
 
         with self._lock:
@@ -264,10 +314,15 @@ class ControlNode:
             if tracking_active and self._flex_slew_target is not None:
                 self._flex_slew_target = None
 
-        # 松开按键时停掉位置伺服
-        if not any_arm_key and self._teleop_servo_active:
-            self._send_servo_stop()
+        servo_was_active = self._teleop_servo_active
+        self._servo_sent_this_tick = False
+        try:
+            self._step_controls(ks, pull_out_active, tracking_active)
+        finally:
+            if servo_was_active and not self._servo_sent_this_tick:
+                self._send_servo_stop()
 
+    def _step_controls(self, ks, pull_out_active, tracking_active):
         self._step_flex_slew()
 
         if pull_out_active:
@@ -291,63 +346,37 @@ class ControlNode:
         if ks['arm_fwd']: arm_dx -= self.ARM_AXIS_VEL*self.dt
         if ks['arm_bwd']: arm_dx += self.ARM_AXIS_VEL*self.dt
 
-        if arm_dx or arm_dy or arm_dz:
-            self._arm_linear_step(arm_dx, arm_dy, arm_dz, traj_duration=self.dt)
         if arm_tilt_up or arm_tilt_right:
             self._arm_rcm_tilt(math.degrees(arm_tilt_right),
                                math.degrees(arm_tilt_up),
-                               traj_duration=self.dt)
+                               insertion_m=arm_dx)
+        elif arm_dx or arm_dy or arm_dz:
+            self._arm_linear_step(arm_dx, arm_dy, arm_dz)
 
-        flex_updated = False
-        if ks['flex_w']: self._flex_curvature_step(-self.FLEX_CURV_VEL*self.dt); flex_updated=True
-        if ks['flex_s']: self._flex_curvature_step(+self.FLEX_CURV_VEL*self.dt); flex_updated=True
-        if ks['flex_a']: self._flex_yaw_step(+self.FLEX_YAW_VEL*self.dt);       flex_updated=True
-        if ks['flex_d']: self._flex_yaw_step(-self.FLEX_YAW_VEL*self.dt);       flex_updated=True
-        if ks.get('flex_r'):
-            with self._lock:
-                self.flex_arc_len = min(FLEX_ARC_MAX, self.flex_arc_len + self.FLEX_ARC_VEL*self.dt)
-            flex_updated = True
-        if ks.get('flex_f'):
-            with self._lock:
-                self.flex_arc_len = max(FLEX_ARC_MIN, self.flex_arc_len - self.FLEX_ARC_VEL*self.dt)
-            flex_updated = True
-
-        if not flex_updated:
-            self._update_flex_state()
-
-    def _teleop_housekeeping(self, any_arm_key):
         with self._lock:
-            if self._q_cmd is None:
-                if self.joint_received:
-                    self._q_meas_prev = self.joint_positions.copy()
-                return
-            if not any_arm_key:
-                self._q_cmd = None
-                return
-            if self.joint_received:
-                drift = float(np.max(np.abs(self.joint_positions - self._q_cmd)))
-                moved = 1.0 if self._q_meas_prev is None else float(
-                    np.max(np.abs(self.joint_positions - self._q_meas_prev)))
-                if drift > self.TELEOP_RESYNC_RAD and moved < 1e-4:
-                    log.info(f"Teleop integrator re-sync (drift {drift:.3f})")
-                    self._q_cmd = None
-                self._q_meas_prev = self.joint_positions.copy()
+            dk = (ks['flex_s'] - ks['flex_w']) * self.FLEX_CURV_VEL * self.dt
+            dy = (ks['flex_a'] - ks['flex_d']) * self.FLEX_YAW_VEL * self.dt
+            da = (ks['flex_r'] - ks['flex_f']) * self.FLEX_ARC_VEL * self.dt
+            self.flex_arc_len = min(FLEX_ARC_MAX, max(FLEX_ARC_MIN, self.flex_arc_len + da))
+            effective_length = self.flex_arc_len - FLEX_SEG_LEN
+            self.flex_curvature = min(FLEX_MAX_BEND / effective_length,
+                                      max(0.0, self.flex_curvature + dk))
+            self.flex_steer_yaw = (self.flex_steer_yaw + dy + math.pi) % (2 * math.pi) - math.pi
+        self._update_flex_state()
 
     def _arm_ready(self):
         with self._lock:
-            return self.kin.ready and self.joint_received
+            return self.kin.ready and self._motion_fault is None and self._joint_state_fresh()
 
-    def _arm_linear_step(self, dx_m, dy_m, dz_m, traj_duration=None):
+    def _joint_state_fresh(self):
+        return (self.joint_received
+                and time.monotonic() - self._last_joint_at <= STATE_TIMEOUT_S)
+
+    def _arm_linear_step(self, dx_m, dy_m, dz_m):
         if not self._arm_ready(): return
-        if traj_duration is None: traj_duration = self.dt
-        is_teleop = traj_duration <= self.dt * 2.0
 
         with self._lock:
-            if is_teleop and self.joint_received:
-                q_now = self.joint_positions.copy()
-            else:
-                q_now = (self._q_cmd.copy() if self._q_cmd is not None
-                         else self.joint_positions.copy())
+            q_now = self.joint_positions.copy()
             rcm_on = self.rcm_enabled
             rcm_pt = None if self.rcm_world_point is None else self.rcm_world_point.copy()
         try:
@@ -375,25 +404,16 @@ class ControlNode:
                     else self.kin.ik_position_only(p_target, q_now))
         if q_target is None: return
         q_target = self._auto_solve_wrist1(q_target)
-        if is_teleop:
-            self._send_servo(q_target, q_now, traj_duration)   # ★
-        else:
-            self._send_trajectory(q_target, traj_duration=traj_duration, anchor='cmd')
+        self._send_servo(q_target, q_now, self.dt)
 
-    def _arm_rcm_tilt(self, angle_right_deg, angle_up_deg, traj_duration=None):
+    def _arm_rcm_tilt(self, angle_right_deg, angle_up_deg, insertion_m=0.0):
         if not self._arm_ready(): return
-        if traj_duration is None: traj_duration = self.dt
-        is_teleop = traj_duration <= self.dt * 2.0
 
         with self._lock:
             rcm_on  = self.rcm_enabled
             rcm_pt  = None if self.rcm_world_point is None else self.rcm_world_point.copy()
             ref_axis = None if self.rcm_ref_axis is None else self.rcm_ref_axis.copy()
-            if is_teleop and self.joint_received:
-                q_now = self.joint_positions.copy()
-            else:
-                q_now = (self._q_cmd.copy() if self._q_cmd is not None
-                         else self.joint_positions.copy())
+            q_now = self.joint_positions.copy()
         if not rcm_on or rcm_pt is None or ref_axis is None: return
         try: axis, _, p_tip = self.kin.tube_axis_in_base(q_now)
         except Exception: return
@@ -414,16 +434,17 @@ class ControlNode:
             new_axis = self.kin.rotate_about(new_axis, z_world, -theta)
             new_axis /= max(np.linalg.norm(new_axis), 1e-9)
         cos_a = float(np.clip(np.dot(new_axis, ref_axis), -1., 1.))
-        if math.degrees(math.acos(cos_a)) > math.degrees(self.RCM_CONE_HALF_ANGLE):
+        if math.acos(cos_a) > self.RCM_CONE_HALF_ANGLE:
+            if not insertion_m:
+                return
+            new_axis = (p_tip - rcm_pt) / distance
+        if distance + insertion_m < 1e-6:
             return
-        p_target = rcm_pt + distance * new_axis
+        p_target = rcm_pt + (distance + insertion_m) * new_axis
         q_target = self.kin.ik_with_rcm(p_target, rcm_pt, q_now)
         if q_target is None: return
         q_target = self._auto_solve_wrist1(q_target)
-        if is_teleop:
-            self._send_servo(q_target, q_now, traj_duration)   # ★
-        else:
-            self._send_trajectory(q_target, traj_duration=traj_duration, anchor='cmd')
+        self._send_servo(q_target, q_now, self.dt)
 
     def _auto_solve_wrist1(self, q):
         q = np.array(q, float).copy()
@@ -431,18 +452,6 @@ class ControlNode:
         return q
 
     # ---------- flex ----------
-    def _flex_curvature_step(self, dk):
-        with self._lock:
-            self.flex_curvature = max(0.0, self.flex_curvature + dk)
-            eff = max(1e-6, self.flex_arc_len - FLEX_SEG_LEN)
-            self.flex_curvature = min(FLEX_MAX_BEND/eff, self.flex_curvature)
-        self._update_flex_state()
-
-    def _flex_yaw_step(self, dy):
-        with self._lock:
-            self.flex_steer_yaw = (self.flex_steer_yaw + dy + math.pi) % (2*math.pi) - math.pi
-        self._update_flex_state()
-
     def _set_flex_slew_target(self, curvature=None, steer_yaw=None, arc_len=None):
         self._flex_slew_target = {
             'curvature': self.flex_curvature if curvature is None else float(curvature),
@@ -483,7 +492,7 @@ class ControlNode:
             return abs(self.flex_curvature) <= FLEX_STRAIGHT_KAPPA_TOL
 
     def _update_auto_horizon_twist_unlocked(self, theta_total):
-        if self.kin.ready and self.joint_received:
+        if self.kin.ready and self._joint_state_fresh():
             try:
                 by, ey = self.kin.solve_horizon_flex_yaw(
                     q=self.joint_positions, steer_yaw=self.flex_steer_yaw,
@@ -520,6 +529,8 @@ class ControlNode:
     # ---------- modes ----------
     def toggle_arm_mode(self):
         with self._lock:
+            if self.arm_mode == 'linear' and not self._arm_ready():
+                return False
             self._pull_out_state = None
             self._flex_slew_target = None
             self._q_cmd = None
@@ -531,12 +542,14 @@ class ControlNode:
             else:
                 self.arm_mode = 'linear'
                 self.rcm_enabled = False
+                self.rcm_world_point = None
                 self.rcm_ref_axis = None
                 self.rcm_ref_depth = None
                 log.info("Arm mode -> linear")
                 if tracking_was:
                     self._clear_track_state_unlocked()
                     log.warning("TRACKING auto-cancelled (RCM off)")
+        return True
 
     def _capture_rcm_unlocked(self):
         if not (self.kin.ready and self.joint_received):
@@ -560,15 +573,19 @@ class ControlNode:
 
     # ---------- semi-auto ----------
     def cmd_home(self):
+        if not self._arm_ready():
+            return False
         with self._lock:
-            self._pull_out_state = None
+            self._cancel_motion()
             self._set_flex_slew_target(curvature=0., steer_yaw=0., arc_len=FLEX_ARC_MAX)
         self._update_flex_state()
         q_target = np.deg2rad(np.array(HOME_DEG, float))
         q_target = self._auto_solve_wrist1(q_target)
-        self._send_trajectory(q_target, traj_duration=self.TRAJ_DURATION_S)
+        return self._send_trajectory(q_target, traj_duration=self.TRAJ_DURATION_S)
 
     def cmd_reset(self):
+        if not self._arm_ready():
+            return False
         with self._lock:
             self._pull_out_state = None
             self._flex_slew_target = None
@@ -577,14 +594,16 @@ class ControlNode:
             self.arm_mode = 'linear'
             self.flex_mode = 'fixed'
             self.rcm_enabled = False
+            self.rcm_world_point = None
             self.rcm_ref_axis = None
             self.rcm_ref_depth = None
         if tracking_was: log.warning("TRACKING auto-cancelled (RESET)")
-        self.cmd_home()
+        return self.cmd_home()
 
     def cmd_bird_eye_view(self):
-        if not (self.kin.ready and self.joint_received):
-            log.warning("BIRD-EYE waiting for URDF/joints"); return
+        if not self._arm_ready():
+            log.warning("BIRD-EYE waiting for URDF/joints")
+            return False
         with self._lock:
             self._pull_out_state = None
             q_now = self.joint_positions.copy()
@@ -595,8 +614,11 @@ class ControlNode:
             self._set_flex_slew_target(curvature=float(theta_t/eff), steer_yaw=0.)
         self._update_flex_state()
         log.info(f"BIRD-EYE {math.degrees(theta_t):.1f} deg")
+        return True
 
     def cmd_pull_out(self):
+        if not self._arm_ready():
+            return False
         with self._lock:
             rcm_on   = (self.arm_mode == 'rcm' and self.rcm_enabled)
             rcm_pt   = None if self.rcm_world_point is None else self.rcm_world_point.copy()
@@ -604,13 +626,14 @@ class ControlNode:
             q_now    = self.joint_positions.copy()
             self._clear_track_state_unlocked()
         if not (rcm_on and rcm_pt is not None and ref_axis is not None):
-            log.warning("PULL OUT requires RCM mode"); return
-        if not (self.kin.ready and self.joint_received): return
+            log.warning("PULL OUT requires RCM mode")
+            return False
         try:
             axis_cur, _, p_tip_cur = self.kin.tube_axis_in_base(q_now)
             p_end_cur = self.kin.end_cylinder_in_base(q_now)
         except Exception as e:
-            log.warning(f"PULL OUT FK failed: {e}"); return
+            log.warning(f"PULL OUT FK failed: {e}")
+            return False
         d_tip = float(np.linalg.norm(p_tip_cur - rcm_pt))
         if d_tip < 0.05: d_tip = float(self.kin.tube_length)
         tip_from_end = float(np.linalg.norm(p_tip_cur - p_end_cur))
@@ -622,6 +645,7 @@ class ControlNode:
                 's_end_cmd': None,'waiting_logged': False}
         self._update_flex_state()
         log.info("PULL OUT started (align stage)")
+        return True
 
     def _step_pull_out(self):
         if not self._arm_ready(): return
@@ -693,16 +717,25 @@ class ControlNode:
                     self._pull_out_state = None; self._flex_slew_target = None
                 log.info(f"PULL OUT complete ({s_end_cur*100:.1f} cm behind RCM)")
 
+    def _cancel_motion(self):
+        self._key_updated.clear()
+        for key in self._key_state:
+            self._key_state[key] = False
+        self._pull_out_state = None
+        self._flex_slew_target = None
+        self._clear_track_state_unlocked()
+        self._teleop_servo_active = False
+        self._q_cmd = None
+
     def cmd_stop(self):
-        self._send({"type":"stop"})
         with self._lock:
-            self._teleop_servo_active = False
-            self._q_cmd = None
-        log.warning("STOP sent to Jetson")
+            self._cancel_motion()
+        return self._send({"type": "stop"})
 
     def cmd_dashboard_stop(self):
-        self._send({"type":"estop"})
-        log.warning("E-STOP sent to Jetson")
+        with self._lock:
+            self._cancel_motion()
+        return self._send({"type": "estop"})
 
     # ---------- tracking ----------
     def _clear_track_state_unlocked(self):
@@ -712,13 +745,28 @@ class ControlNode:
         self._track_status_msg = None
 
     def set_targets(self, targets_dict):
+        valid_keys = {key for key, _, _ in TRACK_TARGETS}
+        targets = {}
+        for key, value in targets_dict.items():
+            if key not in valid_keys:
+                raise ValueError(f"Unknown tracking target {key}")
+            if not isinstance(value, list) or len(value) != 3:
+                raise ValueError(f"{key} needs three coordinates")
+            try:
+                valid = all(type(v) in (int, float) and math.isfinite(v) for v in value)
+            except OverflowError:
+                valid = False
+            if not valid:
+                raise ValueError(f"{key} coordinates must be finite numbers")
+            targets[key] = np.array(value, float)
         with self._lock:
-            for k, v in targets_dict.items():
-                self._targets_state[k] = np.array(v, float)
+            self._targets_state.update(targets)
 
     def start_tracking(self, key):
-        if key not in {k for k, _, _ in TRACK_TARGETS}:
-            log.warning(f"unknown tracking target {key}"); return
+        if not isinstance(key, str) or key not in {k for k, _, _ in TRACK_TARGETS}:
+            return False
+        if not self._arm_ready():
+            return False
         refusal = None; recovering = False; start_theta = 0.0
         with self._lock:
             rcm_ok = (self.arm_mode == 'rcm' and self.rcm_enabled
@@ -734,11 +782,13 @@ class ControlNode:
                 self._track_recover = start_theta > TRACK_RECOVER_BEND_DEG
                 recovering = self._track_recover
         if refusal:
-            log.warning(f"TRACKING refused for {key}: {refusal}"); return
+            log.warning(f"TRACKING refused for {key}: {refusal}")
+            return False
         if recovering:
             log.info(f"TRACKING recovery: bend {start_theta:.1f}° > "
                      f"{TRACK_RECOVER_BEND_DEG:.0f}°")
         log.info(f"TRACKING started: {key}")
+        return True
 
     def stop_tracking(self):
         with self._lock:
@@ -898,56 +948,47 @@ class ControlNode:
 
     # ---------- transport ----------
     def _send_servo(self, q_target, q_now, dt):
-        """★ 位置伺服：每 tick 发送目标关节位置 q_target，而非速度。
-        UR 内部位置环闭环，末端轨迹由 IK 的世界坐标 p_target 保证。"""
         q_target = np.asarray(q_target, float)
-        q_now    = np.asarray(q_now, float)
+        if q_target.shape != (6,) or not np.isfinite(q_target).all():
+            return False
 
         with self._lock:
-            q_base = (self._q_cmd.copy() if self._q_cmd is not None
-                      else q_now.copy())
+            if not self._arm_ready():
+                return False
+            q_base = self._q_cmd
+            if q_base is None or np.max(np.abs(q_base - q_now)) > self.TELEOP_RESYNC_RAD:
+                q_base = q_now
 
-        # 增量限幅：每 tick 最大关节增量 = SERVO_MAX_JOINT_VEL * dt
-        max_step = self.SERVO_MAX_JOINT_VEL * max(float(dt), 1e-6)
+        max_step = self.SERVO_MAX_JOINT_VEL * dt
         delta = q_target - q_base
-        md = float(np.max(np.abs(delta))) if delta.size else 0.0
+        md = float(np.max(np.abs(delta)))
         if md > max_step:
-            delta *= max_step / md
-            q_target = q_base + delta
+            q_target = q_base + delta * (max_step / md)
 
+        if not self._send({"type": "servo_joint", "positions": q_target.tolist()}):
+            return False
         with self._lock:
             self._q_cmd = q_target.copy()
             self._teleop_servo_active = True
-
-        self._send({
-            "type": "servo_joint",
-            "positions": [float(x) for x in q_target],
-        })
+            self._servo_sent_this_tick = True
+        return True
 
     def _send_servo_stop(self):
-        """松开方向键时停掉位置伺服。"""
-        if not self._teleop_servo_active:
-            return
         with self._lock:
             self._teleop_servo_active = False
             self._q_cmd = None
         self._send({"type": "stop"})
 
-    def _send_trajectory(self, q_target, traj_duration=None, anchor='measured'):
-        """整段轨迹（HOME / PULL OUT / RESET 等低频命令）仍走 moveJ。"""
-        if traj_duration is None: traj_duration = self.TRAJ_DURATION_S
+    def _send_trajectory(self, q_target, traj_duration):
         with self._lock:
-            if anchor == 'cmd' and self._q_cmd is not None:
-                q_base = self._q_cmd.copy()
-            elif self.joint_received:
-                q_base = self.joint_positions.copy()
-            else:
-                q_base = np.asarray(q_target, float).copy()
-            if anchor != 'cmd':
-                self._q_cmd = None
+            if not self._arm_ready():
+                return False
+            q_base = self.joint_positions.copy()
 
-        delta = np.asarray(q_target, float) - q_base
-        max_delta = float(np.max(np.abs(delta))) if delta.size else 0.0
+        q_target = np.asarray(q_target, float)
+        if q_target.shape != (6,) or not np.isfinite(q_target).all():
+            return False
+        max_delta = float(np.max(np.abs(q_target - q_base)))
         if max_delta < 1e-6:
             speed = 0.05
         else:
@@ -955,29 +996,36 @@ class ControlNode:
         speed = float(np.clip(speed, 0.02, 3.0))
         accel = float(np.clip(speed * 2.0, 0.05, 5.0))
 
-        ok = self._send({
+        return self._send({
             "type": "move_joint",
-            "positions": [float(x) for x in q_target],
+            "positions": q_target.tolist(),
             "speed": speed, "accel": accel,
         })
-        if ok and anchor == 'cmd':
-            with self._lock:
-                self._q_cmd = np.asarray(q_target, float).copy()
 
     # ---------- key state ----------
     def set_key(self, key, down):
-        with self._key_lock:
-            if key in self._key_state:
-                self._key_state[key] = bool(down)
+        if key not in self._key_state:
+            return False
+        if down and key.startswith("arm_") and not self._arm_ready():
+            return False
+        self._key_state[key] = down
+        if down:
+            self._key_updated[key] = time.monotonic()
+        else:
+            self._key_updated.pop(key, None)
+        return True
 
-    def set_all_keys_up(self):
-        with self._key_lock:
-            for k in self._key_state: self._key_state[k] = False
+    def refresh_keys(self, held):
+        now = time.monotonic()
+        for key in held:
+            if key in self._key_updated and now - self._key_updated[key] <= KEY_TIMEOUT_S:
+                self._key_updated[key] = now
 
     # ---------- state snapshot ----------
     def get_state_dict(self):
         with self._lock:
-            q = self.joint_positions.copy() if self.joint_received else None
+            fresh = self._joint_state_fresh()
+            q = self.joint_positions.copy() if fresh else None
             eff = max(1e-6, self.flex_arc_len - FLEX_SEG_LEN)
             theta_total = min(FLEX_MAX_BEND, eff*max(0., self.flex_curvature))
             state = {
@@ -1000,8 +1048,9 @@ class ControlNode:
                 'tracking_locked':     self._track_locked,
                 'tracking_refusal':    self._track_status_msg,
                 'jetson_connected':    self._sock is not None,
-                'joints_received':     self.joint_received,
+                'joints_received':     fresh,
                 'kinematics_ready':    self.kin.ready,
+                'motion_fault':        self._motion_fault,
             }
             alpha = self.flex_base_yaw + self.flex_ext_yaw
             tendons = {}

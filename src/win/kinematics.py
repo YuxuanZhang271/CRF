@@ -33,8 +33,10 @@ import numpy as np
 
 try:
     import PyKDL
-    from urdf_parser_py.urdf import URDF
-    from kdl_parser_py.urdf import treeFromUrdfModel
+    try:
+        from kdl_parser.urdf import treeFromString
+    except ImportError:
+        from kdl_parser_py.urdf import treeFromString
     HAS_KDL = True
 except Exception as _e:  # noqa
     print("KDL imports failed:", _e)
@@ -134,13 +136,17 @@ class EndoscopeKinematics:
                 self.logger.warn('KDL not available; Cartesian/RCM disabled.')
             return False
         try:
-            robot = URDF.from_xml_string(urdf_str)
-            ok, tree = treeFromUrdfModel(robot)
+            ok, tree = treeFromString(urdf_str)
             if not ok:
                 raise RuntimeError('treeFromUrdfModel failed')
             self.chain = tree.getChain(self.base_link, self.tip_link)
-            if self.chain.getNrOfJoints() == 0:
-                raise RuntimeError('empty chain base_link -> tip_link')
+            joint_names = [
+                self.chain.getSegment(i).getJoint().getName()
+                for i in range(self.chain.getNrOfSegments())
+                if self.chain.getSegment(i).getJoint().getTypeName() != "Fixed"
+            ]
+            if joint_names != JOINT_NAMES:
+                raise RuntimeError(f"URDF chain joint order does not match RTDE: {joint_names}")
             self.fk_solver = PyKDL.ChainFkSolverPos_recursive(self.chain)
             self.ik_solver = PyKDL.ChainIkSolverPos_LMA(self.chain)
 

@@ -15,17 +15,33 @@
 
 ## Communication Test
 
-### Windows
-```sh
-# 1. On Windows side
-cd path/to/CRF/src/win/
-conda activate zyx
-python app.py --urdf ./ur5_endo_flex.urdf --jetson 192.168.55.1
+Run the commands from the repository root on each machine.
 
-# 2. On Jetson side
-cd path/to/CRF/src/jetson/
+### 1. Jetson
+
+```sh
 conda activate crf
-python rtde_server.py
+python src/jetson/rtde_server.py
 ```
 
-###
+The Jetson environment needs `ur-rtde`. The relay listens on the USB interface at
+`192.168.55.1:9000` and connects to the UR5 at `192.168.1.10`. Use `--host`,
+`--port`, or `--robot-ip` to match a different network configuration.
+
+### 2. Windows
+
+```powershell
+conda activate zyx
+python src/win/app.py
+```
+
+The Windows environment needs NumPy, PyKDL and a URDF-to-KDL parser. If your
+environment has PyKDL and no parser, initialize the submodule and install it
+with `python -m pip install ./dependencies/kdl_parser`. The app loads the
+bundled URDF by default.
+
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Confirm that the joint
+readings appear and Diagnostics shows Jetson connected and kinematics ready.
+The **Dashboard Stop** button sends a program stop to PolyScope. After a
+Dashboard stop or relay motion fault, check the robot before restarting the
+Jetson relay. The physical emergency stop remains on the robot.

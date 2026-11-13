@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-windows_app.py — HTTP control panel + main entry for the Windows PC.
+app.py — HTTP control panel and entry point for the Windows PC.
 
 Usage:
-    python windows_app.py --urdf ./ur5_endo_flex.urdf --jetson 192.168.55.1
+    python app.py --urdf ./ur5_endo_flex.urdf --jetson 192.168.55.1
 """
-import argparse, json, threading, time, logging
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import argparse
+import json
+import logging
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from control_node import ControlNode, TRACK_TARGETS
 
@@ -15,8 +18,6 @@ log = logging.getLogger("WindowsApp")
 
 # Shared across request handlers
 _NODE = None
-_LAST_KEY_TS = time.monotonic()
-_KEY_WATCHDOG_LOCK = threading.Lock()
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>UR5 EndoFlex Control</title>
@@ -35,7 +36,7 @@ button.estop{background:#b82a2a}button.estop:hover{background:#d03a3a}
 button.ok{background:#2a7a4a}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;font:13px ui-monospace,Menlo,Consolas}
 .pad{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
-.pad button{padding:10px 0}
+.pad button{padding:10px 0;touch-action:none}
 .status{font:12px ui-monospace,Menlo,Consolas;color:var(--dim);margin:4px 0;white-space:pre-wrap}
 pre{background:#1a1a2b;padding:8px;border-radius:4px;font-size:11px;margin:0;max-height:180px;overflow:auto}
 .tag-ok{color:var(--ok)}.tag-bad{color:var(--bad)}
@@ -50,7 +51,7 @@ pre{background:#1a1a2b;padding:8px;border-radius:4px;font-size:11px;margin:0;max
   <button onclick="post('/api/cmd/bird_eye')">BIRD-EYE</button>
   <button onclick="post('/api/cmd/pull_out')">PULL OUT</button>
   <button class="ok" onclick="post('/api/cmd/stop')">STOP</button>
-  <button class="estop" onclick="post('/api/cmd/estop')">E-STOP</button>
+  <button class="estop" onclick="post('/api/cmd/estop')">DASHBOARD STOP</button>
 </div>
 
 <div class="row">
@@ -102,27 +103,78 @@ pre{background:#1a1a2b;padding:8px;border-radius:4px;font-size:11px;margin:0;max
 
 <div class="card"><h3>Diagnostics</h3>
   <div class="status" id="diag"></div>
+  <div class="status tag-bad" id="motion-fault"></div>
+  <div class="status tag-bad" id="command-error" aria-live="polite"></div>
 </div>
 
 <script>
-const nodeState = {lastState: null};
-
-function post(path, body) {
-  return fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
-                      body: body ? JSON.stringify(body) : '{}'}).then(r => r.json());
+async function post(path, body = {}, quiet = false) {
+  const error = document.getElementById('command-error');
+  try {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(1000)
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || 'Command refused');
+    if (!quiet) error.textContent = '';
+    return true;
+  } catch (e) {
+    if (!quiet) error.textContent = e.message;
+    return false;
+  }
 }
 
-// press-and-hold buttons
+const held = new Map();
+let keyRequest = Promise.resolve();
+
+function sendKey(key, down, pointerId) {
+  keyRequest = keyRequest.then(() => {
+    if (!down || held.get(key) === pointerId) {
+      return post('/api/key', {key, down}, !down);
+    }
+  });
+}
+
 document.querySelectorAll('button[data-key]').forEach(btn => {
   const key = btn.dataset.key;
-  const dn = e => { e.preventDefault(); post('/api/key', {key, down:true}); };
-  const up = e => { e.preventDefault(); post('/api/key', {key, down:false}); };
-  btn.addEventListener('mousedown', dn);
-  btn.addEventListener('mouseup', up);
-  btn.addEventListener('mouseleave', up);
-  btn.addEventListener('touchstart', dn);
-  btn.addEventListener('touchend', up);
+  btn.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || held.has(key)) return;
+    e.preventDefault();
+    btn.setPointerCapture(e.pointerId);
+    held.set(key, e.pointerId);
+    sendKey(key, true, e.pointerId);
+  });
+  const release = e => {
+    if (held.get(key) !== e.pointerId) return;
+    held.delete(key);
+    sendKey(key, false);
+  };
+  btn.addEventListener('pointerup', release);
+  btn.addEventListener('pointercancel', release);
+  btn.addEventListener('lostpointercapture', release);
+  btn.addEventListener('pointermove', e => {
+    if (e.pointerType !== 'mouse' || held.get(key) !== e.pointerId) return;
+    const rect = btn.getBoundingClientRect();
+    if (e.clientX < rect.left || e.clientX > rect.right ||
+        e.clientY < rect.top || e.clientY > rect.bottom) release(e);
+  });
 });
+
+function releaseKeys() {
+  held.forEach((_, key) => sendKey(key, false));
+  held.clear();
+}
+window.addEventListener('blur', releaseKeys);
+window.addEventListener('pagehide', releaseKeys);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) releaseKeys();
+});
+setInterval(() => {
+  if (held.size) post('/api/key/heartbeat', {held: [...held.keys()]}, true);
+}, 250);
 
 // track buttons
 const TRACK_TARGETS = [ /* injected below */ ];
@@ -148,7 +200,6 @@ function setTargetsPrompt() {
 async function pollState() {
   try {
     const r = await fetch('/api/state'); const s = await r.json();
-    nodeState.lastState = s;
     renderState(s);
   } catch (e) {}
   setTimeout(pollState, 200);
@@ -209,6 +260,7 @@ function renderState(s) {
       `Jetson: <span class="${s.jetson_connected?'tag-ok':'tag-bad'}">${s.jetson_connected?'connected':'offline'}</span> · ` +
       `joints: <span class="${s.joints_received?'tag-ok':'tag-bad'}">${s.joints_received?'ok':'waiting'}</span> · ` +
       `kinematics: <span class="${s.kinematics_ready?'tag-ok':'tag-bad'}">${s.kinematics_ready?'ready':'not ready'}</span>`;
+  document.getElementById('motion-fault').textContent = s.motion_fault || '';
 }
 
 async function init() {
@@ -223,9 +275,12 @@ init();
 """
 
 class _Handler(BaseHTTPRequestHandler):
+    timeout = 2.0
+
     def _send(self, code, ctype, body):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         self.wfile.write(body)
@@ -244,58 +299,65 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, 'text/plain', b'not found')
 
     def do_POST(self):
-        global _LAST_KEY_TS
         try:
             n = int(self.headers.get('Content-Length') or 0)
+            if not 0 <= n <= 4096:
+                raise ValueError("Invalid Content-Length")
+            if n and self.headers.get_content_type() != 'application/json':
+                raise ValueError("Expected application/json")
             body = json.loads(self.rfile.read(n).decode('utf-8')) if n else {}
-        except Exception:
-            body = {}
+            if not isinstance(body, dict):
+                raise ValueError("Expected a JSON object")
+        except (ValueError, TimeoutError) as error:
+            return self._json({'error': str(error)}, 400)
 
-        if self.path == '/api/key':
-            key = body.get('key'); down = bool(body.get('down'))
-            if isinstance(key, str):
-                _NODE.set_key(key, down)
-                with _KEY_WATCHDOG_LOCK:
-                    _LAST_KEY_TS = time.monotonic()
-            return self._json({'ok': True})
+        origin = self.headers.get('Origin')
+        if origin is not None and origin != f"http://{self.headers.get('Host')}":
+            return self._json({'error': 'Request must come from the control panel'}, 403)
 
-        if self.path == '/api/mode/arm':
-            _NODE.toggle_arm_mode(); return self._json({'ok': True})
-        if self.path == '/api/mode/flex':
-            _NODE.toggle_flex_mode(); return self._json({'ok': True})
-        if self.path == '/api/cmd/home':      _NODE.cmd_home(); return self._json({'ok': True})
-        if self.path == '/api/cmd/reset':     _NODE.cmd_reset(); return self._json({'ok': True})
-        if self.path == '/api/cmd/bird_eye':  _NODE.cmd_bird_eye_view(); return self._json({'ok': True})
-        if self.path == '/api/cmd/pull_out':  _NODE.cmd_pull_out(); return self._json({'ok': True})
-        if self.path == '/api/cmd/stop':      _NODE.cmd_stop(); return self._json({'ok': True})
-        if self.path == '/api/cmd/estop':     _NODE.cmd_dashboard_stop(); return self._json({'ok': True})
-
-        if self.path == '/api/track/start':
-            _NODE.start_tracking(body.get('key')); return self._json({'ok': True})
-        if self.path == '/api/track/stop':
-            _NODE.stop_tracking(); return self._json({'ok': True})
-
-        if self.path == '/api/set_targets':
+        with _NODE.control_lock:
             try:
-                _NODE.set_targets(body); return self._json({'ok': True})
-            except Exception as e:
-                return self._json({'error': str(e)}, 400)
+                accepted = self._dispatch(body)
+            except ValueError as error:
+                return self._json({'error': str(error)}, 400)
+            except KeyError:
+                return self._json({'error': 'Unknown endpoint'}, 404)
+        if accepted is False:
+            if self.path in ('/api/cmd/stop', '/api/cmd/estop'):
+                return self._json({'error': 'Stop canceled local motion. Jetson delivery failed.'}, 503)
+            return self._json({'error': 'Command unavailable. Check the current mode and diagnostics.'}, 409)
+        self._json({'ok': True})
 
-        self._send(404, 'text/plain', b'not found')
+    def _dispatch(self, body):
+        if self.path == '/api/key':
+            key, down = body.get('key'), body.get('down')
+            if not isinstance(key, str) or type(down) is not bool:
+                raise ValueError("Expected a key name and a boolean down value")
+            return _NODE.set_key(key, down)
+        if self.path == '/api/key/heartbeat':
+            held = body.get('held')
+            if not isinstance(held, list) or not all(isinstance(key, str) for key in held):
+                raise ValueError("Expected a list of held keys")
+            return _NODE.refresh_keys(held)
+        if self.path == '/api/track/start':
+            return _NODE.start_tracking(body.get('key'))
+        if self.path == '/api/set_targets':
+            return _NODE.set_targets(body)
+        commands = {
+            '/api/mode/arm': _NODE.toggle_arm_mode,
+            '/api/mode/flex': _NODE.toggle_flex_mode,
+            '/api/cmd/home': _NODE.cmd_home,
+            '/api/cmd/reset': _NODE.cmd_reset,
+            '/api/cmd/bird_eye': _NODE.cmd_bird_eye_view,
+            '/api/cmd/pull_out': _NODE.cmd_pull_out,
+            '/api/cmd/stop': _NODE.cmd_stop,
+            '/api/cmd/estop': _NODE.cmd_dashboard_stop,
+            '/api/track/stop': _NODE.stop_tracking,
+        }
+        return commands[self.path]()
 
     def log_message(self, *args):  # silence HTTP access log
         pass
-
-
-def _key_watchdog():
-    """If no key event has come in for 2s, release all keys (browser crashed)."""
-    global _LAST_KEY_TS
-    while True:
-        time.sleep(0.5)
-        with _KEY_WATCHDOG_LOCK:
-            stale = (time.monotonic() - _LAST_KEY_TS) > 2.0
-        if stale and _NODE is not None:
-            _NODE.set_all_keys_up()
 
 
 def main():
@@ -304,11 +366,12 @@ def main():
                         format='[Windows] %(asctime)s - %(message)s')
 
     ap = argparse.ArgumentParser()
-    ap.add_argument('--urdf', required=True,
+    ap.add_argument('--urdf', default=Path(__file__).with_name('ur5_endo_flex.urdf'),
                     help='Path to ur5_endo_flex.urdf (or .xacro output)')
     ap.add_argument('--jetson', default='192.168.55.1')
     ap.add_argument('--port-jetson', type=int, default=9000)
     ap.add_argument('--port-web', type=int, default=8080)
+    ap.add_argument('--host-web', default='127.0.0.1')
     ap.add_argument('--rcm-local', nargs=3, type=float,
                     default=[0.0, 0.0, -0.30])
     ap.add_argument('--tip-local', nargs=3, type=float,
@@ -324,19 +387,15 @@ def main():
         standoff_m=args.standoff,
         flex_state_callback=lambda s: None,  # <-- plug PCIe driver here
     )
-    _NODE.start()
-
-    threading.Thread(target=_key_watchdog, daemon=True).start()
-
-    srv = HTTPServer(('0.0.0.0', args.port_web), _Handler)
-    log.info(f'Web control panel: http://localhost:{args.port_web}')
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        _NODE.stop()
-        srv.server_close()
+    with ThreadingHTTPServer((args.host_web, args.port_web), _Handler) as srv:
+        _NODE.start()
+        log.info("Web control panel listening on %s:%d", args.host_web, args.port_web)
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            _NODE.stop()
 
 if __name__ == '__main__':
     main()
