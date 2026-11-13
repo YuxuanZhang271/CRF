@@ -12,7 +12,12 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from control_node import ControlNode, TRACK_TARGETS
+from control_node import (
+    DEFAULT_JOG_SPEED_SCALE,
+    JOG_SPEED_SCALES,
+    TRACK_TARGETS,
+    ControlNode,
+)
 
 log = logging.getLogger("WindowsApp")
 
@@ -377,6 +382,9 @@ def main():
     ap.add_argument('--tip-local', nargs=3, type=float,
                     default=[0.0, 0.0, 0.20195])
     ap.add_argument('--standoff', type=float, default=0.105)
+    ap.add_argument('--jog-speed-scale', type=float, default=DEFAULT_JOG_SPEED_SCALE,
+                    choices=JOG_SPEED_SCALES,
+                    help='Manual arm speed multiplier (default %(default)s)')
     args = ap.parse_args()
 
     _NODE = ControlNode(
@@ -386,10 +394,12 @@ def main():
         tip_local=args.tip_local,
         standoff_m=args.standoff,
         flex_state_callback=lambda s: None,  # <-- plug PCIe driver here
+        jog_speed_scale=args.jog_speed_scale,
     )
     with ThreadingHTTPServer((args.host_web, args.port_web), _Handler) as srv:
         _NODE.start()
         log.info("Web control panel listening on %s:%d", args.host_web, args.port_web)
+        log.info("Manual arm jog speed multiplier: %gx", args.jog_speed_scale)
         try:
             srv.serve_forever()
         except KeyboardInterrupt:

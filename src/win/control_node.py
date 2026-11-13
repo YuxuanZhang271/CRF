@@ -41,6 +41,8 @@ log = logging.getLogger("ControlNode")
 STATE_TIMEOUT_S = 0.3
 KEY_TIMEOUT_S = 2.0
 MAX_LINE_BYTES = 4096
+DEFAULT_JOG_SPEED_SCALE = 10
+JOG_SPEED_SCALES = (3, 5, DEFAULT_JOG_SPEED_SCALE, 15)
 
 class ControlNode:
     """Non-ROS port of Ur5EndoFlexNode."""
@@ -63,8 +65,13 @@ class ControlNode:
                  rcm_point_local=(0,0,-0.30),
                  tip_local=(0,0,0.20195),
                  standoff_m=0.105,
-                 flex_state_callback=None):
+                 flex_state_callback=None,
+                 jog_speed_scale=DEFAULT_JOG_SPEED_SCALE):
+        if jog_speed_scale not in JOG_SPEED_SCALES:
+            choices = ", ".join(map(str, JOG_SPEED_SCALES))
+            raise ValueError(f"jog speed scale must be one of {choices}")
         self.dt = 1.0 / self.STEP_TICK_HZ
+        self.jog_speed_scale = jog_speed_scale
         self.jetson_ip   = jetson_ip
         self.jetson_port = jetson_port
         self.standoff    = standoff_m
@@ -330,26 +337,22 @@ class ControlNode:
         if tracking_active:
             self._step_hybrid_rcm_tracking(); self._update_flex_state(); return
 
-        arm_dx = arm_dy = arm_dz = arm_tilt_right = arm_tilt_up = 0.0
+        arm_dy = arm_dz = arm_tilt_right = arm_tilt_up = 0.0
         with self._lock: mode = self.arm_mode
 
+        jog_dt = self.dt * self.jog_speed_scale
+        vertical = ks['arm_up'] - ks['arm_down']
+        horizontal = ks['arm_right'] - ks['arm_left']
+        arm_dx = (ks['arm_bwd'] - ks['arm_fwd']) * self.ARM_AXIS_VEL * jog_dt
         if mode == 'rcm':
-            if ks['arm_up']:    arm_tilt_up    += math.radians(self.ARM_TILT_VEL_DEG_S)*self.dt
-            if ks['arm_down']:  arm_tilt_up    -= math.radians(self.ARM_TILT_VEL_DEG_S)*self.dt
-            if ks['arm_right']: arm_tilt_right += math.radians(self.ARM_TILT_VEL_DEG_S)*self.dt
-            if ks['arm_left']:  arm_tilt_right -= math.radians(self.ARM_TILT_VEL_DEG_S)*self.dt
+            arm_tilt_up = vertical * self.ARM_TILT_VEL_DEG_S * jog_dt
+            arm_tilt_right = horizontal * self.ARM_TILT_VEL_DEG_S * jog_dt
         else:
-            if ks['arm_up']:    arm_dz += self.ARM_LINEAR_VEL*self.dt
-            if ks['arm_down']:  arm_dz -= self.ARM_LINEAR_VEL*self.dt
-            if ks['arm_right']: arm_dy += self.ARM_LINEAR_VEL*self.dt
-            if ks['arm_left']:  arm_dy -= self.ARM_LINEAR_VEL*self.dt
-        if ks['arm_fwd']: arm_dx -= self.ARM_AXIS_VEL*self.dt
-        if ks['arm_bwd']: arm_dx += self.ARM_AXIS_VEL*self.dt
+            arm_dz = vertical * self.ARM_LINEAR_VEL * jog_dt
+            arm_dy = horizontal * self.ARM_LINEAR_VEL * jog_dt
 
         if arm_tilt_up or arm_tilt_right:
-            self._arm_rcm_tilt(math.degrees(arm_tilt_right),
-                               math.degrees(arm_tilt_up),
-                               insertion_m=arm_dx)
+            self._arm_rcm_tilt(arm_tilt_right, arm_tilt_up, insertion_m=arm_dx)
         elif arm_dx or arm_dy or arm_dz:
             self._arm_linear_step(arm_dx, arm_dy, arm_dz)
 

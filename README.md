@@ -42,6 +42,10 @@ bundled URDF by default.
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Confirm that the joint
 readings appear and Diagnostics shows Jetson connected and kinematics ready.
+
+Manual arm controls default to a 10× speed multiplier. Use
+`--jog-speed-scale` to select 3, 5, 10, or 15.
+
 The **Dashboard Stop** button sends a program stop to PolyScope. After a
 Dashboard stop or relay motion fault, check the robot before restarting the
 Jetson relay. The physical emergency stop remains on the robot.
