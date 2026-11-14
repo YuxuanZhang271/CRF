@@ -25,9 +25,12 @@ constexpr double SetupRollLimit = 20.0;
 constexpr DWORD PollIntervalMs = 10;
 constexpr double MinPositionDurationMs = 20.0;
 constexpr double PositionBendStep = 0.18, PositionRollStep = 0.60;
-// Keep the jog and tracking increments in sync with FlexControl's horizon correction.
-constexpr double JogBendStep = 0.24, JogRollStep = 0.80;
-constexpr double TrackBendStep = 0.32, TrackRollStep = 1.0;
+constexpr double JogSpeedMultiplier = 1.5;
+constexpr double TrackSpeedMultiplier = 3.0;
+constexpr double HorizonRollStep = 0.80;
+// Keep these increments in sync with FlexControl's jog and tracking commands.
+constexpr double JogBendStep = 0.24 * JogSpeedMultiplier, JogRollStep = HorizonRollStep * JogSpeedMultiplier;
+constexpr double TrackBendStep = 0.32 * TrackSpeedMultiplier, TrackRollStep = 1.0 * TrackSpeedMultiplier;
 constexpr double PositionTolerance = 0.15;
 constexpr DWORD ConfigSettleMs = 100;
 constexpr uint64_t DriveEnableSettleMs = 200;
@@ -35,8 +38,11 @@ constexpr uint64_t StepTimeoutMs = 600;
 constexpr uint64_t SetupReportSettleMs = 100;
 constexpr double EncoderTolerancePulses = 25.0;
 constexpr double BendPositionSpeed = 40.0, RollPositionSpeed = 15.0; // pulses/ms
-constexpr double JogSpeedScale = 1.25;
-constexpr double SetupBendStopMargin = 0.5;
+constexpr double HorizonSpeedScale = 1.25;
+constexpr double JogSpeedScale = HorizonSpeedScale * JogSpeedMultiplier;
+constexpr double TrackSpeedScale = HorizonSpeedScale * TrackSpeedMultiplier;
+// Preserve the stopping look-ahead time for held velocity jogs.
+constexpr double SetupBendStopMargin = 0.5 * JogSpeedMultiplier;
 constexpr long MotionMask = 0x1f, DriveEnabled = 0x200, ProfileMoving = 0x400;
 // Axis status bits for drive alarm, following error, limits, and I/O stops.
 constexpr long AxisFaultBits = 0x1f2;
@@ -261,13 +267,14 @@ private:
             encoder_ = profile_;
             return true;
         }
-        if (!trapProfilesReady_) {
+        const double acceleration = 0.5 * std::max(1.0, speedScale / HorizonSpeedScale);
+        if (trapAcceleration_ != acceleration) {
             for (short axis = 1; axis <= 5; ++axis) {
-                TTrapPrm parameters{0.5, 0.5, 0.0, 1};
+                TTrapPrm parameters{acceleration, acceleration, 0.0, 1};
                 if (!check(GT_PrfTrap(axis), "GT_PrfTrap", axis) ||
                     !check(GT_SetTrapPrm(axis, &parameters), "GT_SetTrapPrm", axis)) return false;
             }
-            trapProfilesReady_ = true;
+            trapAcceleration_ = acceleration;
         }
         double durationMs = MinPositionDurationMs;
         for (size_t i = 0; i < target.size(); ++i) {
@@ -315,7 +322,7 @@ public:
             return true;
         }
         if (moving()) return true;
-        trapProfilesReady_ = false;
+        trapAcceleration_ = 0.0;
         long mask = 0;
         for (short axis = 1; axis <= 5; ++axis) {
             const size_t i = axis - 1;
@@ -423,7 +430,8 @@ private:
     long enabled_ = 0;
     long stepMask_ = 0;
     long setupJogMask_ = 0;
-    bool trapProfilesReady_ = false, jogActive_ = false;
+    bool jogActive_ = false;
+    double trapAcceleration_ = 0.0;
     bool verifyEncoder_ = false, setupFeedbackMismatch_ = false;
     uint64_t stepDeadline_ = 0;
     uint64_t enableReadyAt_ = 0;
@@ -802,9 +810,10 @@ private:
         if (motion_.moving()) return;
         const Pose current = readPose(positionFeedback(), reference_);
         const double roll = rollLimit();
+        const bool horizon = cmd.action == Horizon;
         const bool tracking = cmd.action == Track;
-        const double bendStep = cmd.action == Horizon ? 0.0 : tracking ? TrackBendStep : JogBendStep;
-        const double rollStep = tracking ? TrackRollStep : JogRollStep;
+        const double bendStep = horizon ? 0.0 : tracking ? TrackBendStep : JogBendStep;
+        const double rollStep = horizon ? HorizonRollStep : tracking ? TrackRollStep : JogRollStep;
         const double zeroRoll = readPose(reference_, usesPlannedFeedback() ? setupReference_ : travelReference_).roll;
         const double rollTarget = current.roll + std::clamp(cmd.roll * rollStep,
             std::min(0.0, std::max(-roll, -roll - zeroRoll) - current.roll),
@@ -812,7 +821,7 @@ private:
         Pose next = nextJog(current, cmd.x, cmd.y, rollTarget, bendStep);
         // A roll correction can run out of tendon travel before a bend-only step does.
         if (!withinTravel(next, reference_, BendLimit, roll)) {
-            if (cmd.action == Horizon) {
+            if (horizon) {
                 halt();
                 status_.result = Limit;
                 blockedSequence_ = cmd.sequence;
@@ -820,13 +829,14 @@ private:
             }
             next = nextJog(current, cmd.x, cmd.y, current.roll, bendStep);
         }
-        if (cmd.action == Horizon && next.roll == current.roll) {
+        if (horizon && next.roll == current.roll) {
             halt();
             status_.result = Limit;
             blockedSequence_ = cmd.sequence;
             return;
         }
-        move(next, reference_, BendLimit, roll, JogSpeedScale);
+        const double speedScale = horizon ? HorizonSpeedScale : tracking ? TrackSpeedScale : JogSpeedScale;
+        move(next, reference_, BendLimit, roll, speedScale);
     }
 
     static bool canBendJog(Pose current, int x, int y) {

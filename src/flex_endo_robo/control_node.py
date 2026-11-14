@@ -394,9 +394,12 @@ class ControlNode:
 
     def _rcm_pose_is_valid(self, joints, depth=None):
         axis, _, tip = self.kin.tube_axis_in_base(joints)
-        offset = tip - self.rcm_world_point
         return (self._inside_rcm_cone(axis, self.rcm_ref_axis)
-                and np.linalg.norm(np.cross(offset, axis)) <= 0.002
+                and self._rcm_pivot_is_valid(axis, tip, depth))
+
+    def _rcm_pivot_is_valid(self, axis, tip, depth=None):
+        offset = tip - self.rcm_world_point
+        return (np.linalg.norm(np.cross(offset, axis)) <= 0.002
                 and (depth is None or abs(float(np.dot(offset, axis)) - depth) <= 0.002))
 
     def _arm_linear_step(self, dx_m, dy_m, dz_m):
@@ -967,7 +970,7 @@ class ControlNode:
             log.info(f"TRACKING locked on {key}: d={dist_m*100:.1f}cm aim={aim_deg:.2f}°")
 
     # ---------- transport ----------
-    def _send_servo(self, q_target, q_now, dt, validate=None):
+    def _send_servo(self, q_target, q_now, dt, validate=None, *, validate_start=None):
         q_target = np.asarray(q_target, float)
         if q_target.shape != (6,) or not np.isfinite(q_target).all():
             return False
@@ -985,7 +988,7 @@ class ControlNode:
         if md > max_step:
             q_target = q_base + delta * (max_step / md)
 
-        if validate is not None and (not validate(q_now) or not validate(q_target)):
+        if validate is not None and (not (validate_start or validate)(q_now) or not validate(q_target)):
             return False
         if not self._send({"type": "servo_joint", "positions": q_target.tolist()}):
             return False

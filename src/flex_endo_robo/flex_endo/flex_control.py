@@ -15,8 +15,13 @@ STRAIGHT_BEND_DEG = 0.25
 TRACK_ARM_SPEED_RAD_S = math.radians(3)
 PULL_OUT_ALIGN_SPEED_RAD_S = math.radians(2)
 # Match the per-command increments in the native Flex driver.
-JOG_BEND_STEP_DEG, JOG_ROLL_STEP_DEG = 0.24, 0.80
-TRACK_BEND_STEP_DEG, TRACK_ROLL_STEP_DEG = 0.32, 1.0
+JOG_SPEED_MULTIPLIER = 1.5
+TRACK_SPEED_MULTIPLIER = 3.0
+HORIZON_ROLL_STEP_DEG = 0.80
+JOG_BEND_STEP_DEG = 0.24 * JOG_SPEED_MULTIPLIER
+JOG_ROLL_STEP_DEG = HORIZON_ROLL_STEP_DEG * JOG_SPEED_MULTIPLIER
+TRACK_BEND_STEP_DEG = 0.32 * TRACK_SPEED_MULTIPLIER
+TRACK_ROLL_STEP_DEG = 1.0 * TRACK_SPEED_MULTIPLIER
 HORIZON_DEADBAND_DEG = 0.15
 PIVOT_TOLERANCE_M = 0.002
 
@@ -203,8 +208,6 @@ class FlexControl:
         obs = self.camera.observation()
         if obs is None or obs.category is None or not self._fresh(obs):
             raise ValueError("Select one YOLO category and wait for a fresh camera frame.")
-        if not self._valid_arm_pose(node, node.joint_positions.copy()):
-            raise ValueError("UR5 is outside the captured RCM envelope.")
         with node._lock:
             node._clear_track_state_unlocked()
         self.tracking = (obs.revision, obs.category)
@@ -222,17 +225,25 @@ class FlexControl:
         if not self._rcm_ready(node) or not self.ready():
             self.cancel_tracking("Tracking stopped · RCM or Flex feedback lost")
             return
-        q_now = node.joint_positions.copy()
-        if not self._valid_arm_pose(node, q_now):
-            self.cancel_tracking("Tracking stopped · UR5 outside the RCM envelope")
-            return
         if obs is None or (obs.revision, obs.category) != self.tracking or not self._fresh(obs):
             self.cancel_tracking("Tracking stopped · camera stream or category changed")
             return
+        q_now = node.joint_positions.copy()
+        axis_now, _, tip_now = node.kin.tube_axis_in_base(q_now)
+        ref = node.rcm_ref_axis
+        pivot = node.rcm_world_point
+        depth = float(np.dot(tip_now - pivot, axis_now))
+        outside_cone = not node._inside_rcm_cone(axis_now, ref)
+        if depth <= 0 or not node._rcm_pivot_is_valid(axis_now, tip_now):
+            self._wait_at_tracking_limit("UR5 is off the captured RCM pivot")
+            return
         if not obs.valid or obs.centered:
-            self.tracking_state = "Centered" if obs.valid else "Waiting for target"
             self._tracking_limit = None
             self._tracking_command = None
+            if outside_cone:
+                self._wait_at_tracking_limit("UR5 outside the RCM cone")
+                return
+            self.tracking_state = "Centered" if obs.valid else "Waiting for target"
             if obs.valid:
                 self._hold_horizon(node)
             else:
@@ -267,7 +278,7 @@ class FlexControl:
                 self._tracking_limit = None
         current_bend = np.linalg.norm(bend)
         next_bend = np.linalg.norm(bend + TRACK_BEND_STEP_DEG * step)
-        if not blocked and (next_bend <= s.bend_limit or next_bend < current_bend):
+        if not outside_cone and not blocked and (next_bend <= s.bend_limit or next_bend < current_bend):
             x, y = step
             self.client.command(ipc.TRACK, frame=obs.frame, x=x, y=y,
                                 roll=self._horizon_correction(
@@ -279,7 +290,7 @@ class FlexControl:
             return
 
         self._tracking_command = None
-        if s.action == ipc.TRACK or (s.moving and s.action != ipc.HORIZON):
+        if s.action == ipc.TRACK or (s.moving and (outside_cone or s.action != ipc.HORIZON)):
             self.client.command(ipc.IDLE)
             self._owned = False
             self.tracking_state = "Holding Flex before arm assist"
@@ -287,16 +298,14 @@ class FlexControl:
         # Advance from the last nearby servo target so RTDE lag does not reduce
         # each correction to a single step from the measured pose.
         q_seed = q_now
+        axis = axis_now
         q_cmd = node._q_cmd
-        if (q_cmd is not None and np.max(np.abs(q_cmd - q_now)) <= node.TELEOP_RESYNC_RAD
-                and self._valid_arm_pose(node, q_cmd)):
-            q_seed = q_cmd
-        axis, _, tip = node.kin.tube_axis_in_base(q_seed)
-        pivot = node.rcm_world_point
-        depth = float(np.dot(tip - pivot, axis))
-        if depth <= 0:
-            self.cancel_tracking("Tracking stopped · UR5 outside the RCM envelope")
-            return
+        if q_cmd is not None and np.max(np.abs(q_cmd - q_now)) <= node.TELEOP_RESYNC_RAD:
+            cmd_axis, _, cmd_tip = node.kin.tube_axis_in_base(q_cmd)
+            usable_direction = (np.dot(cmd_axis, ref) >= np.dot(axis_now, ref) if outside_cone
+                                else node._inside_rcm_cone(cmd_axis, ref))
+            if usable_direction and node._rcm_pivot_is_valid(cmd_axis, cmd_tip, depth):
+                q_seed, axis = q_cmd, cmd_axis
         camera_rotation = node.kin.physical_flex_camera_rotation(q_seed, s.bend_x, s.bend_y, s.roll)
         right = -camera_rotation[:, 1]
         down = camera_rotation[:, 0]
@@ -310,8 +319,12 @@ class FlexControl:
             return
         angle = TRACK_ARM_SPEED_RAD_S * node.dt
         axis_target = math.cos(angle) * axis + math.sin(angle) * tangent / length
-        if not node._inside_rcm_cone(axis_target, node.rcm_ref_axis):
-            ref = node.rcm_ref_axis
+        seed_inside = node._inside_rcm_cone(axis, ref)
+        if not seed_inside:
+            if np.dot(axis_target - axis, ref) <= 1e-8:
+                self._wait_at_tracking_limit("UR5 outside the RCM cone")
+                return
+        elif not node._inside_rcm_cone(axis_target, ref):
             radial = axis_target - np.dot(axis_target, ref) * ref
             cone = node.RCM_CONE_HALF_ANGLE
             axis_target = math.cos(cone) * ref + math.sin(cone) * radial / np.linalg.norm(radial)
@@ -319,14 +332,30 @@ class FlexControl:
                 self._wait_at_tracking_limit("UR5 RCM cone reached")
                 return
         q_target = node.kin.ik_along_axis(pivot + depth * axis_target, axis_target, q_seed)
+        def validate_start(q):
+            start_axis, _, start_tip = node.kin.tube_axis_in_base(q)
+            return node._rcm_pivot_is_valid(start_axis, start_tip, depth)
+
+        def validate_target(q):
+            target_axis, _, target_tip = node.kin.tube_axis_in_base(q)
+            allowed = (node._inside_rcm_cone(target_axis, ref) if seed_inside
+                       else np.dot(target_axis - axis, ref) > 1e-8)
+            return allowed and node._rcm_pivot_is_valid(target_axis, target_tip, depth)
+
         if q_target is None or not node._send_servo(
-                q_target, q_now, node.dt, validate=lambda q: node._rcm_pose_is_valid(q, depth)):
+                q_target, q_now, node.dt, validate=validate_target, validate_start=validate_start):
             self._wait_at_tracking_limit("no feasible RCM correction")
             return
-        self.tracking_state = "Following with arm assist"
-        self._hold_horizon(node)
+        if outside_cone:
+            self.client.command(ipc.IDLE)
+            self._owned = False
+            self.tracking_state = "Returning UR5 to the RCM cone"
+        else:
+            self.tracking_state = "Following with arm assist"
+            self._hold_horizon(node)
 
     def _wait_at_tracking_limit(self, reason):
+        self._tracking_command = None
         self.client.command(ipc.IDLE)
         self._owned = False
         self.tracking_state = f"Tracking limited · {reason}. Waiting for target to move."
@@ -359,7 +388,7 @@ class FlexControl:
 
     def _hold_horizon(self, node):
         s = self.status
-        roll = self._horizon_correction(node, 0., 0., 0., JOG_ROLL_STEP_DEG)
+        roll = self._horizon_correction(node, 0., 0., 0., HORIZON_ROLL_STEP_DEG)
         if roll:
             self.client.command(ipc.HORIZON, roll=roll)
             self._owned = s.result != ipc.LIMIT or s.sequence != self.client.sequence
