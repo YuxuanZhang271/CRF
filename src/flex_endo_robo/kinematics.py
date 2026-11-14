@@ -49,7 +49,6 @@ JOINT_NAMES = [
 ]
 
 # Default GUI pose (degrees); nothing is sent to the robot on startup.
-HOME_DEG = [0.0, -120.0, -120.0, -30.0, 90.0, 45.0]
 
 # Fallback transform from endoscope_link to flex_base_link (from ur5_endo_flex.urdf.xacro)
 # origin xyz="0 0 -0.398" rpy="3.141593 0 0.616096"
@@ -254,7 +253,7 @@ class EndoscopeKinematics:
                 @ _rot_y(bend) @ _rot_z(-plane))
 
     def flex_fk_from_base_frame(self, R_0, p_0, curvature=0.0, steer_yaw=0.0,
-                                arc_len=0.050, flex_mode='fixed'):
+                                arc_len=0.050):
         """
         Constant-curvature arc FK of the distal endo_flex camera given the
         flex-base frame (R_0, p_0) in the base_link frame.
@@ -275,7 +274,7 @@ class EndoscopeKinematics:
 
         base_yaw, ext_yaw = self.solve_horizon_flex_yaw_from_R0(
             R_0, steer_yaw=float(steer_yaw),
-            theta_total=theta, flex_mode=flex_mode)
+            theta_total=theta)
 
         # Steering-plane twist. rot_z() is 2*pi-periodic, so this recovers
         # alpha = psi_h + steer_yaw from the solved joint pair.
@@ -295,16 +294,15 @@ class EndoscopeKinematics:
         return R_end, p_end, (base_yaw, ext_yaw)
 
     def flex_fk_in_base(self, q, curvature=0.0, steer_yaw=0.0,
-                        arc_len=0.050, flex_mode='fixed'):
+                        arc_len=0.050):
         """
         Forward kinematics of the distal endoscope camera (end_cylinder) in
         the base_link frame for a given endo_flex configuration.
 
         The flex section is modelled as a constant-curvature arc of length
-        `arc_len` (m) and curvature `curvature` (1/m) in the steering plane,
-        with the horizon-leveling yaw coordination of
-        `solve_horizon_flex_yaw()` applied so that, in 'fixed' mode, the
-        distal y-axis stays strictly horizontal. The distal camera frame
+        `arc_len` (m) and curvature `curvature` (1/m) in the steering plane.
+        The yaw coordination from `solve_horizon_flex_yaw()` keeps the
+        distal y-axis horizontal. The distal camera frame
         convention is: +x down, +y horizontal, +z forward along the tube.
 
         Returns (R_end, p_end, (base_yaw, ext_yaw)).
@@ -312,13 +310,13 @@ class EndoscopeKinematics:
         R_0, p_0 = self.flex_base_frame_in_base(q)
         return self.flex_fk_from_base_frame(
             R_0, p_0, curvature=curvature, steer_yaw=steer_yaw,
-            arc_len=arc_len, flex_mode=flex_mode)
+            arc_len=arc_len)
 
     # ------------------------------------------------------------------
     # Hybrid RCM tracking kinematics (control-space FK / Jacobian)
     # ------------------------------------------------------------------
     def camera_pose_on_shaft(self, p_rcm, R_shaft, d_ins, kappa, steer_yaw,
-                             arc_len=0.050, flex_mode='fixed',
+                             arc_len=0.050,
                              tip_to_flex_base=0.59995):
         """
         Control-space FK used by the hybrid RCM tracking servo (no arm IK).
@@ -345,7 +343,7 @@ class EndoscopeKinematics:
         R_0 = R_shaft @ self._R_endo_to_flex
         R_end, p_end, _ = self.flex_fk_from_base_frame(
             R_0, p_0, curvature=kappa, steer_yaw=steer_yaw,
-            arc_len=arc_len, flex_mode=flex_mode)
+            arc_len=arc_len)
         return p_end, R_end[:, 2].copy()
 
     def rotate_shaft_frame(self, R_shaft, d_tilt=0.0, d_yaw=0.0):
@@ -379,7 +377,7 @@ class EndoscopeKinematics:
         return R_new
 
     def hybrid_rcm_jacobian(self, p_rcm, R_shaft, d_ins, kappa, steer_yaw,
-                            standoff, arc_len=0.050, flex_mode='fixed',
+                            standoff, arc_len=0.050,
                             tip_to_flex_base=0.59995, eps=None):
         """
         3x5 task Jacobian of the virtual aim point
@@ -408,7 +406,7 @@ class EndoscopeKinematics:
             p = (math.atan2(ky, kx) if k > 1e-12 else psi)
             p_cam, v_hat = self.camera_pose_on_shaft(
                 p_rcm, R_s, d_i, k, p,
-                arc_len=arc_len, flex_mode=flex_mode,
+                arc_len=arc_len,
                 tip_to_flex_base=tip_to_flex_base)
             return p_cam + standoff * v_hat
 
@@ -463,8 +461,7 @@ class EndoscopeKinematics:
     # ------------------------------------------------------------------
     # Endo-flex Automatic Horizon-Keeping Twist & Bird-Eye View Solvers
     # ------------------------------------------------------------------
-    def solve_horizon_flex_yaw(self, q, steer_yaw=0.0, theta_total=0.0,
-                               flex_mode='fixed'):
+    def solve_horizon_flex_yaw(self, q, steer_yaw=0.0, theta_total=0.0):
         """
         Automatically compute (base_yaw, ext_yaw) so that the y-axis of
         endo_flex (and end_cylinder) is always kept horizontal (parallel
@@ -480,20 +477,13 @@ class EndoscopeKinematics:
             (adjusted via A/D keys).
         theta_total : float
             Total bending angle (rad) across the continuum segments.
-        flex_mode : str
-            'fixed' keeps end_cylinder's y-axis strictly on the horizon for
-            any steer_yaw and theta_total by coordinating base_yaw & ext_yaw;
-            'free' keeps yaw_base's y-axis horizon-compensated via base_yaw
-            with ext_yaw = 0.
         """
         R_0, _ = self.flex_base_frame_in_base(q)
         return self.solve_horizon_flex_yaw_from_R0(
-            R_0, steer_yaw=steer_yaw, theta_total=theta_total,
-            flex_mode=flex_mode)
+            R_0, steer_yaw=steer_yaw, theta_total=theta_total)
 
     @staticmethod
-    def solve_horizon_flex_yaw_from_R0(R_0, steer_yaw=0.0, theta_total=0.0,
-                                       flex_mode='fixed'):
+    def solve_horizon_flex_yaw_from_R0(R_0, steer_yaw=0.0, theta_total=0.0):
         """
         Horizon-keeping (base_yaw, ext_yaw) solver from the flex-base frame.
 
@@ -512,12 +502,7 @@ class EndoscopeKinematics:
         else:
             psi_h = math.atan2(-R_0[2, 1], -R_0[2, 0])
 
-        if flex_mode == 'free':
-            base_yaw = _wrap_pi(psi_h + steer_yaw)
-            ext_yaw = 0.0
-            return base_yaw, ext_yaw
-
-        # 2. In 'fixed' mode (or general horizon-locked mode), the bending
+        # 2. The bending
         #    plane in start_cylinder frame is alpha = psi_h + steer_yaw, and
         #    R_end = R_0 @ rot_z(alpha) @ rot_y(theta_total) @ rot_z(-ext_yaw).
         #    Choose gamma = -ext_yaw so end_cylinder's y-axis is strictly

@@ -5,16 +5,17 @@
 
 namespace flex {
 constexpr uint32_t Magic = 0x58454c46;  // FLEX
-constexpr uint32_t Version = 1;
-constexpr wchar_t Prefix[] = L"Local\\CRFFlexV1";
+constexpr uint32_t Version = 3;
+constexpr wchar_t Prefix[] = L"Local\\CRFFlexV3";
+// All driver versions must share the same hardware ownership lock.
+constexpr wchar_t DriverMutex[] = L"Local\\CRFFlexV1Driver";
 constexpr uint64_t CommandTimeoutMs = 350;
 constexpr uint64_t VisionTimeoutMs = 500;
 
-enum Action : uint32_t { Idle, Stop, Calibrate, SetMode, Jog, Position, Track, ReturnZero };
-enum Mode : uint32_t { Fixed, Free };
+enum Action : uint32_t { Idle, Stop, Calibrate, Horizon, Jog, Position, Track, ReturnZero, RecheckStartup };
 enum Flags : uint32_t {
-    Calibrated = 1, Setup = 2, Moving = 4, Simulated = 8, Xbox = 16, SetupEncoderMismatch = 32,
-    ManualBench = 64, PlannedZero = 128, PlannedFull = 256
+    Calibrated = 1, Moving = 4, Simulated = 8, SetupEncoderMismatch = 32,
+    ManualBench = 64, PlannedZero = 128, PlannedFull = 256, StartupRecheck = 512
 };
 enum Result : uint32_t { None, Accepted, Done, Refused, Canceled, Limit };
 
@@ -25,13 +26,13 @@ struct Header {
 struct Command {
     Header header;
     uint64_t driver, app, sequence, stamp, request, frame;
-    uint32_t action, mode;
+    uint32_t action, reserved;
     double x, y, roll;
 };
 struct Status {
     Header header;
     uint64_t driver, stamp, app, sequence, request;
-    uint32_t action, mode, flags, result;
+    uint32_t action, reserved, flags, result;
     int32_t fault;
     uint32_t faultAxisStatus;
     double x, y, roll, bendLimit, tendon[4];

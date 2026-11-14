@@ -1,7 +1,6 @@
 ﻿#define NOMINMAX
 #include "stdafx.h"
 #include <Windows.h>
-#include <Xinput.h>
 #include <conio.h>
 
 #include <algorithm>
@@ -23,18 +22,21 @@ constexpr double BendPulsesPerDegree = 68000.0 * 4.0 * Pi / 180.0;
 constexpr double RollPulsesPerDegree = 123000.0 * (100.0 / 40.0) / 360.0;
 constexpr double BendLimit = 60.0, RollLimit = 180.0;
 constexpr double SetupRollLimit = 20.0;
-constexpr double NoBendLimit = std::numeric_limits<double>::infinity();
-constexpr double TickSeconds = 0.02;
-constexpr double BendStep = 0.12, RollStep = 0.40;
+constexpr DWORD PollIntervalMs = 10;
+constexpr double MinPositionDurationMs = 20.0;
+constexpr double PositionBendStep = 0.18, PositionRollStep = 0.60;
+// Keep the jog and tracking increments in sync with FlexControl's horizon correction.
+constexpr double JogBendStep = 0.24, JogRollStep = 0.80;
+constexpr double TrackBendStep = 0.32, TrackRollStep = 1.0;
 constexpr double PositionTolerance = 0.15;
 constexpr DWORD ConfigSettleMs = 100;
 constexpr uint64_t DriveEnableSettleMs = 200;
 constexpr uint64_t StepTimeoutMs = 600;
 constexpr uint64_t SetupReportSettleMs = 100;
 constexpr double EncoderTolerancePulses = 25.0;
-constexpr double SetupBendJogSpeed = 32.0; // pulses/ms
-constexpr double SetupRollJogSpeed = 12.0;
-constexpr double SetupBendStopMargin = 0.5, SetupRollStopMargin = 1.0;
+constexpr double BendPositionSpeed = 40.0, RollPositionSpeed = 15.0; // pulses/ms
+constexpr double JogSpeedScale = 1.25;
+constexpr double SetupBendStopMargin = 0.5;
 constexpr long MotionMask = 0x1f, DriveEnabled = 0x200, ProfileMoving = 0x400;
 // Axis status bits for drive alarm, following error, limits, and I/O stops.
 constexpr long AxisFaultBits = 0x1f2;
@@ -98,7 +100,7 @@ using Axes = std::array<double, 5>;
 
 class Motion {
 public:
-    Motion(bool simulated, bool feedbackTest) : simulated_(simulated), feedbackTest_(feedbackTest) {}
+    explicit Motion(bool simulated) : simulated_(simulated) {}
     ~Motion() {
         if (!opened_) return;
         stop();
@@ -120,14 +122,21 @@ public:
         // Let the configured inputs settle before the startup status clear.
         Sleep(ConfigSettleMs);
         if (!check(GT_ClrSts(1, 8), "GT_ClrSts")) return false;
-        return sample();
+        const bool valid = sample();
+        startupFault_ = !valid && hasAxisInputFault();
+        return valid;
     }
 
-    bool recheckStartupInputs() {
-        if (!opened_ || enabled_ || fault_ < -104 || fault_ > -100) return false;
+    bool canRecheckStartup() const { return startupFault_ && !enabled_; }
+
+    bool recheckStartup() {
+        if (!canRecheckStartup()) return false;
         fault_ = 0;
         faultAxisStatus_ = 0;
-        return check(GT_ClrSts(1, 8), "GT_ClrSts(startup recheck)") && sample();
+        const bool valid = check(GT_ClrSts(1, 8), "GT_ClrSts(startup recheck)") && sample();
+        startupFault_ = !valid && hasAxisInputFault();
+        if (valid) std::puts("GTS startup inputs are clear.");
+        return valid;
     }
 
     bool sample() {
@@ -164,7 +173,7 @@ public:
         if (setupJogMask_ && GetTickCount64() >= stepDeadline_) {
             if (!setupJogHasFeedback(setupJogMask_)) {
                 setupFeedbackMismatch_ = true;
-                std::fputs("Xbox setup stopped: encoder travel did not match the velocity jog.\n", stderr);
+                std::fputs("Flex setup stopped: encoder travel did not match the velocity jog.\n", stderr);
                 return stop();
             }
             setupJogMask_ = 0;
@@ -176,20 +185,7 @@ public:
                 const bool profileReached = std::abs(profile_[i] - stepTarget_[i]) <= 1.0;
                 const double error = std::abs((encoder_[i] - stepEncoder_[i]) -
                                               (stepTarget_[i] - stepProfile_[i]));
-                if (profileReached && (!verifyEncoder_ || error <= EncoderTolerancePulses)) {
-                    if (verifySetupFeedback_ && error > EncoderTolerancePulses &&
-                        GetTickCount64() < stepDeadline_) {
-                        waiting = true;
-                        continue;
-                    }
-                    if (!verifySetupFeedback_ || error <= EncoderTolerancePulses) continue;
-                    setupFeedbackMismatch_ = true;
-                    std::fprintf(stderr,
-                                 "Xbox setup stopped: axis %zu planned %.0f pulses, encoder changed %.0f.\n",
-                                 i + 1, stepTarget_[i] - stepProfile_[i],
-                                 encoder_[i] - stepEncoder_[i]);
-                    continue;
-                }
+                if (profileReached && (!verifyEncoder_ || error <= EncoderTolerancePulses)) continue;
                 waiting = true;
                 if (GetTickCount64() >= stepDeadline_) {
                     fault_ = profileReached ? -113 : -112;
@@ -212,13 +208,14 @@ public:
         setupJogMask_ = 0;
         jogActive_ = false;
         if (setupReportMask_ && !setupReportAt_)
-            setupReportAt_ = GetTickCount64() + SetupReportSettleMs;
+            setupReportAt_ = GetTickCount64() + (verifyReportFeedback_ ? SetupReportSettleMs : 0);
         return !opened_ || !enabled_ || check(GT_Stop(enabled_, enabled_), "GT_Stop");
     }
 
     bool enable() {
         if (fault_) return false;
         if (simulated_ || enabled_ == MotionMask) return true;
+        if (moving()) return true;
         for (short axis = 1; axis <= 5; ++axis) {
             const size_t index = axis - 1;
             if (!check(GT_AxisOn(axis), "GT_AxisOn", axis)) return false;
@@ -230,7 +227,11 @@ public:
         return sample();
     }
 
-    bool position(Pose next, const Axes& reference, bool planned, bool verifySetupFeedback) {
+    bool ready() const {
+        return simulated_ || (enabled_ == MotionMask && GetTickCount64() >= enableReadyAt_);
+    }
+
+    bool position(Pose next, const Axes& reference, bool planned, double speedScale = 1.0) {
         const Axes target{
             reference[0] - next.x * BendPulsesPerDegree,
             reference[1] - next.y * BendPulsesPerDegree,
@@ -238,18 +239,19 @@ public:
             reference[3] + next.y * BendPulsesPerDegree,
             reference[4] + next.roll * RollPulsesPerDegree,
         };
-        return positionAxes(target, !planned, verifySetupFeedback);
+        return positionAxes(target, !planned, false, speedScale);
     }
 
     bool returnToZero(const Axes& reference, bool planned) {
-        return positionAxes(reference, !planned, false, true);
+        return positionAxes(reference, !planned, true);
     }
 
 private:
-    bool positionAxes(const Axes& target, bool verifyEncoder, bool verifySetupFeedback, bool exact = false) {
-        if (!enable()) return false;
-        // Keep servicing stop and controller input during drive startup.
-        if (GetTickCount64() < enableReadyAt_) return true;
+    bool hasAxisInputFault() const {
+        return fault_ >= -104 && fault_ <= -100 && (faultAxisStatus_ & AxisFaultBits);
+    }
+
+    bool positionAxes(const Axes& target, bool verifyEncoder, bool exact, double speedScale = 1.0) {
         const Axes& positionFeedback = verifyEncoder ? encoder_ : profile_;
         if (simulated_) {
             if (!verifyEncoder) profile_ = target;
@@ -267,9 +269,9 @@ private:
             }
             trapProfilesReady_ = true;
         }
-        double durationMs = TickSeconds * 1000.0;
+        double durationMs = MinPositionDurationMs;
         for (size_t i = 0; i < target.size(); ++i) {
-            const double speed = i == 4 ? SetupRollJogSpeed : SetupBendJogSpeed;
+            const double speed = (i == 4 ? RollPositionSpeed : BendPositionSpeed) * speedScale;
             durationMs = std::max(durationMs, std::abs(target[i] - positionFeedback[i]) / speed);
         }
         long mask = 0;
@@ -291,42 +293,28 @@ private:
         }
         if (!mask) return true;
         if (!check(GT_Update(mask), "GT_Update")) return false;
-        if (verifySetupFeedback) recordSetupMove(mask, true);
         stepMask_ = mask;
         stepProfile_ = profile_;
         stepEncoder_ = encoder_;
         verifyEncoder_ = verifyEncoder;
-        verifySetupFeedback_ = verifySetupFeedback;
         stepDeadline_ = GetTickCount64() + static_cast<uint64_t>(std::ceil(durationMs)) + StepTimeoutMs;
-        if (verifySetupFeedback && mask != lastSetupMask_) {
-            std::printf("Xbox setup: GTS accepted axis mask 0x%lX.\n", mask);
-        }
-        lastSetupMask_ = verifySetupFeedback ? mask : 0;
         return true;
     }
 
 public:
-    bool setupJog(int x, int y, int roll, bool verifyFeedback = true) {
+    bool setupJog(int x, int y, bool verifyFeedback) {
         if (jogActive_) return true;
-        const Axes velocity{-x * SetupBendJogSpeed, -y * SetupBendJogSpeed,
-                            x * SetupBendJogSpeed, y * SetupBendJogSpeed,
-                            roll * SetupRollJogSpeed};
+        const double bendSpeed = BendPositionSpeed * JogSpeedScale;
+        const Axes velocity{-x * bendSpeed, -y * bendSpeed, x * bendSpeed, y * bendSpeed,
+                            0.0};
         if (simulated_) {
             for (size_t i = 0; i < velocity.size(); ++i) {
-                profile_[i] += velocity[i] * TickSeconds * 1000.0;
+                profile_[i] += velocity[i] * PollIntervalMs;
                 encoder_[i] = profile_[i];
             }
             return true;
         }
-        if (!enable()) return false;
-        if (GetTickCount64() < enableReadyAt_ || moving()) return true;
-        if (feedbackTest_) {
-            testAxisEncoderResult_ = GT_GetAxisEncPos(1, testAxisEncoder_.data(), 5);
-            if (testAxisEncoderResult_) {
-                std::fprintf(stderr, "Feedback test: initial GT_GetAxisEncPos unavailable (%d).\n",
-                             testAxisEncoderResult_);
-            }
-        }
+        if (moving()) return true;
         trapProfilesReady_ = false;
         long mask = 0;
         for (short axis = 1; axis <= 5; ++axis) {
@@ -335,7 +323,7 @@ public:
             TJogPrm ramp{};
             if (!check(GT_PrfJog(axis), "GT_PrfJog", axis) ||
                 !check(GT_GetJogPrm(axis, &ramp), "GT_GetJogPrm", axis)) return false;
-            ramp.acc = ramp.dec = 100; // Original Xbox jog ramp.
+            ramp.acc = ramp.dec = 100;
             if (!check(GT_SetJogPrm(axis, &ramp), "GT_SetJogPrm", axis) ||
                 !check(GT_SetVel(axis, velocity[i]), "GT_SetVel", axis)) return false;
             mask |= 1L << i;
@@ -345,8 +333,7 @@ public:
         jogActive_ = true;
         setupJogMask_ = verifyFeedback ? mask : 0;
         stepDeadline_ = GetTickCount64() + StepTimeoutMs;
-        std::printf("%s: velocity jog started (axis mask 0x%lX).\n",
-                    verifyFeedback ? "Xbox setup" : "Web UI jog", mask);
+        std::printf("Web UI jog started (axis mask 0x%lX).\n", mask);
         return true;
     }
 
@@ -355,7 +342,6 @@ public:
     bool moving() const { return moving_ || stepMask_ || setupReportPending(); }
     bool setupReportPending() const { return setupReportAt_ != 0; }
     bool setupFeedbackMismatch() const { return setupFeedbackMismatch_; }
-    bool feedbackTestDone() const { return feedbackTestDone_; }
     int fault() const { return fault_; }
     uint32_t faultAxisStatus() const { return faultAxisStatus_; }
 
@@ -385,35 +371,22 @@ private:
     }
 
     void reportSetupTravel(const std::array<long, 5>& status) {
-        Axes axisEncoder{};
-        const short axisResult = feedbackTest_ ? GT_GetAxisEncPos(1, axisEncoder.data(), 5) : 0;
         for (size_t i = 0; i < status.size(); ++i) {
             if (!(setupReportMask_ & (1L << i))) continue;
             const double profileTravel = profile_[i] - setupReportProfile_[i];
             const double encoderTravel = encoder_[i] - setupReportEncoder_[i];
-            std::printf("%s release: axis %zu profile delta %+.0f, "
+            std::printf("Web UI jog release: axis %zu profile delta %+.0f, "
                         "encoder delta %+.0f pulses, status 0x%lX.\n",
-                        verifyReportFeedback_ ? "Xbox setup" : "Web UI jog", i + 1, profileTravel,
+                        i + 1, profileTravel,
                         encoderTravel, static_cast<unsigned long>(status[i]));
-            if (feedbackTest_ && !testAxisEncoderResult_ && !axisResult) {
-                std::printf("Feedback test: axis %zu planned delta %+.0f, raw encoder delta %+.0f, "
-                            "mapped encoder delta %+.0f pulses.\n",
-                            i + 1, profileTravel, encoderTravel, axisEncoder[i] - testAxisEncoder_[i]);
-            }
             if (verifyReportFeedback_ && std::abs(profileTravel - encoderTravel) > EncoderTolerancePulses) {
                 if (!setupFeedbackMismatch_)
-                    std::fprintf(stderr, "Xbox setup stopped: encoder travel did not match planned travel.\n");
+                    std::fprintf(stderr, "Flex setup stopped: encoder travel did not match planned travel.\n");
                 setupFeedbackMismatch_ = true;
             }
         }
-        if (feedbackTest_) {
-            if (axisResult)
-                std::fprintf(stderr, "Feedback test: final GT_GetAxisEncPos unavailable (%d).\n", axisResult);
-            std::puts("Feedback test complete. Copy the console output.");
-            feedbackTestDone_ = true;
-        }
         std::fflush(stdout);
-        setupReportMask_ = lastSetupMask_ = 0;
+        setupReportMask_ = 0;
         setupReportAt_ = 0;
     }
 
@@ -446,13 +419,12 @@ private:
         return false;
     }
 
-    bool simulated_, opened_ = false, moving_ = false, sampled_ = false;
+    bool simulated_, opened_ = false, moving_ = false, sampled_ = false, startupFault_ = false;
     long enabled_ = 0;
-    long stepMask_ = 0, lastSetupMask_ = 0;
+    long stepMask_ = 0;
     long setupJogMask_ = 0;
     bool trapProfilesReady_ = false, jogActive_ = false;
     bool verifyEncoder_ = false, setupFeedbackMismatch_ = false;
-    bool verifySetupFeedback_ = false;
     uint64_t stepDeadline_ = 0;
     uint64_t enableReadyAt_ = 0;
     uint64_t setupReportAt_ = 0;
@@ -463,9 +435,6 @@ private:
     Axes stepTarget_{}, stepProfile_{}, stepEncoder_{};
     Axes setupReportProfile_{}, setupReportEncoder_{};
     bool verifyReportFeedback_ = true;
-    bool feedbackTest_, feedbackTestDone_ = false;
-    Axes testAxisEncoder_{};
-    short testAxisEncoderResult_ = 0;
 };
 
 Pose readPose(const Axes& value, const Axes& ref) {
@@ -490,34 +459,27 @@ Pose rotateBend(Pose p, double angle) {
             p.x * std::sin(rad) + p.y * std::cos(rad), p.roll};
 }
 
-Pose nextJog(Pose current, double x, double y, double roll, bool fixed, double rollLimit) {
-    Pose next = current;
-    next.roll += roll * RollStep;
-    if (std::abs(current.roll) < rollLimit)
-        next.roll = std::clamp(next.roll, -rollLimit, rollLimit);
-    if (fixed) next = rotateBend(next, current.roll - next.roll);
+Pose nextJog(Pose current, double x, double y, double rollTarget, double bendStep) {
     const double scale = std::max(1.0, std::hypot(x, y));
-    next.x += x * BendStep / scale;
-    next.y += y * BendStep / scale;
+    current.x += x * bendStep / scale;
+    current.y += y * bendStep / scale;
+    Pose next = rotateBend(current, current.roll - rollTarget);
+    next.roll = rollTarget;
     return next;
 }
 
 Pose nextPosition(Pose current, Pose target) {
-    const double scale = std::max({1.0, std::hypot(target.x - current.x, target.y - current.y) / BendStep,
-                                  std::abs(target.roll - current.roll) / RollStep});
+    const double scale = std::max({1.0, std::hypot(target.x - current.x, target.y - current.y) / PositionBendStep,
+                                  std::abs(target.roll - current.roll) / PositionRollStep});
     return {current.x + (target.x - current.x) / scale,
             current.y + (target.y - current.y) / scale,
             current.roll + (target.roll - current.roll) / scale};
 }
 
-int buttonAxis(WORD buttons, WORD positive, WORD negative) {
-    return int((buttons & positive) != 0) - int((buttons & negative) != 0);
-}
-
 class Driver {
 public:
-    Driver(bool simulated, bool feedbackTest, bool manualBench, bool plannedFull, bool managedSession)
-        : motion_(simulated, feedbackTest), simulated_(simulated), feedbackTest_(feedbackTest),
+    Driver(bool simulated, bool manualBench, bool plannedFull, bool managedSession)
+        : motion_(simulated), simulated_(simulated),
           manualBench_(manualBench), plannedFull_(plannedFull), managedSession_(managedSession) {
         status_.header = header<Status>();
         LARGE_INTEGER counter{};
@@ -526,14 +488,11 @@ public:
     }
 
     bool open() {
-        if (feedbackTest_) return true;
         return commands_.open(L"Command") && statusMapping_.open(L"Status") &&
                vision_.open(L"Vision");
     }
 
     int run() {
-        if (feedbackTest_)
-            std::puts("Flex feedback test. Press Start for setup, then hold B until it stops or for one second, then release.");
         if (manualBench_)
             std::puts("Manual Flex control. Web UI jog and set zero. Positions are planned. Q exits.");
         if (plannedFull_)
@@ -543,23 +502,20 @@ public:
         setupReference_ = motion_.profile();
         setupEncoder_ = motion_.encoder();
         if (!motion_.fault() && !usesPlannedFeedback())
-            std::puts("Flex driver ready. Xbox Start enters/exits setup, Back stops. Q exits.");
+            std::puts("Flex driver started. Use the Web UI to jog and calibrate. Q exits.");
         while (!InterlockedCompareExchange(&quitting, 0, 0)) {
             if (_kbhit() && (_getch() | 32) == 'q') break;
             if (!motion_.sample()) {
                 if (!status_.fault) halt();
                 status_.fault = motion_.fault();
             }
-            if (motion_.feedbackTestDone()) break;
             process();
-            if (!feedbackTest_) publish(GetTickCount64());
-            Sleep(20);
+            publish(GetTickCount64());
+            Sleep(PollIntervalMs);
         }
         halt();
-        if (!feedbackTest_) {
-            status_.stamp = 0;
-            statusMapping_.write(status_);
-        }
+        status_.stamp = 0;
+        statusMapping_.write(status_);
         return motion_.fault() ? 1 : 0;
     }
 
@@ -571,8 +527,7 @@ private:
 
     void halt() {
         motion_.stop();
-        setup_ = false;
-        benchIntent_ = {};
+        setupIntent_ = {};
         if (status_.action != Idle || status_.result == Accepted) status_.result = Canceled;
         status_.action = Idle;
     }
@@ -581,10 +536,11 @@ private:
         status_.stamp = now;
         status_.fault = motion_.fault();
         status_.faultAxisStatus = motion_.faultAxisStatus();
-        status_.flags = (calibrated_ ? Calibrated : 0) | (setup_ ? Setup : 0) |
+        status_.flags = (calibrated_ ? Calibrated : 0) |
                         (motion_.moving() ? Moving : 0) | (simulated_ ? Simulated : 0) |
-                        (controller_ ? Xbox : 0) | (manualBench_ ? ManualBench : 0) |
+                        (manualBench_ ? ManualBench : 0) |
                         (plannedZero_ ? PlannedZero : 0) | (plannedFull_ ? PlannedFull : 0) |
+                        (motion_.canRecheckStartup() ? StartupRecheck : 0) |
                         (!usesPlannedFeedback() && !calibrated_ && !motion_.moving() && !setupFeedbackMatches() ?
                          SetupEncoderMismatch : 0);
         const Axes& ref = calibrated_ || plannedZero_ ? reference_ : setupReference_;
@@ -599,19 +555,13 @@ private:
     }
 
     void process() {
-        bool controllerLost = false;
-        const WORD buttons = readXbox(controllerLost);
-        const WORD pressed = buttons & ~lastButtons_;
-        lastButtons_ = buttons;
-
         Command cmd{};
-        const bool read = feedbackTest_ || commands_.read(cmd);
+        const bool read = commands_.read(cmd);
         const uint64_t now = GetTickCount64();
         const bool validCommand = read && valid(cmd) && cmd.driver == status_.driver &&
-                                  cmd.app && cmd.sequence && cmd.action <= ReturnZero &&
-                                  cmd.mode <= Free && fresh(cmd.stamp, now, CommandTimeoutMs);
-        if (!read || (appLive_ && !validCommand) || (setup_ && controllerLost) ||
-            (buttons & XINPUT_GAMEPAD_BACK)) {
+                                  cmd.app && cmd.sequence && cmd.action <= RecheckStartup &&
+                                  !cmd.reserved && fresh(cmd.stamp, now, CommandTimeoutMs);
+        if (!read || (appLive_ && !validCommand)) {
             halt();
             blockedSequence_ = validCommand ? cmd.sequence : status_.sequence;
             waitForNeutral_ = true;
@@ -629,19 +579,28 @@ private:
         }
         appLive_ = validCommand;
         if (motion_.fault()) {
-            if (pressed & XINPUT_GAMEPAD_START) {
-                if (motion_.recheckStartupInputs()) {
+            if (validCommand && cmd.action == RecheckStartup && cmd.request &&
+                (cmd.app != recheckApp_ || cmd.sequence > status_.sequence) &&
+                motion_.canRecheckStartup()) {
+                recheckApp_ = cmd.app;
+                if (motion_.recheckStartup()) {
                     setupReference_ = motion_.profile();
                     setupEncoder_ = motion_.encoder();
-                    std::puts("GTS startup inputs are clear. Press Start again to enter setup.");
+                    acknowledge(cmd, Done);
                 } else {
-                    std::fprintf(stderr, "Xbox Start received; setup blocked by GTS fault %d.\n",
-                                 motion_.fault());
+                    acknowledge(cmd, Refused);
                 }
             }
             return;
         }
-        if (validCommand && cmd.app != status_.app) {
+        // Settle the drives when the app connects with neutral intent, before acknowledging
+        // the session and exposing jog controls.
+        if (!validCommand) return;
+        if (!motion_.ready()) {
+            if (cmd.action == Idle) motion_.enable();
+            return;
+        }
+        if (cmd.app != status_.app) {
             if (status_.app || status_.action != Idle) halt();
             status_.app = cmd.app;
             status_.sequence = cmd.sequence;
@@ -650,50 +609,30 @@ private:
             blockedSequence_ = cmd.sequence;
         }
 
-        if (validCommand && cmd.sequence > status_.sequence && cmd.action == Stop) {
+        if (cmd.sequence > status_.sequence && cmd.action == Stop) {
             halt();
-            acknowledge(cmd, Done);
+            acknowledge(cmd, motion_.fault() ? Refused : Done);
             blockedSequence_ = cmd.sequence;
             waitForNeutral_ = false;
             return;
         }
-        if (buttons & XINPUT_GAMEPAD_BACK) return;
-
-        if (pressed & XINPUT_GAMEPAD_START) {
-            if (usesPlannedFeedback()) {
-                std::puts("Planned feedback mode uses the Web UI controls. Xbox Back still stops.");
-                return;
-            }
-            if (calibrated_ || status_.action != Idle) {
-                std::puts(calibrated_ ? "Xbox Start received; setup is available before calibration."
-                                      : "Xbox Start received; wait for Flex to stop before setup.");
-                return;
-            }
-            const bool enableSetup = !setup_;
-            halt();
-            setupIntent_ = {};
-            if (enableSetup && motion_.fault()) return;
-            setup_ = enableSetup;
-            if (setup_) waitForNeutral_ = false;
-            std::puts(setup_ ? "Xbox setup enabled. Use B/X, A/Y or the D-pad."
-                             : "Xbox setup exited.");
-            if (validCommand) blockedSequence_ = cmd.sequence;
-            return;
-        }
         if (waitForNeutral_) {
-            if (!validCommand || cmd.action != Idle) return;
+            if (cmd.action != Idle) return;
             waitForNeutral_ = false;
         }
-        if (validCommand && cmd.sequence > blockedSequence_ && cmd.sequence >= status_.sequence) {
+        if (cmd.sequence > blockedSequence_ && cmd.sequence >= status_.sequence) {
             if ((status_.action == Position || status_.action == ReturnZero) &&
                 (cmd.action != status_.action || cmd.sequence != status_.sequence || cmd.request != status_.request)) {
                 halt();
                 blockedSequence_ = cmd.sequence;
                 return;
             }
+            if (cmd.request && cmd.request > status_.request && status_.action == Horizon) halt();
+            if (cmd.request && cmd.request > status_.request && status_.action == Idle &&
+                motion_.moving()) return;
             if (cmd.request && cmd.request > status_.request) acceptRequest(cmd);
-            if (cmd.action == Idle || cmd.action == Jog || cmd.action == Track) {
-                if (manualBench_ || (plannedFull_ && !plannedZero_)) serviceBenchJog(cmd);
+            if (cmd.action == Idle || cmd.action == Jog || cmd.action == Track || cmd.action == Horizon) {
+                if (!positioningReady() || manualBench_) serviceSetupJog(cmd);
                 else serviceContinuous(cmd);
             }
             if (cmd.action == Position && cmd.request == status_.request && status_.result == Accepted)
@@ -701,34 +640,6 @@ private:
             if (cmd.action == ReturnZero && cmd.request == status_.request && status_.result == Accepted)
                 serviceReturnZero(cmd);
         }
-        if (setup_) serviceSetup(feedbackTest_ ? buttons & XINPUT_GAMEPAD_B : buttons);
-    }
-
-    WORD readXbox(bool& lost) {
-        if (simulated_) return 0;
-        XINPUT_STATE pad{};
-        if (controller_ && XInputGetState(xboxSlot_, &pad) == ERROR_SUCCESS)
-            return pad.Gamepad.wButtons;
-        if (controller_) {
-            std::printf("Xbox disconnected from XInput slot %lu.\n", xboxSlot_ + 1);
-            controller_ = false;
-            lost = true;
-            return 0;
-        }
-        const uint64_t now = GetTickCount64();
-        if (now < nextXboxScan_) return 0;
-        nextXboxScan_ = now + 250;
-        for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
-            if (XInputGetState(slot, &pad) != ERROR_SUCCESS) continue;
-            controller_ = true;
-            xboxSlot_ = slot;
-            // Pairing or reconnecting with buttons held must not start setup or jog.
-            lastButtons_ = pad.Gamepad.wButtons;
-            std::printf("Xbox detected on XInput slot %lu. Release all buttons, then press Menu (Start).\n",
-                        slot + 1);
-            return pad.Gamepad.wButtons;
-        }
-        return 0;
     }
 
     void acknowledge(const Command& cmd, Result result) {
@@ -739,7 +650,7 @@ private:
 
     void acceptRequest(const Command& cmd) {
         if (cmd.action == ReturnZero) {
-            if ((!calibrated_ && !plannedZero_) || setup_ || status_.action != Idle || motion_.moving()) {
+            if ((!calibrated_ && !plannedZero_) || status_.action != Idle || motion_.moving()) {
                 acknowledge(cmd, Refused);
                 return;
             }
@@ -767,8 +678,7 @@ private:
         }
         switch (cmd.action) {
         case Calibrate:
-            if (status_.action != Idle || motion_.moving() ||
-                (setup_ && (lastButtons_ & SetupDirections))) {
+            if (status_.action != Idle || motion_.moving()) {
                 acknowledge(cmd, Refused);
                 return;
             }
@@ -778,22 +688,13 @@ private:
                 acknowledge(cmd, Refused);
                 return;
             }
-            setup_ = false;
             reference_ = motion_.encoder();
             if (!calibrated_) travelReference_ = reference_;
             calibrated_ = true;
             acknowledge(cmd, Done);
             break;
-        case SetMode:
-            if (!positioningReady() || setup_ || motion_.moving() || status_.action != Idle) {
-                acknowledge(cmd, Refused);
-                return;
-            }
-            status_.mode = cmd.mode;
-            acknowledge(cmd, Done);
-            break;
         case Position:
-            if (!positioningReady() || setup_ || motion_.moving() || status_.action != Idle || !finiteAxes(cmd)) {
+            if (!positioningReady() || motion_.moving() || status_.action != Idle || !finiteAxes(cmd)) {
                 acknowledge(cmd, Refused);
                 return;
             }
@@ -824,7 +725,7 @@ private:
         } else if (positionStarted_) {
             halt();
             acknowledge(cmd, Refused);
-        } else if (!motion_.position(target, reference_, true, false)) {
+        } else if (!motion_.position(target, reference_, true)) {
             halt();
         } else {
             positionStarted_ = motion_.moving();
@@ -863,7 +764,8 @@ private:
             status_.sequence = cmd.sequence;
             return;
         }
-        if (setup_ || !positioningReady() || !finiteAxes(cmd) ||
+        if (!positioningReady() || !finiteAxes(cmd) ||
+            (cmd.action == Horizon && (cmd.x || cmd.y)) ||
             std::max({std::abs(cmd.x), std::abs(cmd.y), std::abs(cmd.roll)}) > 1.0) {
             status_.sequence = cmd.sequence;
             halt();
@@ -900,40 +802,31 @@ private:
         if (motion_.moving()) return;
         const Pose current = readPose(positionFeedback(), reference_);
         const double roll = rollLimit();
-        const Pose next = nextJog(current, cmd.x, cmd.y, cmd.roll, status_.mode == Fixed, roll);
-        const Pose bendOnly = nextJog(current, cmd.x, cmd.y, 0, false, roll);
-        move(cmd.action == Track && !withinTravel(next, reference_, BendLimit, roll) ? bendOnly : next,
-             reference_, BendLimit, roll);
-    }
-
-    void serviceSetup(WORD buttons) {
-        const Pose current = readPose(motion_.profile(), setupReference_);
-        const int x = buttonAxis(buttons, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X);
-        const int y = buttonAxis(buttons, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_Y);
-        const int roll = buttonAxis(buttons, XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_LEFT);
-        const bool fixed = (buttons & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) != 0;
-        const int r = fixed ? buttonAxis(buttons, XINPUT_GAMEPAD_RIGHT_SHOULDER,
-                                       XINPUT_GAMEPAD_LEFT_SHOULDER) : roll;
-        const auto intent = std::array<int, 4>{x, y, r, int(fixed)};
-        if (intent != setupIntent_) {
-            setupIntent_ = intent;
-            setupLimitReached_ = false;
-            motion_.stop();
-            return;
-        }
-        if ((!x && !y && !r) || motion_.setupFeedbackMismatch() || setupLimitReached_) return;
-        if (!fixed) {
-            if (!canRollJog(current.roll, r)) {
-                setupLimitReached_ = true;
-                motion_.stop();
+        const bool tracking = cmd.action == Track;
+        const double bendStep = cmd.action == Horizon ? 0.0 : tracking ? TrackBendStep : JogBendStep;
+        const double rollStep = tracking ? TrackRollStep : JogRollStep;
+        const double zeroRoll = readPose(reference_, usesPlannedFeedback() ? setupReference_ : travelReference_).roll;
+        const double rollTarget = current.roll + std::clamp(cmd.roll * rollStep,
+            std::min(0.0, std::max(-roll, -roll - zeroRoll) - current.roll),
+            std::max(0.0, std::min(roll, roll - zeroRoll) - current.roll));
+        Pose next = nextJog(current, cmd.x, cmd.y, rollTarget, bendStep);
+        // A roll correction can run out of tendon travel before a bend-only step does.
+        if (!withinTravel(next, reference_, BendLimit, roll)) {
+            if (cmd.action == Horizon) {
+                halt();
+                status_.result = Limit;
+                blockedSequence_ = cmd.sequence;
                 return;
             }
-            if (!motion_.setupJog(x, y, r)) halt();
+            next = nextJog(current, cmd.x, cmd.y, current.roll, bendStep);
+        }
+        if (cmd.action == Horizon && next.roll == current.roll) {
+            halt();
+            status_.result = Limit;
+            blockedSequence_ = cmd.sequence;
             return;
         }
-        if (motion_.moving()) return;
-        move(nextJog(current, x * 0.5, y * 0.5, r * 0.5, fixed, SetupRollLimit),
-             setupReference_, NoBendLimit, SetupRollLimit, true);
+        move(next, reference_, BendLimit, roll, JogSpeedScale);
     }
 
     static bool canBendJog(Pose current, int x, int y) {
@@ -943,46 +836,47 @@ private:
         return projectedBend <= BendLimit || projectedBend < bend;
     }
 
-    static bool canRollJog(double current, int roll) {
-        const double projected = std::abs(current + roll * SetupRollStopMargin);
-        return projected <= SetupRollLimit || projected < std::abs(current);
-    }
-
-    void serviceBenchJog(const Command& cmd) {
+    void serviceSetupJog(const Command& cmd) {
         status_.sequence = cmd.sequence;
         if (cmd.action == Idle) {
             if (status_.action != Idle) halt();
             return;
         }
         const auto direction = [](double v) { return v == -1 || v == 0 || v == 1; };
-        if (cmd.action != Jog || !direction(cmd.x) || !direction(cmd.y) || !direction(cmd.roll)) {
+        if (cmd.action != Jog || !direction(cmd.x) || !direction(cmd.y) || cmd.roll != 0) {
             halt();
             status_.result = Refused;
             blockedSequence_ = cmd.sequence;
             return;
         }
-        const std::array<int, 3> intent{int(cmd.x), int(cmd.y), int(cmd.roll)};
-        if (intent == std::array<int, 3>{}) {
+        const std::array<int, 2> intent{int(cmd.x), int(cmd.y)};
+        if (intent == std::array<int, 2>{}) {
             if (status_.action != Idle) halt();
             return;
         }
-        if (intent != benchIntent_) {
-            motion_.stop();
-            benchIntent_ = intent;
+        if (intent != setupIntent_) {
+            if (setupIntent_ != std::array<int, 2>{} && !motion_.stop()) return;
+            setupIntent_ = intent;
         }
-        const auto [x, y, roll] = intent;
+        const auto [x, y] = intent;
         const Axes& profile = motion_.profile();
-        if (!canRollJog(readPose(profile, setupReference_).roll, roll) ||
-            (plannedZero_ && (!canBendJog(readPose(profile, reference_), x, y) ||
-                              !canBendJog(readPose(profile, travelReference_), x, y)))) {
+        if (plannedZero_ && (!canBendJog(readPose(profile, reference_), x, y) ||
+                             !canBendJog(readPose(profile, travelReference_), x, y))) {
             halt();
             status_.result = Limit;
             blockedSequence_ = cmd.sequence;
             return;
         }
+        const bool verifyFeedback = !usesPlannedFeedback();
+        if (verifyFeedback && !motion_.moving() && !setupFeedbackMatches()) {
+            halt();
+            status_.result = Refused;
+            blockedSequence_ = cmd.sequence;
+            return;
+        }
         status_.action = Jog;
         status_.result = Accepted;
-        if (!motion_.setupJog(x, y, roll, false)) halt();
+        if (!motion_.setupJog(x, y, verifyFeedback)) halt();
     }
 
     bool setupFeedbackMatches() const {
@@ -1003,41 +897,32 @@ private:
         return within({next.x + zero.x, next.y + zero.y, next.roll + zeroRoll}, bend, roll);
     }
 
-    void move(Pose next, const Axes& reference, double bend, double roll,
-              bool setup = false) {
+    void move(Pose next, const Axes& reference, double bend, double roll, double speedScale = 1.0) {
         if (!withinTravel(next, reference, bend, roll)) {
             motion_.stop();
             status_.result = Limit;
             status_.action = Idle;
             blockedSequence_ = status_.sequence;
-        } else if (!motion_.position(next, reference, setup || plannedFull_, setup)) {
+        } else if (!motion_.position(next, reference, plannedFull_, speedScale)) {
             halt();
         }
     }
 
-    static constexpr WORD SetupDirections = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B |
-        XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y | XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT |
-        XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER;
     Motion motion_;
-    bool simulated_, calibrated_ = false, setup_ = false, controller_ = false, appLive_ = false;
-    bool feedbackTest_;
+    bool simulated_, calibrated_ = false, appLive_ = false;
     bool manualBench_;
     bool plannedFull_;
     bool plannedZero_ = false;
     bool positionStarted_ = false;
     bool managedSession_ = false;
     uint64_t startedAt_ = 0;
-    std::array<int, 3> benchIntent_{};
+    std::array<int, 2> setupIntent_{};
     bool waitForNeutral_ = false;
-    bool setupLimitReached_ = false;
-    WORD lastButtons_ = 0;
-    DWORD xboxSlot_ = 0;
-    uint64_t nextXboxScan_ = 0;
     uint64_t blockedSequence_ = 0;
+    uint64_t recheckApp_ = 0;
     uint32_t trackingRevision_ = 0;
     Axes reference_{}, setupReference_{}, setupEncoder_{}, travelReference_{};
     Pose positionTarget_{};
-    std::array<int, 4> setupIntent_{};
     Status status_{};
     Mapping<Command> commands_;
     Mapping<Status> statusMapping_;
@@ -1046,10 +931,9 @@ private:
 }
 
 int wmain(int argc, wchar_t** argv) {
-    bool simulated = false, feedbackTest = false, manualBench = false, plannedFull = false, managedSession = false;
+    bool simulated = false, manualBench = false, plannedFull = false, managedSession = false;
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--simulate") == 0) simulated = true;
-        else if (std::wcscmp(argv[i], L"--feedback-test") == 0) feedbackTest = true;
         else if (std::wcscmp(argv[i], L"--manual-bench") == 0) manualBench = true;
         else if (std::wcscmp(argv[i], L"--planned-full") == 0) plannedFull = true;
         else if (std::wcscmp(argv[i], L"--managed-session") == 0) managedSession = true;
@@ -1058,13 +942,11 @@ int wmain(int argc, wchar_t** argv) {
             return 2;
         }
     }
-    if (int(simulated) + int(feedbackTest) + int(manualBench) + int(plannedFull) > 1 ||
-        (feedbackTest && managedSession)) {
+    if (int(manualBench) + int(plannedFull) > 1) {
         std::fprintf(stderr, "Conflicting Flex driver options.\n");
         return 2;
     }
-    const auto name = objectName(L"Driver");
-    const HANDLE singleton = CreateMutexW(nullptr, FALSE, name.c_str());
+    const HANDLE singleton = CreateMutexW(nullptr, FALSE, DriverMutex);
     if (!singleton || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (singleton) CloseHandle(singleton);
         std::fprintf(stderr, "A Flex driver is already running, or the session mutex is unavailable.\n");
@@ -1073,7 +955,7 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleCtrlHandler(consoleEvent, TRUE);
     int result = 1;
     {
-        Driver driver(simulated, feedbackTest, manualBench, plannedFull, managedSession);
+        Driver driver(simulated, manualBench, plannedFull, managedSession);
         if (driver.open()) result = driver.run();
         else std::fprintf(stderr, "Could not initialize Flex shared memory.\n");
     }

@@ -8,22 +8,22 @@ import time
 from dataclasses import dataclass
 
 
-PREFIX = r"Local\CRFFlexV1"
-MAGIC, VERSION = 0x58454C46, 1
+PREFIX = r"Local\CRFFlexV3"
+APPLICATION_MUTEX = r"Local\CRFFlexV1Application"
+MAGIC, VERSION = 0x58454C46, 3
 COMMAND = struct.Struct("<4I6Q2I3d")
 STATUS = struct.Struct("<4I5Q4IiI8d")
 VISION = struct.Struct("<4I4Q4I2diI")
 assert (COMMAND.size, STATUS.size, VISION.size) == (96, 144, 88)
 
-IDLE, STOP, CALIBRATE, SET_MODE, JOG, POSITION, TRACK, RETURN_ZERO = range(8)
-FIXED, FREE = range(2)
-CALIBRATED, SETUP, MOVING, SIMULATED, XBOX, SETUP_ENCODER_MISMATCH = (1, 2, 4, 8, 16, 32)
+IDLE, STOP, CALIBRATE, HORIZON, JOG, POSITION, TRACK, RETURN_ZERO, RECHECK_STARTUP = range(9)
+CALIBRATED, MOVING, SIMULATED, SETUP_ENCODER_MISMATCH = (1, 4, 8, 32)
 MANUAL_BENCH = 64
 PLANNED_ZERO = 128
 PLANNED_FULL = 256
+STARTUP_RECHECK = 512
 NO_RESULT, ACCEPTED, DONE, REFUSED, CANCELED, LIMIT = range(6)
-MODES = ("fixed", "free")
-ACTIONS = ("idle", "stop", "calibrate", "set mode", "jog", "position", "track", "return to zero")
+ACTIONS = ("idle", "stop", "calibrate", "horizon", "jog", "position", "track", "return to zero", "recheck startup")
 RESULTS = ("", "in progress", "complete", "refused", "canceled", "limit reached")
 AXIS_FAULT_BITS = (
     (0x02, "drive alarm"),
@@ -49,7 +49,6 @@ class FlexStatus:
     sequence: int
     request: int
     action: int
-    mode: int
     flags: int
     result: int
     fault: int
@@ -82,10 +81,6 @@ class FlexStatus:
     @property
     def positioning_ready(self):
         return self.calibrated or bool(self.flags & PLANNED_FULL and self.flags & PLANNED_ZERO)
-
-    @property
-    def setup(self):
-        return bool(self.flags & SETUP)
 
     @property
     def moving(self):
@@ -154,7 +149,7 @@ class FlexClient:
 
     def __init__(self):
         self._api = _Windows()
-        self._owner = self._api.create_mutex(None, False, PREFIX + "Application")
+        self._owner = self._api.create_mutex(None, False, APPLICATION_MUTEX)
         error = ct.get_last_error()
         if not self._owner:
             raise ct.WinError(error)
@@ -167,7 +162,7 @@ class FlexClient:
         self.status = None
         self.sequence = 0
         self._request_counter = 0
-        self._intent = (IDLE, FIXED, 0, 0, 0., 0., 0.)
+        self._intent = (IDLE, 0, 0, 0., 0., 0.)
         self._vision_frame = 0
 
     @property
@@ -199,24 +194,24 @@ class FlexClient:
             fields = STATUS.unpack(self._maps["Status"].copy())
             if fields[:4] != _header(STATUS):
                 raise OSError("Invalid Flex status layout")
-            driver, stamp, app, seq, req, action, mode, flags, result, fault, axis_status, *pose = fields[4:]
+            driver, stamp, app, seq, req, action, reserved, flags, result, fault, axis_status, *pose = fields[4:]
             if (not driver or not stamp or not 0 <= self._api.now() - stamp <= FEEDBACK_TIMEOUT_MS
-                    or action >= len(ACTIONS) or mode >= len(MODES) or result >= len(RESULTS)
+                    or action >= len(ACTIONS) or reserved or result >= len(RESULTS)
                     or not all(map(math.isfinite, pose)) or pose[3] < 0
                     or (pose[3] == 0 and flags & (CALIBRATED | PLANNED_ZERO))):
                 raise OSError("Invalid or stale Flex status")
             if self.status is None or driver != self.status.driver or (self.ready and app != self.app):
                 self._vision_frame = 0
                 self.command(IDLE)
-            self.status = FlexStatus(driver, stamp, app, seq, req, action, mode, flags, result, fault,
+            self.status = FlexStatus(driver, stamp, app, seq, req, action, flags, result, fault,
                                      *pose[:4], tuple(pose[4:]), axis_status)
             return self.status
         except OSError:
             self._detach()
             return None
 
-    def command(self, action, *, mode=FIXED, request=0, frame=0, x=0., y=0., roll=0.):
-        intent = (action, mode, request, frame, x, y, roll)
+    def command(self, action, *, request=0, frame=0, x=0., y=0., roll=0.):
+        intent = (action, request, frame, x, y, roll)
         if intent != self._intent or not self.sequence:
             self.sequence += 1
             self._intent = intent
@@ -230,7 +225,7 @@ class FlexClient:
         if self.status is None:
             return False
         tick = self._api.now()
-        action, mode, request, frame, x, y, roll = self._intent
+        action, request, frame, x, y, roll = self._intent
         try:
             if observation is not None and observation.frame != self._vision_frame:
                 age = max(0., time.monotonic() - observation.captured_at)
@@ -244,7 +239,7 @@ class FlexClient:
                 self._maps["Vision"].copy(data)
                 self._vision_frame = observation.frame
             data = COMMAND.pack(*_header(COMMAND), self.status.driver, self.app, self.sequence,
-                                tick, request, frame, action, mode, x, y, roll)
+                                tick, request, frame, action, 0, x, y, roll)
             self._maps["Command"].copy(data)
             return True
         except OSError:

@@ -11,10 +11,10 @@ import time
 import numpy as np
 
 if __package__:
-    from .kinematics import EndoscopeKinematics, HOME_DEG
+    from .kinematics import EndoscopeKinematics
     from .flex_endo.flex_control import FLEX_KEYS
 else:
-    from kinematics import EndoscopeKinematics, HOME_DEG
+    from kinematics import EndoscopeKinematics
     from flex_endo.flex_control import FLEX_KEYS
 
 # ---------- copy of flex constants ----------
@@ -59,7 +59,6 @@ class ControlNode:
     FLEX_YAW_VEL        = 1.0
     FLEX_CURV_VEL       = 10.0
     FLEX_ARC_VEL        = 0.020
-    TRAJ_DURATION_S     = 3.0
     RCM_CONE_HALF_ANGLE = math.radians(10.0)
     TELEOP_RESYNC_RAD   = 0.05
 
@@ -111,7 +110,6 @@ class ControlNode:
         self.rcm_ref_axis     = None
         self.rcm_ref_depth    = None
         self.arm_mode         = 'linear'
-        self.flex_mode        = 'fixed'
 
         self._q_cmd       = None
         self._teleop_servo_active = False       # ★ 位置伺服活跃标记
@@ -527,16 +525,12 @@ class ControlNode:
             try:
                 by, ey = self.kin.solve_horizon_flex_yaw(
                     q=self.joint_positions, steer_yaw=self.flex_steer_yaw,
-                    theta_total=theta_total, flex_mode=self.flex_mode)
+                    theta_total=theta_total)
                 self.flex_base_yaw = float(by); self.flex_ext_yaw = float(ey); return
             except Exception as e:
                 log.warning(f"auto horizon twist failed: {e}")
-        if self.flex_mode == 'fixed':
-            self.flex_base_yaw = float(self.flex_steer_yaw)
-            self.flex_ext_yaw  = float(-self.flex_steer_yaw)
-        else:
-            self.flex_base_yaw = float(self.flex_steer_yaw)
-            self.flex_ext_yaw  = 0.0
+        self.flex_base_yaw = float(self.flex_steer_yaw)
+        self.flex_ext_yaw = float(-self.flex_steer_yaw)
 
     def _update_flex_state(self):
         with self._lock:
@@ -602,50 +596,26 @@ class ControlNode:
         self.rcm_ref_depth = float(np.dot(p_tip - p_rcm, axis))
         self.rcm_enabled = True
 
-    def toggle_flex_mode(self):
-        if self.flex is not None:
-            if self.flex.status is None:
-                return False
-            return self.flex.set_mode("free" if self.flex.status.mode == 0 else "fixed")
-        with self._lock:
-            self.flex_mode = 'free' if self.flex_mode == 'fixed' else 'fixed'
-            m = self.flex_mode
-            if m != 'fixed' and self._track_target is not None:
-                self._clear_track_state_unlocked()
-                log.warning("TRACKING auto-cancelled (flex not fixed)")
-        self._update_flex_state()
-        log.info(f"Flex mode -> {m}")
-
     # ---------- semi-auto ----------
-    def cmd_home(self):
-        if not self._arm_ready():
-            return False
-        with self._lock:
-            self._cancel_motion()
-            if self.flex is None:
-                self._set_flex_slew_target(curvature=0., steer_yaw=0., arc_len=FLEX_ARC_MAX)
-        if self.flex is None:
-            self._update_flex_state()
-        q_target = np.deg2rad(np.array(HOME_DEG, float))
-        q_target = self._auto_solve_wrist1(q_target)
-        return self._send_trajectory(q_target, traj_duration=self.TRAJ_DURATION_S)
-
     def cmd_reset(self):
         if not self._arm_ready():
-            return False
+            raise ValueError("RESET requires fresh UR5 joint feedback and a ready arm.")
+        target = np.deg2rad([0., -120., -120., -30., 90., 45.])
         with self._lock:
-            self._pull_out_state = None
-            self._flex_slew_target = None
-            tracking_was = self._track_target is not None
-            self._clear_track_state_unlocked()
+            self._cancel_motion()
             self.arm_mode = 'linear'
-            self.flex_mode = 'fixed'
             self.rcm_enabled = False
             self.rcm_world_point = None
             self.rcm_ref_axis = None
             self.rcm_ref_depth = None
-        if tracking_was: log.warning("TRACKING auto-cancelled (RESET)")
-        return self.cmd_home()
+            distance = float(np.max(np.abs(target - self.joint_positions)))
+        if distance < 1e-6:
+            return self._send({"type": "stop"})
+        # The relay waits for active motion to stop before running moveJ.
+        speed = float(np.clip(distance / 3.0, 0.02, 3.0))
+        accel = float(np.clip(2.0 * speed, 0.05, 5.0))
+        return self._send({"type": "move_joint", "positions": target.tolist(),
+                           "speed": speed, "accel": accel})
 
     def cmd_bird_eye_view(self):
         if self.flex is not None:
@@ -825,8 +795,8 @@ class ControlNode:
         with self._lock:
             rcm_ok = (self.arm_mode == 'rcm' and self.rcm_enabled
                       and self.rcm_world_point is not None)
-            if not rcm_ok or self.flex_mode != 'fixed':
-                refusal = 'requires RCM mode + fixed flex mode'
+            if not rcm_ok:
+                refusal = 'requires RCM mode'
                 self._track_status_msg = refusal
             else:
                 self._pull_out_state = None; self._flex_slew_target = None
@@ -870,7 +840,6 @@ class ControlNode:
             kappa = float(self.flex_curvature)
             steer_yaw = float(self.flex_steer_yaw)
             arc_len = float(self.flex_arc_len)
-            flex_mode = self.flex_mode
             standoff = float(self.standoff)
             already_warned = self._track_warned
             recovering = bool(self._track_recover)
@@ -878,9 +847,6 @@ class ControlNode:
         if not (arm_mode == 'rcm' and rcm_on and rcm_pt is not None and ref_axis is not None):
             with self._lock: self._clear_track_state_unlocked()
             log.warning("TRACKING auto-cancelled (RCM gone)"); return
-        if flex_mode != 'fixed':
-            with self._lock: self._clear_track_state_unlocked()
-            log.warning("TRACKING auto-cancelled (flex not fixed)"); return
         if p_target is None:
             if not already_warned: log.warning(f"TRACKING waiting for target '{key}'")
             return
@@ -891,7 +857,7 @@ class ControlNode:
             d_ins = float(np.linalg.norm(p_tip - rcm_pt))
             p_cam, v_hat = self.kin.camera_pose_on_shaft(
                 rcm_pt, R_shaft, d_ins, kappa, steer_yaw,
-                arc_len=arc_len, flex_mode=flex_mode,
+                arc_len=arc_len,
                 tip_to_flex_base=TRACK_TIP_TO_FLEX_BASE)
         except Exception as e:
             log.warning(f"TRACKING FK: {e}"); return
@@ -934,7 +900,7 @@ class ControlNode:
                 try:
                     J = self.kin.hybrid_rcm_jacobian(
                         rcm_pt, R_shaft, d_ins, kappa, steer_yaw, standoff,
-                        arc_len=arc_len, flex_mode=flex_mode,
+                        arc_len=arc_len,
                         tip_to_flex_base=TRACK_TIP_TO_FLEX_BASE)
                 except Exception as e:
                     log.warning(f"TRACKING jacobian: {e}"); return
@@ -1035,29 +1001,6 @@ class ControlNode:
             self._q_cmd = None
         self._send({"type": "stop"})
 
-    def _send_trajectory(self, q_target, traj_duration):
-        with self._lock:
-            if not self._arm_ready():
-                return False
-            q_base = self.joint_positions.copy()
-
-        q_target = np.asarray(q_target, float)
-        if q_target.shape != (6,) or not np.isfinite(q_target).all():
-            return False
-        max_delta = float(np.max(np.abs(q_target - q_base)))
-        if max_delta < 1e-6:
-            speed = 0.05
-        else:
-            speed = max_delta / float(traj_duration)
-        speed = float(np.clip(speed, 0.02, 3.0))
-        accel = float(np.clip(speed * 2.0, 0.05, 5.0))
-
-        return self._send({
-            "type": "move_joint",
-            "positions": q_target.tolist(),
-            "speed": speed, "accel": accel,
-        })
-
     # ---------- key state ----------
     def set_key(self, key, down):
         if self.flex is not None and key in FLEX_KEYS:
@@ -1077,6 +1020,8 @@ class ControlNode:
                 self.flex.cancel("Coordinated motion stopped · manual arm input")
                 if self._teleop_servo_active:
                     self._send_servo_stop()
+            if key.startswith("arm_"):
+                self.flex.resume_horizon()
         self._key_state[key] = down
         if down:
             self._key_updated[key] = time.monotonic()
@@ -1101,7 +1046,6 @@ class ControlNode:
             theta_total = min(FLEX_MAX_BEND, eff*max(0., self.flex_curvature))
             state = {
                 'arm_mode': self.arm_mode,
-                'flex_mode': self.flex_mode,
                 'rcm_enabled': self.rcm_enabled,
                 'rcm_point': None if self.rcm_world_point is None else self.rcm_world_point.tolist(),
                 'joints_deg': (np.rad2deg(q).tolist() if q is not None else None),

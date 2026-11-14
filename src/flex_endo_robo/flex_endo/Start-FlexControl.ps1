@@ -13,12 +13,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../..')).ProviderPath
 $buildFolder = Join-Path $PSScriptRoot "build/Win32/$Configuration"
-$driverPath = Join-Path $buildFolder 'XboxEndoscopeTeleoperation.exe'
+$driverPath = Join-Path $buildFolder 'FlexEndoscopeDriver.exe'
 if (!(Test-Path -LiteralPath $driverPath -PathType Leaf)) {
     throw "Driver executable missing at '$driverPath'. Build the Visual Studio solution in $Configuration | x86."
 }
-if (Get-Process -Name 'XboxEndoscopeTeleoperation' -ErrorAction SilentlyContinue) {
-    throw 'Close the current Xbox/Flex driver before starting this control session.'
+if (Get-Process -Name 'FlexEndoscopeDriver' -ErrorAction SilentlyContinue) {
+    throw 'Close the current Flex driver before starting this control session.'
 }
 
 $python = Get-Command python -CommandType Application | Select-Object -First 1

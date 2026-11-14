@@ -184,6 +184,10 @@ class Relay:
 
     def _execute_dashboard_stop(self):
         try:
+            self._stop_motion()
+        except (OSError, RuntimeError):
+            log.exception("RTDE stop failed before Dashboard Stop")
+        try:
             dashboard_stop(self.robot_ip)
         except (OSError, RuntimeError) as error:
             log.exception("Dashboard Stop failed")
@@ -191,7 +195,6 @@ class Relay:
             with self.lock:
                 self.fault = failure
                 self.dashboard_result.set_result(failure)
-            self._stop_motion()
         else:
             self.mode = None
             with self.lock:

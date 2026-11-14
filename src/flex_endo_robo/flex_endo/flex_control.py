@@ -8,12 +8,16 @@ import numpy as np
 from . import flex_ipc as ipc
 
 
-FLEX_KEYS = ("flex_left", "flex_right", "flex_up", "flex_down", "flex_ccw", "flex_cw")
+FLEX_KEYS = ("flex_left", "flex_right", "flex_up", "flex_down")
 POSITION_TIMEOUT_S = 30.0
 KEY_TIMEOUT_S = 0.65
 STRAIGHT_BEND_DEG = 0.25
-TRACK_BEND_MARGIN_DEG = 0.5
-TRACK_ARM_SPEED_RAD_S = math.radians(2)
+TRACK_ARM_SPEED_RAD_S = math.radians(3)
+PULL_OUT_ALIGN_SPEED_RAD_S = math.radians(2)
+# Match the per-command increments in the native Flex driver.
+JOG_BEND_STEP_DEG, JOG_ROLL_STEP_DEG = 0.24, 0.80
+TRACK_BEND_STEP_DEG, TRACK_ROLL_STEP_DEG = 0.32, 1.0
+HORIZON_DEADBAND_DEG = 0.15
 PIVOT_TOLERANCE_M = 0.002
 
 
@@ -31,21 +35,52 @@ class FlexControl:
         self._driver = None
         self._owned = False
         self.stop_request = None
+        self._startup_recheck = None
         self._tracking_limit = None
-        self._tracking_sequence = 0
+        self._tracking_command = None
+        self._horizon_paused = False
+        self._zero_hold_joints = None
 
     @property
     def status(self):
         return self.client.status
 
-    def ready(self, *, calibrated=True, allow_setup=False):
+    def ready(self, *, calibrated=True):
         s = self.status
         return (self.client.ready and s is not None and not s.fault
-                and (s.positioning_ready or not calibrated) and (allow_setup or not s.setup))
+                and (s.positioning_ready or not calibrated))
 
     def jog_ready(self):
+        return (self.ready(calibrated=False)
+                and not (self.status.flags & ipc.SETUP_ENCODER_MISMATCH))
+
+    def connection_issue(self):
         s = self.status
-        return self.ready(calibrated=not (s and s.planned_feedback))
+        if s is None:
+            return "Flex driver offline. Check the launcher console."
+        if s.fault:
+            detail = s.fault_detail or f"GTS fault {s.fault}"
+            return f"Flex blocked by {detail}. See the Flex state panel."
+        if not self.client.ready:
+            return "Waiting for the Flex driver to acknowledge the session."
+        return None
+
+    def recheck_startup_inputs(self):
+        s = self.status
+        if self._startup_recheck is not None:
+            raise ValueError("A Flex input recheck is already pending.")
+        if s is None or not (s.flags & ipc.STARTUP_RECHECK):
+            raise ValueError("A Flex startup input recheck is unavailable. See the driver console.")
+        request = self.client.request(ipc.RECHECK_STARTUP)
+        if not self.client.send():
+            raise ValueError("Could not send the Flex input recheck. Check the driver connection.")
+        self._startup_recheck = (s.driver, request, time.monotonic() + 2.0)
+        self.message = "Rechecking Flex startup inputs…"
+        return True
+
+    def _available_for_request(self):
+        s = self.status
+        return s.action == ipc.HORIZON or (s.action == ipc.IDLE and not s.moving)
 
     def set_key(self, key, down):
         if not down:
@@ -62,7 +97,12 @@ class FlexControl:
             self.cancel("Flex positioning canceled by manual input")
             return False
         self.keys[key] = time.monotonic()
+        self.resume_horizon()
         return True
+
+    def resume_horizon(self):
+        self._horizon_paused = False
+        self._zero_hold_joints = None
 
     def heartbeat(self, held):
         now = time.monotonic()
@@ -82,20 +122,29 @@ class FlexControl:
         return False
 
     def stop(self):
+        self._horizon_paused = True
+        self._zero_hold_joints = None
         self.tracking = None
         self.tracking_state = "Off"
         self._tracking_limit = None
+        self._tracking_command = None
         self.keys.clear()
         self.pending = self.procedure = None
+        self._startup_recheck = None
         self._owned = False
+        if not self.client.ready:
+            self.stop_request = None
+            self.client.command(ipc.IDLE)
+            return False
         self.stop_request = self.client.request(ipc.STOP)
         return self.client.send()
 
-    def stop_acknowledged(self):
+    def stop_acknowledged(self, request=None):
+        request = self.stop_request if request is None else request
         s = self.status
-        return (self.stop_request is None or
-                (s is not None and s.app == self.client.app and s.request == self.stop_request
-                 and s.result == ipc.DONE and not s.moving))
+        return (request is None or
+                (s is not None and s.app == self.client.app and s.request == request
+                 and s.result == ipc.DONE and not s.fault and not s.moving))
 
     def cancel(self, message):
         self.stop()
@@ -107,44 +156,34 @@ class FlexControl:
         self.tracking = None
         self.tracking_state = state
         self._tracking_limit = None
+        self._tracking_command = None
         self.stop_request = self.client.request(ipc.STOP)
         self.client.send()
         self._owned = False
 
     def calibrate(self):
-        if (not self.ready(calibrated=False, allow_setup=True) or not self.stop_acknowledged()
-                or self.status.moving
-                or self.status.action != ipc.IDLE or self.keys or self.pending
+        if (not self.ready(calibrated=False) or not self.stop_acknowledged()
+                or not self._available_for_request() or self.keys or self.pending
                 or self.procedure or self.tracking):
             raise ValueError("Calibration requires stationary Flex hardware with all motion controls released.")
         if self.status.flags & ipc.SETUP_ENCODER_MISMATCH:
             raise ValueError("Setup travel and encoder feedback disagree. Check the encoder wiring, direction, and pulse scale.")
+        self.resume_horizon()
         return self._request(ipc.CALIBRATE)
 
     def return_to_zero(self):
         s = self.status
-        if (not self.jog_ready() or not self.stop_acknowledged() or s.moving
-                or s.action != ipc.IDLE or self.keys or self.pending or self.procedure or self.tracking):
+        if (not self.jog_ready() or not self.stop_acknowledged() or not self._available_for_request()
+                or self.keys or self.pending or self.procedure or self.tracking):
             raise ValueError("Stop Flex motion and release the jog controls before returning to zero.")
         if not (s.positioning_ready or s.flags & ipc.PLANNED_ZERO):
             raise ValueError("Calibrate Flex first to record a zero position.")
         if not self._request(ipc.RETURN_ZERO):
             return False
+        self._horizon_paused = True
+        self._zero_hold_joints = None
         self.message = "Returning to planned Flex zero" if s.flags & ipc.PLANNED_ZERO else "Returning Flex to zero"
         return True
-
-    def set_mode(self, mode):
-        if mode not in ipc.MODES:
-            raise ValueError("Choose fixed or free.")
-        if (not self.ready() or not self.stop_acknowledged()
-                or self.keys or self.pending or self.procedure):
-            raise ValueError("Release Flex controls and wait for positioning to finish.")
-        if self.tracking:
-            self.cancel_tracking()
-            raise ValueError("Tracking stopped. Select the mode once Flex is idle.")
-        if self.status.moving or self.status.action != ipc.IDLE:
-            raise ValueError("Wait for Flex to be stationary before changing mode.")
-        return self._request(ipc.SET_MODE, mode=ipc.MODES.index(mode))
 
     def _rcm_ready(self, node):
         return (node._arm_ready() and node.arm_mode == "rcm" and node.rcm_enabled
@@ -158,8 +197,7 @@ class FlexControl:
             return True
         if not self._rcm_ready(node):
             raise ValueError("Tracking requires an active UR5 RCM and fresh joint feedback.")
-        if (not self.ready() or not self.stop_acknowledged() or self.status.moving
-                or self.status.action != ipc.IDLE
+        if (not self.ready() or not self.stop_acknowledged() or not self._available_for_request()
                 or self.keys or self.pending or self.procedure):
             raise ValueError("Tracking requires calibrated, idle Flex hardware.")
         obs = self.camera.observation()
@@ -170,6 +208,7 @@ class FlexControl:
         with node._lock:
             node._clear_track_state_unlocked()
         self.tracking = (obs.revision, obs.category)
+        self.resume_horizon()
         self.tracking_state = "Waiting for target"
         self.message = ""
         return True
@@ -193,8 +232,12 @@ class FlexControl:
         if not obs.valid or obs.centered:
             self.tracking_state = "Centered" if obs.valid else "Waiting for target"
             self._tracking_limit = None
-            self.client.command(ipc.IDLE)
-            self._owned = False
+            self._tracking_command = None
+            if obs.valid:
+                self._hold_horizon(node)
+            else:
+                self.client.command(ipc.IDLE)
+                self._owned = False
             return
 
         # The prototype maps image right/down to the two tendon axes. Both
@@ -207,77 +250,122 @@ class FlexControl:
         direction = error / norm
         s = self.status
         bend = np.array((s.bend_x, s.bend_y))
-        # Camera frames can advance faster than the driver acknowledges them.
-        if self._owned and s.result == ipc.LIMIT and s.sequence >= self._tracking_sequence:
-            self._tracking_limit = direction
-        blocked = self._tracking_limit is not None and np.dot(direction, self._tracking_limit) > 0.95
-        if not blocked:
-            self._tracking_limit = None
-        next_bend = np.linalg.norm(bend + TRACK_BEND_MARGIN_DEG * direction)
-        if not blocked and (next_bend < s.bend_limit or next_bend < np.linalg.norm(bend)):
-            gain = min(1., max(0.15, norm / (0.12 * min(obs.width, obs.height))))
-            x, y = gain * direction
+        gain = min(1., max(0.15, norm / (0.12 * min(obs.width, obs.height))))
+        step = gain * direction
+        # Remember the last rejected Flex correction. A changed direction,
+        # smaller step, or changed Flex pose can fit within the travel limits.
+        if (self._tracking_command is not None and s.result == ipc.LIMIT
+                and s.sequence == self._tracking_command[0]):
+            self._tracking_limit = self._tracking_command[1:]
+        blocked = False
+        if self._tracking_limit is not None:
+            limited_bend, limited_roll, limited_step = self._tracking_limit
+            blocked = (np.linalg.norm(bend - limited_bend) < 0.02
+                       and abs(s.roll - limited_roll) < 0.1
+                       and np.linalg.norm(step - limited_step) < 0.02)
+            if not blocked:
+                self._tracking_limit = None
+        current_bend = np.linalg.norm(bend)
+        next_bend = np.linalg.norm(bend + TRACK_BEND_STEP_DEG * step)
+        if not blocked and (next_bend <= s.bend_limit or next_bend < current_bend):
+            x, y = step
             self.client.command(ipc.TRACK, frame=obs.frame, x=x, y=y,
-                                roll=self._horizon_correction(node, x, y))
-            if not self._owned:
-                self._tracking_sequence = self.client.sequence
+                                roll=self._horizon_correction(
+                                    node, x, y, TRACK_BEND_STEP_DEG, TRACK_ROLL_STEP_DEG))
+            if self._tracking_command is None or self.client.sequence != self._tracking_command[0]:
+                self._tracking_command = (self.client.sequence, bend, s.roll, step)
             self._owned = True
             self.tracking_state = "Following with Flex"
             return
 
-        self.client.command(ipc.IDLE)
-        self._owned = False
-        if s.moving or s.action == ipc.TRACK:
+        self._tracking_command = None
+        if s.action == ipc.TRACK or (s.moving and s.action != ipc.HORIZON):
+            self.client.command(ipc.IDLE)
+            self._owned = False
             self.tracking_state = "Holding Flex before arm assist"
             return
-        axis, _, tip = node.kin.tube_axis_in_base(q_now)
+        # Advance from the last nearby servo target so RTDE lag does not reduce
+        # each correction to a single step from the measured pose.
+        q_seed = q_now
+        q_cmd = node._q_cmd
+        if (q_cmd is not None and np.max(np.abs(q_cmd - q_now)) <= node.TELEOP_RESYNC_RAD
+                and self._valid_arm_pose(node, q_cmd)):
+            q_seed = q_cmd
+        axis, _, tip = node.kin.tube_axis_in_base(q_seed)
         pivot = node.rcm_world_point
         depth = float(np.dot(tip - pivot, axis))
         if depth <= 0:
             self.cancel_tracking("Tracking stopped · UR5 outside the RCM envelope")
             return
-        camera_rotation = node.kin.physical_flex_camera_rotation(q_now, s.bend_x, s.bend_y, s.roll)
+        camera_rotation = node.kin.physical_flex_camera_rotation(q_seed, s.bend_x, s.bend_y, s.roll)
         right = -camera_rotation[:, 1]
         down = camera_rotation[:, 0]
-        tangent = direction[0] * right + direction[1] * down
-        tangent -= np.dot(tangent, axis) * axis
+        image_tangent = direction[0] * right + direction[1] * down
+        # Rotate the camera toward the detection. Only the component of that
+        # rotation perpendicular to the shaft can change its RCM tilt.
+        tangent = np.cross(np.cross(camera_rotation[:, 2], image_tangent), axis)
         length = float(np.linalg.norm(tangent))
         if length < 1e-6:
-            self.cancel_tracking("Tracking limited · target cannot be centered")
+            self._wait_at_tracking_limit("no available RCM tilt toward the target")
             return
         angle = TRACK_ARM_SPEED_RAD_S * node.dt
         axis_target = math.cos(angle) * axis + math.sin(angle) * tangent / length
         if not node._inside_rcm_cone(axis_target, node.rcm_ref_axis):
-            self.cancel_tracking("Tracking limited · target cannot be centered")
-            return
-        q_target = node.kin.ik_along_axis(pivot + depth * axis_target, axis_target, q_now)
+            ref = node.rcm_ref_axis
+            radial = axis_target - np.dot(axis_target, ref) * ref
+            cone = node.RCM_CONE_HALF_ANGLE
+            axis_target = math.cos(cone) * ref + math.sin(cone) * radial / np.linalg.norm(radial)
+            if np.dot(axis_target - axis, tangent) <= 1e-8:
+                self._wait_at_tracking_limit("UR5 RCM cone reached")
+                return
+        q_target = node.kin.ik_along_axis(pivot + depth * axis_target, axis_target, q_seed)
         if q_target is None or not node._send_servo(
                 q_target, q_now, node.dt, validate=lambda q: node._rcm_pose_is_valid(q, depth)):
-            self.cancel_tracking("Tracking stopped · RCM correction unavailable")
+            self._wait_at_tracking_limit("no feasible RCM correction")
             return
         self.tracking_state = "Following with arm assist"
+        self._hold_horizon(node)
+
+    def _wait_at_tracking_limit(self, reason):
+        self.client.command(ipc.IDLE)
+        self._owned = False
+        self.tracking_state = f"Tracking limited · {reason}. Waiting for target to move."
 
     def _valid_arm_pose(self, node, q):
         return node._rcm_pose_is_valid(q)
 
-    def _horizon_correction(self, node, x, y):
+    def _horizon_correction(self, node, x, y, bend_step, roll_step):
         s = self.status
-        if s.mode != ipc.FIXED or not (x or y) or not node._arm_ready():
+        if self._horizon_paused or not node._arm_ready():
             return 0.
         q = node.joint_positions.copy()
-        x_next, y_next = s.bend_x + x * 0.12, s.bend_y + y * 0.12
+        scale = max(1., math.hypot(x, y))
+        x_next, y_next = s.bend_x + x * bend_step / scale, s.bend_y + y * bend_step / scale
         radius = math.hypot(x_next, y_next)
+        neutral, _ = node.kin.solve_horizon_flex_yaw(q)
         if radius < STRAIGHT_BEND_DEG:
-            return 0.
-        neutral, _ = node.kin.solve_horizon_flex_yaw(q, flex_mode="free")
-        plane = math.radians(s.roll) + math.atan2(-x_next, y_next)
-        target, _ = node.kin.solve_horizon_flex_yaw(
-            q, steer_yaw=plane - neutral, theta_total=math.radians(radius), flex_mode="fixed")
+            target = neutral
+        else:
+            plane = math.radians(s.roll) + math.atan2(-x_next, y_next)
+            target, _ = node.kin.solve_horizon_flex_yaw(
+                q, steer_yaw=plane - neutral, theta_total=math.radians(radius))
         target = math.degrees(target)
         delta = (target - s.roll + 180.) % 360. - 180.
         limit = self._roll_limit()
         bounded = min(limit - s.roll, max(-limit - s.roll, delta))
-        return float(np.clip(bounded / 0.40, -1., 1.))
+        if abs(bounded) <= HORIZON_DEADBAND_DEG:
+            return 0.
+        return float(np.clip(bounded / roll_step, -1., 1.))
+
+    def _hold_horizon(self, node):
+        s = self.status
+        roll = self._horizon_correction(node, 0., 0., 0., JOG_ROLL_STEP_DEG)
+        if roll:
+            self.client.command(ipc.HORIZON, roll=roll)
+            self._owned = s.result != ipc.LIMIT or s.sequence != self.client.sequence
+        else:
+            self.client.command(ipc.IDLE)
+            self._owned = False
 
     def _roll_limit(self):
         return 20. if self.status.planned_feedback else 180.
@@ -290,7 +378,7 @@ class FlexControl:
         if self.tracking:
             self.cancel_tracking()
             raise ValueError("Tracking stopped. Try the positioning command once Flex is idle.")
-        if s.moving or s.action != ipc.IDLE:
+        if not self._available_for_request():
             raise ValueError("Wait for Flex to stop before positioning.")
         if (not all(map(math.isfinite, (x, y, roll))) or abs(roll) > self._roll_limit()
                 or math.hypot(x, y) > s.bend_limit + 1e-6):
@@ -309,9 +397,7 @@ class FlexControl:
         if required < -1e-6 or required > math.radians(self.status.bend_limit) + 1e-6:
             raise ValueError("The 30° downward view is outside the available bend range.")
         bend = max(0., math.degrees(required))
-        base, distal = node.kin.solve_horizon_flex_yaw(
-            q, steer_yaw=0., theta_total=max(0., required),
-            flex_mode=ipc.MODES[self.status.mode])
+        base, distal = node.kin.solve_horizon_flex_yaw(q, theta_total=max(0., required))
         # The physical bending-plane yaw is base plus distal compensation.
         # Tendon x points image-right and tendon y points image-down.
         tendon_angle = distal
@@ -320,6 +406,7 @@ class FlexControl:
             raise ValueError("Bird-eye needs more base roll than is available at this UR5 pose.")
         if not self._position(-bend * math.sin(tendon_angle), bend * math.cos(tendon_angle), roll):
             return False
+        self.resume_horizon()
         self.message = "Bird-eye · moving Flex"
         return True
 
@@ -405,7 +492,7 @@ class FlexControl:
                 return
             cross = np.cross(axis, ref)
             axis_target = node.kin.rotate_about(axis, cross / np.linalg.norm(cross),
-                                                min(actual_error, TRACK_ARM_SPEED_RAD_S * node.dt))
+                                                min(actual_error, PULL_OUT_ALIGN_SPEED_RAD_S * node.dt))
             depth = st["depth"]
         else:
             if actual_error > math.radians(1):
@@ -428,29 +515,46 @@ class FlexControl:
             self.cancel("Pull Out stopped · RCM correction unavailable")
 
     def tick(self, node):
-        old, owned = self._driver, self._owned
+        old = self._driver
         s = self.client.poll()
-        self._driver = s.driver if s else None
+        self._driver = s.driver if s is not None and self.client.ready else None
         exclusive = bool(self.tracking or self.procedure or
                          (self.pending and self.pending[1] in (ipc.POSITION, ipc.RETURN_ZERO)))
-        if old != self._driver or (s is not None and not s.fault and not self.client.ready):
-            if old is not None or owned or self.tracking or self.procedure:
-                self.cancel("Flex motion blocked by GTS fault" if s and s.fault
-                            else "Flex driver disconnected or restarted")
-            if s is None or not self.client.ready:
-                self.stop_request = None
-        elif s is not None and s.fault and self.stop_request is not None:
-            self.stop_request = None
-        if s is None:
+        if old is not None and old != self._driver:
+            self.cancel("Flex motion blocked by GTS fault" if s and s.fault
+                        else "Flex driver disconnected or restarted")
+        if self._startup_recheck is not None:
+            driver, request, deadline = self._startup_recheck
+            if s is None or s.driver != driver:
+                self.message = "Flex driver connection lost during the input recheck."
+            elif s.request == request and s.result in (ipc.DONE, ipc.REFUSED):
+                self.message = ("GTS startup inputs are clear. Waiting for the drives to settle."
+                                if s.result == ipc.DONE else
+                                "GTS still reports a fault. Check Flex drive power and the alarm and limit inputs.")
+            elif time.monotonic() >= deadline:
+                self.message = "Flex input recheck timed out. Check the driver console and restart the session."
+            else:
+                self.client.send()
+                return exclusive
+            self._startup_recheck = None
+        if self._driver is None:
+            if s is not None:
+                # The driver waits for neutral intent and drive settling before it
+                # acknowledges this app. Keep the heartbeat neutral until then.
+                self.client.command(ipc.IDLE)
+                self.client.send()
             return exclusive
-        if self.client.ready and self.message == "Flex driver disconnected or restarted":
+        if self.message == "Flex driver disconnected or restarted":
             self.message = ""
+        elif self.message == "GTS startup inputs are clear. Waiting for the drives to settle." and not s.fault:
+            self.message = "GTS startup inputs are clear."
+        if s.fault:
+            self.stop_request = None
+            if self.tracking or self.procedure or self.keys or self.pending:
+                self.cancel("Flex driver fault")
         if self.stop_request is not None and self.stop_acknowledged():
             self.stop_request = None
             self.client.command(ipc.IDLE)
-        if s.fault or (s.setup and (self.tracking or self.procedure or self.keys)):
-            if self.tracking or self.procedure or self.keys or self.pending:
-                self.cancel("Flex driver fault or local Xbox ownership")
         now = time.monotonic()
         self.keys = {k: t for k, t in self.keys.items() if now - t <= KEY_TIMEOUT_S}
         if self.pending:
@@ -465,29 +569,37 @@ class FlexControl:
                 self._owned = False
                 self.client.command(ipc.IDLE)
                 label = {ipc.POSITION: "Bird-eye", ipc.CALIBRATE: "Calibration",
-                         ipc.RETURN_ZERO: "Return to Flex zero",
-                         ipc.SET_MODE: "Mode change"}[action]
+                         ipc.RETURN_ZERO: "Return to Flex zero"}[action]
                 if result != ipc.DONE:
                     self.cancel(f"{label} {ipc.RESULTS[result]}")
                 elif not self.procedure:
+                    if action == ipc.RETURN_ZERO and node._arm_ready():
+                        self._zero_hold_joints = node.joint_positions.copy()
                     if s.planned_feedback and action == ipc.RETURN_ZERO:
                         self.message = "Returned to planned Flex zero"
                     elif s.planned_feedback and action == ipc.POSITION:
                         self.message = "Bird-eye · planned position reached"
                     else:
                         self.message = f"{label} complete"
+        if (self._zero_hold_joints is not None and node._arm_ready()
+                and np.max(np.abs(node.joint_positions - self._zero_hold_joints))
+                > math.radians(HORIZON_DEADBAND_DEG)):
+            self.resume_horizon()
         obs = self.camera.observation()
         if self.tracking:
             self._step_tracking(node, obs)
         elif self.procedure:
             self._step_pull_out(node)
         elif self.keys and self.jog_ready() and not self.pending and self.stop_acknowledged():
-            left, right, up, down, ccw, cw = (int(k in self.keys) for k in FLEX_KEYS)
-            x, y, roll = right - left, down - up, cw - ccw
-            if not roll and s.positioning_ready:
-                roll = self._horizon_correction(node, x, y)
+            left, right, up, down = (int(k in self.keys) for k in FLEX_KEYS)
+            x, y = right - left, down - up
+            roll = (self._horizon_correction(node, x, y, JOG_BEND_STEP_DEG, JOG_ROLL_STEP_DEG)
+                    if s.positioning_ready else 0.)
             self.client.command(ipc.JOG, x=x, y=y, roll=roll)
             self._owned = True
+        elif (not self.pending and self.stop_request is None and self.ready()
+              and s.action in (ipc.IDLE, ipc.HORIZON) and not self._horizon_paused):
+            self._hold_horizon(node)
         elif self._owned and not self.pending:
             self.client.command(ipc.IDLE)
             self._owned = False
@@ -506,26 +618,25 @@ class FlexControl:
         s = self.status
         manual_bench = bool(s and s.flags & ipc.MANUAL_BENCH)
         planned_zero = bool(s and s.flags & ipc.PLANNED_ZERO)
-        has_pose = s and (s.calibrated or s.setup or s.planned_feedback)
         return {
             "connected": self.client.ready,
             "driver_online": s is not None,
             "calibrated": bool(s and s.calibrated),
             "positioning_ready": bool(s and s.positioning_ready),
-            "setup": bool(s and s.setup),
-            "controller": bool(s and s.flags & ipc.XBOX),
             "simulated": bool(s and s.flags & ipc.SIMULATED),
             "manual_bench": manual_bench,
             "planned_feedback": bool(s and s.planned_feedback),
             "planned_zero": planned_zero,
-            "busy": bool(self.pending or self.procedure or (s and s.moving)),
-            "mode": ipc.MODES[s.mode] if s else None,
-            "bend": math.hypot(s.bend_x, s.bend_y) if has_pose else None,
-            "roll": s.roll if has_pose else None,
+            "busy": bool(self.keys or self.pending or self.procedure or
+                         (s and s.action != ipc.HORIZON and (s.moving or s.action == ipc.JOG))),
+            "bend": math.hypot(s.bend_x, s.bend_y) if s else None,
+            "roll": s.roll if s else None,
             "tendons": list(s.tendons) if s and (s.calibrated or planned_zero) else None,
             "bend_limit": s.bend_limit if s else None,
             "fault": s.fault if s else 0,
             "fault_detail": s.fault_detail if s else "",
+            "startup_recheck": bool(s and s.flags & ipc.STARTUP_RECHECK),
+            "recheck_pending": self._startup_recheck is not None,
             "setup_encoder_mismatch": bool(s and s.flags & ipc.SETUP_ENCODER_MISMATCH),
             "message": self.message,
             "tracking": self.tracking is not None,

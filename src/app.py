@@ -11,6 +11,7 @@ import math
 import json
 import logging
 import threading
+import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,7 @@ from scope.yolo import CATEGORIES, COLORS, MODEL_PATH
 
 log = logging.getLogger("WindowsApp")
 DASHBOARD_CONFIRM_TIMEOUT_S = 10.0
+FLEX_STOP_CONFIRM_TIMEOUT_S = 1.0
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -60,7 +62,6 @@ button:hover{background:#435779}
 button:focus-visible{outline:2px solid var(--hi);outline-offset:2px}
 button:disabled{cursor:default;opacity:.45}
 button.estop{background:#a42c3a}button.estop:hover{background:#c53445}
-button.ok{background:#276247}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 12px;margin:0;font:12px ui-monospace,Consolas,monospace}
 .grid>div{display:flex;justify-content:space-between;gap:4px;min-width:0}
 .grid dt{color:var(--dim)}
@@ -70,6 +71,10 @@ button.ok{background:#276247}
   grid-template-areas:"mode left up right forward" "mode left down right backward";
   grid-template-rows:repeat(2,minmax(32px,auto))}
 .command-grid button{padding:4px;min-width:0}
+#flex-hardware-controls{grid-template-columns:repeat(3,minmax(0,1fr));
+  grid-template-areas:"left up right" "left down right"}
+#flex-model-controls{grid-template-columns:repeat(4,minmax(0,1fr));
+  grid-template-areas:"left up right forward" "left down right backward"}
 .command-grid [data-key]{touch-action:none}
 .command-grid .direction{font-size:15px}
 .control-mode{grid-area:mode}
@@ -122,13 +127,11 @@ pre{background:#151926;padding:7px;border-radius:5px;font-size:10px;margin:7px 0
 <div class="panel-scroll" tabindex="0" aria-label="Robot controls">
 
 <div class="card actions">
-  <button onclick="post('/api/cmd/home')">HOME</button>
   <button onclick="post('/api/cmd/reset')">RESET</button>
   <button onclick="post('/api/cmd/bird_eye')">BIRD-EYE</button>
   <button onclick="post('/api/cmd/pull_out')">PULL OUT</button>
   <button id="confirm-pull-out" onclick="confirmPullOut()" hidden>Confirm straight and retract</button>
-  <button class="ok" onclick="post('/api/cmd/stop')">STOP</button>
-  <button class="estop" onclick="post('/api/cmd/estop')">DASHBOARD STOP</button>
+  <button class="estop" onclick="stopSession()">STOP</button>
 </div>
 
     <div class="card"><h3>Arm state</h3>
@@ -153,15 +156,11 @@ pre{background:#151926;padding:7px;border-radius:5px;font-size:10px;margin:7px 0
       <div class="actions" id="flex-calibration" hidden>
         <button id="calibrate" onclick="calibrateFlex()">Calibrate</button>
         <button id="flex-return-zero" onclick="post('/api/flex/return_zero')" disabled>Return to Flex zero</button>
+        <button id="flex-recheck" onclick="post('/api/flex/recheck_startup')" hidden>Recheck Flex inputs</button>
       </div>
       <p class="status" id="flex-status" role="status"></p>
       <h3 class="control-title">Flex controls</h3>
-      <div class="actions" id="flex-modes" hidden>
-        <button data-mode="fixed" onclick="post('/api/flex/mode', {mode:'fixed'})">Fixed</button>
-        <button data-mode="free" onclick="post('/api/flex/mode', {mode:'free'})">Free</button>
-      </div>
       <div class="command-grid" id="flex-model-controls">
-        <button class="control-mode" onclick="post('/api/mode/flex')">Toggle mode</button>
         <button class="direction control-left" data-key="flex_a">A</button>
         <button class="direction control-up" data-key="flex_w">W</button>
         <button class="direction control-down" data-key="flex_s">S</button>
@@ -174,8 +173,6 @@ pre{background:#151926;padding:7px;border-radius:5px;font-size:10px;margin:7px 0
         <button class="control-up" data-key="flex_up">Bend up</button>
         <button class="control-down" data-key="flex_down">Bend down</button>
         <button class="control-right" data-key="flex_right">Bend right</button>
-        <button class="control-forward" data-key="flex_cw">Roll +</button>
-        <button class="control-backward" data-key="flex_ccw">Roll −</button>
       </div>
     </div>
 
@@ -215,7 +212,7 @@ async function post(path, body = {}, quiet = false) {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(path === '/api/cmd/estop' ? 12000 : 1000)
+      signal: AbortSignal.timeout(path === '/api/cmd/stop' ? 12000 : 1000)
     });
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error(result.error || 'Command refused');
@@ -267,6 +264,12 @@ function releaseKeys() {
   held.forEach((_, key) => sendKey(key, false));
   held.clear();
 }
+async function stopSession() {
+  held.clear();
+  if (await post('/api/cmd/stop')) {
+    document.getElementById('command-error').textContent = 'Control session stopped.';
+  }
+}
 function calibrateFlex() {
   const planned = document.getElementById('calibrate').dataset.planned === 'true';
   const prompt = planned ?
@@ -315,18 +318,20 @@ function renderState(s) {
   const hardware = Boolean(flex);
   document.getElementById('flex-model-controls').hidden = hardware;
   document.getElementById('flex-hardware-controls').hidden = !hardware;
-  document.getElementById('flex-modes').hidden = !hardware;
   document.getElementById('flex-calibration').hidden = !hardware;
   const tracking = document.getElementById('tracking');
-  const flexReady = hardware && flex.connected && flex.positioning_ready && !flex.fault && !flex.setup;
+  const flexReady = hardware && flex.connected && flex.positioning_ready && !flex.fault;
+  const flexBlock = hardware && (flex.fault ? 'Resolve the GTS fault shown under Flex state.' :
+    !flex.connected ? 'Wait for the Flex driver to connect.' : '');
   const armReady = s.relay_connected && s.joints_received && s.kinematics_ready && !s.motion_fault;
   const rcmReady = armReady && s.arm_mode === 'rcm' && s.rcm_enabled;
   tracking.setAttribute('aria-pressed', String(Boolean(flex?.tracking)));
   tracking.disabled = !flex || (!flex.tracking && (!flexReady ||
     flex.busy || !rcmReady || selectedCategory === null));
-  document.getElementById('tracking-status').textContent = flex?.tracking_state || '';
-  document.querySelector('[onclick*="/api/cmd/bird_eye"]').disabled =
-    hardware && (!flexReady || !armReady || flex.busy || flex.tracking);
+  document.getElementById('tracking-status').textContent = flexBlock || flex?.tracking_state || '';
+  const birdEye = document.querySelector('[onclick*="/api/cmd/bird_eye"]');
+  birdEye.disabled = hardware && (!flexReady || !armReady || flex.busy || flex.tracking);
+  birdEye.title = flexBlock || (hardware && !flex.positioning_ready ? 'Calibrate Flex first.' : '');
   document.querySelector('[onclick*="/api/cmd/pull_out"]').disabled =
     hardware && (!flexReady || !flex.pull_out_enabled || !rcmReady ||
     flex.busy || flex.tracking);
@@ -334,41 +339,46 @@ function renderState(s) {
   confirmPullOutButton.hidden = !flex?.pull_out_confirm;
   confirmPullOutButton.disabled = !flexReady || !rcmReady;
   document.querySelector('[onclick*="/api/cmd/pull_out"]').title =
-    hardware && !flex.pull_out_enabled ? 'Set the bench-verified pull-out clearance at startup' : '';
+    flexBlock || (hardware && !flex.pull_out_enabled ? 'Set the bench-verified pull-out clearance at startup.' : '');
 
   if (flex) {
     const angle = value => Number.isFinite(value) ? value.toFixed(2) + '°' : '—';
     renderReadings('flex-state', [
       [flex.planned_zero ? 'Planned roll from zero' :
-        flex.setup || flex.planned_feedback ? 'Planned roll from start' : 'Base roll', angle(flex.roll)],
+        !flex.calibrated || flex.planned_feedback ? 'Planned roll from start' : 'Base roll', angle(flex.roll)],
       [flex.planned_zero ? 'Planned bend from zero' :
-        flex.setup || flex.planned_feedback ? 'Planned bend from start' : 'Bend estimate', angle(flex.bend)],
+        !flex.calibrated || flex.planned_feedback ? 'Planned bend from start' : 'Bend estimate', angle(flex.bend)],
       ['Bend limit', flex.bend_limit === 0 ? 'No software limit' : angle(flex.bend_limit)]
     ]);
-    document.getElementById('flex-mode').textContent = flex.manual_bench ? 'Manual bench mode' : flex.setup ? 'Xbox setup' :
-      (flex.mode ? `Mode: ${flex.mode}` : '');
+    document.getElementById('flex-mode').textContent = 'Mode: fixed';
     document.getElementById('tendons').textContent = flex.tendons ?
       'ΔL [mm]  ' + flex.tendons.map((mm, axis) => `${axis + 1}:${mm.toFixed(2)}`).join('  ') : '';
     const ready = flex.connected && !flex.fault;
     const calibrate = document.getElementById('calibrate');
     calibrate.disabled = !ready || flex.busy || flex.tracking || flex.setup_encoder_mismatch;
     calibrate.dataset.planned = String(flex.planned_feedback);
-    calibrate.title = flex.setup_encoder_mismatch ? 'Calibration requires encoder feedback that follows the setup jog' :
-      flex.planned_feedback ? 'Record the current planned position as zero' : '';
+    calibrate.title = flexBlock || (flex.setup_encoder_mismatch ? 'Calibration requires encoder feedback that follows the setup jog' :
+      flex.planned_feedback ? 'Record the current planned position as zero' : '');
+    const recheck = document.getElementById('flex-recheck');
+    recheck.hidden = !flex.startup_recheck && !flex.recheck_pending;
+    recheck.disabled = flex.recheck_pending;
     document.getElementById('flex-return-zero').disabled =
-      !ready || flex.busy || flex.tracking || flex.setup || !(flex.calibrated || flex.planned_zero);
-    document.querySelectorAll('#flex-hardware-controls button, #flex-modes button').forEach(button => {
-      button.disabled = !ready || flex.setup || (button.dataset.mode ?
-        !flex.positioning_ready || flex.busy : !flex.positioning_ready && !flex.planned_feedback);
-      if (button.dataset.mode) button.setAttribute('aria-pressed', String(flex.mode === button.dataset.mode));
+      !ready || flex.busy || flex.tracking || !(flex.calibrated || flex.planned_zero);
+    document.querySelectorAll('#flex-hardware-controls button').forEach(button => {
+      button.disabled = !ready || flex.setup_encoder_mismatch;
     });
     document.getElementById('flex-status').textContent = [
-      flex.driver_online ? (flex.simulated ? 'Simulated driver' : 'Driver connected') : 'Flex driver offline',
+      !flex.driver_online ? 'Flex driver offline' :
+        flex.connected ? (flex.simulated ? 'Simulated driver' : 'Driver connected') :
+        flex.fault ? 'Flex driver online' : 'Waiting for Flex driver to acknowledge the session',
       flex.fault ? `GTS fault ${flex.fault}${flex.fault_detail ? ' · ' + flex.fault_detail : ''}` : '',
+      flex.startup_recheck ?
+        'Check Flex drive power, the shared I/O connection, and the alarm and limit inputs. Then recheck Flex inputs.' :
+        flex.fault ? 'Resolve the GTS fault and restart the session.' : '',
       flex.setup_encoder_mismatch ? 'Setup blocked. Planned travel and encoder feedback disagree. See the driver console.' : '',
       flex.planned_feedback ? 'Flex positions are planned. Encoder feedback is unavailable in this mode.' : '',
-      ready && !flex.simulated && !flex.calibrated && !flex.planned_feedback ?
-        (flex.controller ? 'Xbox detected. Menu (Start) toggles setup.' : 'No Xbox controller detected through XInput.') : '',
+      ready && !flex.calibrated && !flex.planned_zero && !flex.setup_encoder_mismatch ?
+        'Use the jog buttons to straighten and align Flex before calibrating.' : '',
       flex.message
     ].filter(Boolean).join(' · ');
   } else {
@@ -380,7 +390,7 @@ function renderState(s) {
       ['θ_total',  s.flex_theta_total_deg.toFixed(2)+'°'],
       ['θ_seg',    s.flex_theta_seg_deg.toFixed(2)+'°'],
     ]);
-    document.getElementById('flex-mode').textContent = `Mode: ${s.flex_mode}`;
+    document.getElementById('flex-mode').textContent = 'Mode: fixed';
     const t = s.tendons || {};
     const names4 = ['R','G','B','Y'];
     document.getElementById('tendons').textContent =
@@ -592,13 +602,15 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({'error': str(error)}, 400)
             return self._json(state)
 
+        if self.path == '/api/cmd/stop':
+            return self._stop_session()
+
         if self.server.relay is None and self.server.node.flex is None:
             return self._json({'error': 'Robot controls are disabled in camera preview.'}, 503)
 
-        if self.path == '/api/cmd/estop':
-            return self._dashboard_stop()
-
         with self.server.node.control_lock:
+            if self.server.stopping:
+                return self._json({'error': 'Control session is stopping.'}, 503)
             try:
                 accepted = self._dispatch(body)
             except ValueError as error:
@@ -606,38 +618,69 @@ class _Handler(BaseHTTPRequestHandler):
             except KeyError:
                 return self._json({'error': 'Unknown endpoint'}, 404)
         if accepted is False:
-            if self.path == '/api/cmd/stop':
-                return self._json({'error': 'Local motion canceled. A controller could not receive Stop.'}, 503)
+            if self.path == '/api/cmd/reset':
+                return self._json({'error': 'The UR5 relay did not receive RESET.'}, 409)
             return self._json({'error': 'Command unavailable. Check the current mode and diagnostics.'}, 409)
         self._json({'ok': True})
 
-    def _dashboard_stop(self):
+    def _stop_session(self):
         node = self.server.node
+        with node.control_lock:
+            if self.server.stopping:
+                return self._json({'error': 'Control session is already stopping.'}, 503)
+            self.server.stopping = True
+            node.cancel_motion()
+            flex_request = (node.flex.stop_request
+                            if node.flex is not None and node.flex_stop_delivered else None)
         try:
-            with node.control_lock:
-                node.cancel_motion()
-                flex_ok = node.flex is None or node.flex_stop_delivered
-                relay = self.server.relay
-                result = relay.submit('estop') if relay is not None else None
+            self._confirm_stop(flex_request)
+        finally:
+            self.server.shutdown()
+
+    def _confirm_stop(self, flex_request):
+        relay = self.server.relay
+        try:
+            result = relay.submit('estop') if relay is not None else None
         except RuntimeError as error:
-            return self._json({'error': str(error)}, 503)
+            return self._json({'error': str(error), 'flex_stop_sent': flex_request is not None}, 503)
+        flex = self.server.node.flex
+        flex_stopped = flex is None
+        if flex_request is not None:
+            deadline = time.monotonic() + FLEX_STOP_CONFIRM_TIMEOUT_S
+            while time.monotonic() < deadline:
+                with self.server.node.control_lock:
+                    if flex.stop_acknowledged(flex_request):
+                        flex_stopped = True
+                        break
+                time.sleep(0.01)
+        flex_state = 'disabled' if flex is None else 'confirmed' if flex_stopped else 'unconfirmed'
         if result is None:
-            return self._json({'ok': True, 'arm': 'offline', 'flex': 'sent'} if flex_ok else
-                              {'error': 'Flex Stop delivery failed.', 'arm': 'offline', 'flex': 'offline'},
-                              200 if flex_ok else 503)
+            return self._json({'ok': True, 'arm': 'disabled', 'flex': flex_state} if flex_stopped else
+                              {'error': 'Flex did not confirm Stop.', 'arm': 'disabled', 'flex': flex_state},
+                              200 if flex_stopped else 503)
         try:
             failure = result.result(timeout=DASHBOARD_CONFIRM_TIMEOUT_S)
         except FutureTimeoutError:
             return self._json({'error': 'PolyScope did not confirm Dashboard Stop before the timeout.',
-                               'flex_stop_sent': flex_ok}, 504)
+                               'flex': flex_state}, 504)
         if failure:
-            return self._json({'error': failure, 'flex_stop_sent': flex_ok}, 502)
-        if not flex_ok:
-            return self._json({'error': 'PolyScope stopped. Flex Stop delivery failed.'}, 503)
-        self._json({'ok': True, 'arm': 'confirmed', 'flex': 'sent' if node.flex else 'disabled'})
+            return self._json({'error': failure, 'flex': flex_state}, 502)
+        if not flex_stopped:
+            return self._json({'error': 'PolyScope stopped. Flex did not confirm Stop.'}, 503)
+        self._json({'ok': True, 'arm': 'confirmed', 'flex': flex_state})
 
     def _dispatch(self, body):
         node = self.server.node
+        flex = node.flex
+        if flex is not None and (
+                self.path in ('/api/cmd/bird_eye', '/api/cmd/pull_out', '/api/flex/calibrate',
+                              '/api/flex/return_zero', '/api/flex/confirm_pull_out')
+                or (self.path == '/api/flex/tracking' and body.get('enabled') is True)
+                or (self.path == '/api/key' and body.get('down') is True and
+                    isinstance(body.get('key'), str) and body['key'].startswith('flex_'))):
+            issue = flex.connection_issue()
+            if issue:
+                raise ValueError(issue)
         if self.path.startswith('/api/flex/'):
             if node.flex is None:
                 raise ValueError("The Flex hardware interface is disabled.")
@@ -645,10 +688,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return node.flex.calibrate()
             if self.path == '/api/flex/return_zero':
                 return node.flex.return_to_zero()
+            if self.path == '/api/flex/recheck_startup':
+                return node.flex.recheck_startup_inputs()
             if self.path == '/api/flex/confirm_pull_out':
                 return node.flex.confirm_pull_out(node)
-            if self.path == '/api/flex/mode':
-                return node.flex.set_mode(body.get('mode'))
             if self.path == '/api/flex/tracking':
                 enabled = body.get('enabled')
                 if type(enabled) is not bool:
@@ -671,12 +714,9 @@ class _Handler(BaseHTTPRequestHandler):
             return node.refresh_keys(held)
         commands = {
             '/api/mode/arm': node.toggle_arm_mode,
-            '/api/mode/flex': node.toggle_flex_mode,
-            '/api/cmd/home': node.cmd_home,
             '/api/cmd/reset': node.cmd_reset,
             '/api/cmd/bird_eye': node.cmd_bird_eye_view,
             '/api/cmd/pull_out': node.cmd_pull_out,
-            '/api/cmd/stop': node.cmd_stop,
         }
         return commands[self.path]()
 
@@ -717,6 +757,7 @@ def main():
     try:
         with ExitStack() as resources:
             srv = resources.enter_context(ThreadingHTTPServer((args.host_web, args.port_web), _Handler))
+            srv.stopping = False
             srv.relay = None
             relay_port = args.relay_port
             if not (args.camera_only or args.flex_only):
