@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Run EndoFlex kinematics and send joint targets to the Jetson relay."""
+"""Run EndoFlex kinematics and send joint targets to the local RTDE relay."""
 import json
 import logging
 import math
@@ -10,7 +10,10 @@ import time
 
 import numpy as np
 
-from kinematics import EndoscopeKinematics, HOME_DEG
+if __package__:
+    from .kinematics import EndoscopeKinematics, HOME_DEG
+else:
+    from kinematics import EndoscopeKinematics, HOME_DEG
 
 # ---------- copy of flex constants ----------
 FLEX_N          = 8
@@ -61,7 +64,7 @@ class ControlNode:
     # ★ 位置伺服单 tick 的最大关节速度限制（rad/s）；防止 IK 偶发跳变
     SERVO_MAX_JOINT_VEL = 2.0
 
-    def __init__(self, jetson_ip, jetson_port, urdf_path,
+    def __init__(self, relay_host, relay_port, urdf_path,
                  rcm_point_local=(0,0,-0.30),
                  tip_local=(0,0,0.20195),
                  standoff_m=0.105,
@@ -72,8 +75,8 @@ class ControlNode:
             raise ValueError(f"jog speed scale must be one of {choices}")
         self.dt = 1.0 / self.STEP_TICK_HZ
         self.jog_speed_scale = jog_speed_scale
-        self.jetson_ip   = jetson_ip
-        self.jetson_port = jetson_port
+        self.relay_host  = relay_host
+        self.relay_port  = relay_port
         self.standoff    = standoff_m
         self.flex_state_callback = flex_state_callback
 
@@ -149,7 +152,7 @@ class ControlNode:
     def _connect(self):
         while self._running.is_set():
             try:
-                with socket.create_connection((self.jetson_ip, self.jetson_port),
+                with socket.create_connection((self.relay_host, self.relay_port),
                                               timeout=2.0) as sock:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     sock.settimeout(0.1)
@@ -158,7 +161,7 @@ class ControlNode:
                             return
                         self._sock = sock
                         self._last_joint_at = time.monotonic()
-                    log.info("Connected to Jetson %s:%d", self.jetson_ip, self.jetson_port)
+                    log.info("Connected to relay %s:%d", self.relay_host, self.relay_port)
                     try:
                         self._recv_loop(sock)
                     finally:
@@ -175,7 +178,7 @@ class ControlNode:
                             self.rcm_ref_depth = None
             except (OSError, ValueError) as e:
                 if self._running.is_set():
-                    log.warning("Jetson connection lost or unavailable: %s", e)
+                    log.warning("Relay connection lost or unavailable: %s", e)
             self._shutdown.wait(3.0)
 
     def _recv_loop(self, sock):
@@ -731,14 +734,12 @@ class ControlNode:
         self._q_cmd = None
 
     def cmd_stop(self):
-        with self._lock:
-            self._cancel_motion()
+        self.cancel_motion()
         return self._send({"type": "stop"})
 
-    def cmd_dashboard_stop(self):
+    def cancel_motion(self):
         with self._lock:
             self._cancel_motion()
-        return self._send({"type": "estop"})
 
     # ---------- tracking ----------
     def _clear_track_state_unlocked(self):
@@ -1050,7 +1051,7 @@ class ControlNode:
                 'tracking_recovering': self._track_recover,
                 'tracking_locked':     self._track_locked,
                 'tracking_refusal':    self._track_status_msg,
-                'jetson_connected':    self._sock is not None,
+                'relay_connected':     self._sock is not None,
                 'joints_received':     fresh,
                 'kinematics_ready':    self.kin.ready,
                 'motion_fault':        self._motion_fault,

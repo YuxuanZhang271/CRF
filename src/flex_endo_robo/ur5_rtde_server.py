@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Bridge newline-delimited Windows commands and UR5 state over TCP."""
+"""RTDE Bridge for local execution (runs in background thread)."""
 
-import argparse
 import json
 import logging
 import math
@@ -9,10 +8,11 @@ import select
 import socket
 import threading
 import time
-
+from concurrent.futures import Future
+from contextlib import ExitStack, contextmanager
 
 UR5_IP = "192.168.1.10"
-TCP_HOST = "192.168.55.1"
+TCP_HOST = "127.0.0.1"     # Local loopback
 TCP_PORT = 9000
 UR_DASHBOARD_PORT = 29999
 PERIOD = 1.0 / 125.0
@@ -23,8 +23,7 @@ STOP_TIMEOUT_S = 1.0
 STATIONARY_RAD_S = 1e-3
 MAX_LINE_BYTES = 4096
 
-log = logging.getLogger("Jetson")
-
+log = logging.getLogger("RTDE-Relay")
 
 def joint_vector(values):
     if not isinstance(values, (list, tuple)) or len(values) != 6:
@@ -32,7 +31,6 @@ def joint_vector(values):
     if not all(type(value) in (int, float) and math.isfinite(value) for value in values):
         raise ValueError("expected finite numbers")
     return [float(value) for value in values]
-
 
 def parse_command(line):
     cmd = json.loads(line)
@@ -57,7 +55,6 @@ def parse_command(line):
         return kind, (joint_vector(cmd.get("velocities")), max(duration, PERIOD))
     raise ValueError("unknown command type")
 
-
 def dashboard_stop(robot_ip):
     with socket.create_connection((robot_ip, UR_DASHBOARD_PORT), timeout=2.0) as conn:
         with conn.makefile("rb") as response:
@@ -68,7 +65,6 @@ def dashboard_stop(robot_ip):
             if reply.lower() != "stopped":
                 raise RuntimeError(f"Dashboard stop reply: {reply!r}")
 
-
 class Relay:
     def __init__(self, control, receive, robot_ip):
         self.control = control
@@ -78,9 +74,10 @@ class Relay:
         self.pending_move = None
         self.servo_target = None
         self.pending_stop = None
+        self.dashboard_result = None
+        self.closed = False
         self.telemetry = None
 
-        # The motion worker owns the RTDE control interface.
         self.mode = None
         self.handoff_deadline = None
         self.quiet_sample = None
@@ -89,12 +86,24 @@ class Relay:
 
     def submit(self, kind, args=()):
         with self.lock:
+            if self.closed:
+                if kind == "estop":
+                    raise RuntimeError("RTDE relay has stopped")
+                return
             now = time.monotonic()
             if kind in ("stop", "estop"):
                 self.pending_move = None
                 self.servo_target = None
-                if self.pending_stop != "estop":
-                    self.pending_stop = kind
+                if kind == "estop":
+                    if self.dashboard_result is None or self.dashboard_result.done():
+                        self.dashboard_result = Future()
+                        self.fault = "Waiting for PolyScope to confirm Dashboard Stop"
+                        self.pending_stop = "estop"
+                    return self.dashboard_result
+                if self.pending_stop is None:
+                    self.pending_stop = "stop"
+            elif self.fault is not None:
+                return
             elif kind == "move_joint":
                 self.servo_target = None
                 self.pending_move = (args, now)
@@ -108,6 +117,10 @@ class Relay:
                 else:
                     target = args[0]
                 self.servo_target = (target, now)
+
+    def motion_fault(self):
+        with self.lock:
+            return self.fault
 
     def state(self):
         with self.lock:
@@ -169,6 +182,23 @@ class Relay:
         elif sample_at - self.quiet_sample >= 2 * PERIOD:
             self.handoff_deadline = None
 
+    def _execute_dashboard_stop(self):
+        try:
+            dashboard_stop(self.robot_ip)
+        except (OSError, RuntimeError) as error:
+            log.exception("Dashboard Stop failed")
+            failure = f"Dashboard Stop failed: {error}"
+            with self.lock:
+                self.fault = failure
+                self.dashboard_result.set_result(failure)
+            self._stop_motion()
+        else:
+            self.mode = None
+            with self.lock:
+                self.fault = "PolyScope confirmed Dashboard Stop. Check the robot before restarting the app."
+                self.dashboard_result.set_result(None)
+            log.warning("Dashboard confirmed the program stopped")
+
     def _tick(self):
         with self.lock:
             stop, self.pending_stop = self.pending_stop, None
@@ -177,16 +207,7 @@ class Relay:
             sample = self.telemetry
 
         if stop == "estop":
-            self.fault = "Dashboard stop requested; restart the relay after checking the robot"
-            try:
-                dashboard_stop(self.robot_ip)
-            except (OSError, RuntimeError):
-                log.exception("Dashboard stop failed")
-                self.fault = "Dashboard stop failed; check the robot and Jetson log"
-                self._stop_motion()
-            else:
-                self.mode = None
-                log.warning("Dashboard confirmed the program stopped")
+            self._execute_dashboard_stop()
         elif stop == "stop":
             self._stop_motion()
 
@@ -209,7 +230,6 @@ class Relay:
             fresh = now - updated_at <= STOP_TIMEOUT_S + MOTION_STALE_S
             if fresh and self.mode is not None:
                 self._stop_motion()
-                # Keep the discrete command while the joints decelerate.
                 return
             if fresh and max(map(abs, sample[2])) >= STATIONARY_RAD_S:
                 return
@@ -253,8 +273,11 @@ class Relay:
                 try:
                     self._tick()
                 except Exception as error:
-                    if self.fault is None:
-                        self.fault = str(error)
+                    with self.lock:
+                        first_fault = self.fault is None
+                        if first_fault:
+                            self.fault = str(error)
+                    if first_fault:
                         log.exception("RTDE relay fault; motion disabled until relay restart")
                         try:
                             self._stop_motion()
@@ -265,18 +288,26 @@ class Relay:
                 next_tick = max(next_tick + PERIOD, time.monotonic())
                 shutdown.wait(next_tick - time.monotonic())
         finally:
+            with self.lock:
+                self.closed = True
+                dashboard_pending = self.pending_stop == "estop"
+                self.pending_stop = None
+            if dashboard_pending:
+                try:
+                    self._execute_dashboard_stop()
+                except Exception:
+                    log.exception("Dashboard Stop during shutdown failed")
             try:
                 self._stop_motion()
             except Exception:
                 log.exception("RTDE stop during shutdown failed")
 
-
-def handle_client(conn, relay):
+def handle_client(conn, relay, shutdown):
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     conn.settimeout(0.1)
     buffer = b""
     last_state_at = None
-    while True:
+    while not shutdown.is_set():
         readable, _, _ = select.select([conn], [], [], PERIOD)
         if readable:
             data = conn.recv(MAX_LINE_BYTES)
@@ -302,60 +333,81 @@ def handle_client(conn, relay):
                 conn.sendall((json.dumps(state, allow_nan=False) + "\n").encode("utf-8"))
                 last_state_at = sent_at
 
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--robot-ip", default=UR5_IP)
-    parser.add_argument("--host", default=TCP_HOST)
-    parser.add_argument("--port", type=int, default=TCP_PORT)
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="[Jetson] %(asctime)s - %(message)s")
-
+@contextmanager
+def open_relay(robot_ip, host, port):
+    """Bind the local port and initialize RTDE before starting any workers."""
     try:
         from rtde_control import RTDEControlInterface
         from rtde_receive import RTDEReceiveInterface
-    except ImportError:
-        log.error("Install ur-rtde in the Jetson Python environment")
-        return 1
+    except ImportError as error:
+        raise RuntimeError("Install ur-rtde in the crf environment: python -m pip install ur-rtde") from error
 
-    try:
-        with socket.socket() as server:
+    with socket.socket() as server, ExitStack() as connections:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((args.host, args.port))
-            server.listen(1)
-            receive = RTDEReceiveInterface(args.robot_ip)
-            control = RTDEControlInterface(args.robot_ip)
-            relay = Relay(control, receive, args.robot_ip)
-            shutdown = threading.Event()
-            worker = threading.Thread(target=relay.motion_loop, args=(shutdown,))
-            receiver = threading.Thread(target=relay.receive_loop, args=(shutdown,))
-            log.info("Connected to UR5 %s; listening on %s:%d",
-                     args.robot_ip, args.host, args.port)
-            receiver.start()
+        server.bind((host, port))
+        server.listen(1)
+        server.settimeout(0.2)
+
+        log.info("Connecting to UR5 at %s...", robot_ip)
+        try:
+            receive = RTDEReceiveInterface(robot_ip)
+            connections.callback(receive.disconnect)
+            control = RTDEControlInterface(robot_ip)
+            connections.callback(control.disconnect)
+            if not (receive.isConnected() and control.isConnected()):
+                raise RuntimeError("RTDE interfaces did not connect")
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(f"Could not initialize RTDE for {robot_ip}: {error}") from error
+        log.info("RTDE connected. Relay listening on %s:%d", *server.getsockname())
+        yield server, Relay(control, receive, robot_ip)
+
+
+def serve_relay(server, relay, shutdown_event):
+    workers = []
+    try:
+        for name, target in (("rtde-motion", relay.motion_loop), ("rtde-receive", relay.receive_loop)):
+            worker = threading.Thread(name=name, target=target, args=(shutdown_event,))
             worker.start()
+            workers.append(worker)
+        while not shutdown_event.is_set():
             try:
-                while True:
-                    conn, addr = server.accept()
-                    with conn:
-                        log.info("Windows connected from %s", addr)
-                        try:
-                            handle_client(conn, relay)
-                        except (OSError, ValueError) as error:
-                            log.info("Client connection ended: %s", error)
-                        finally:
-                            relay.submit("stop")
-                            log.info("Windows disconnected from %s", addr)
-            finally:
-                shutdown.set()
-                worker.join()
-                receiver.join()
+                conn, addr = server.accept()
+            except socket.timeout:
+                continue
+            with conn:
+                log.info("ControlNode connected from %s", addr)
+                try:
+                    handle_client(conn, relay, shutdown_event)
+                except (OSError, ValueError) as error:
+                    log.info("Client connection ended: %s", error)
+                finally:
+                    relay.submit("stop")
+                    log.info("ControlNode disconnected")
+    except (OSError, RuntimeError) as error:
+        with relay.lock:
+            if relay.fault is None:
+                relay.fault = f"RTDE relay stopped: {error}"
+        raise
+    finally:
+        shutdown_event.set()
+        for worker in workers:
+            worker.join()
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="[RTDE] %(asctime)s - %(message)s")
+    try:
+        with open_relay(UR5_IP, TCP_HOST, TCP_PORT) as (server, relay):
+            serve_relay(server, relay, threading.Event())
     except KeyboardInterrupt:
-        log.info("Relay stopped")
+        pass
     except (OSError, RuntimeError) as error:
         log.error("Relay failed: %s", error)
         return 1
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
