@@ -60,6 +60,8 @@ ENDO_TO_FLEX_RPY = (3.141593, 0.0, 0.616096)
 # CYL_LEN/2 (0.0025) + 8 * SEG_LEN (0.064) = 0.0665 m along +Z of flex_base_link
 # (which is z = -0.398 - 0.0665 = -0.4645 m in endoscope_link frame).
 FLEX_STRAIGHT_LEN_TO_END_CYL = 0.0665
+# end_cylinder_to_camera_joint in the URDF.
+END_CYLINDER_TO_CAMERA_M = 0.003
 END_CYLINDER_IN_ENDO_LINK = np.array(
     [0.0, 0.0, -0.398 - FLEX_STRAIGHT_LEN_TO_END_CYL], dtype=float
 )
@@ -238,6 +240,18 @@ class EndoscopeKinematics:
         """Return 3D position of end_cylinder in base_link frame when endo_flex is straight."""
         R_flex, p_flex = self.flex_base_frame_in_base(q)
         return p_flex + R_flex[:, 2] * FLEX_STRAIGHT_LEN_TO_END_CYL
+
+    def straight_camera_position_in_base(self, q):
+        rotation, origin = self.flex_base_frame_in_base(q)
+        return origin + rotation[:, 2] * (FLEX_STRAIGHT_LEN_TO_END_CYL + END_CYLINDER_TO_CAMERA_M)
+
+    def physical_flex_camera_rotation(self, q, bend_x_deg, bend_y_deg, roll_deg):
+        """Estimate camera orientation from the roll motor and opposing tendon pairs."""
+        rotation, _ = self.flex_base_frame_in_base(q)
+        bend = math.radians(math.hypot(bend_x_deg, bend_y_deg))
+        plane = math.atan2(-bend_x_deg, bend_y_deg)
+        return (rotation @ _rot_z(math.radians(roll_deg) + plane)
+                @ _rot_y(bend) @ _rot_z(-plane))
 
     def flex_fk_from_base_frame(self, R_0, p_0, curvature=0.0, steer_yaw=0.0,
                                 arc_len=0.050, flex_mode='fixed'):

@@ -7,6 +7,7 @@ Usage:
     python src/app.py --robot-ip 192.168.1.10
 """
 import argparse
+import math
 import json
 import logging
 import threading
@@ -21,6 +22,8 @@ from flex_endo_robo.control_node import (
     JOG_SPEED_SCALES,
     ControlNode,
 )
+from flex_endo_robo.flex_endo.flex_control import FlexControl
+from flex_endo_robo.flex_endo.flex_ipc import FlexClient
 from flex_endo_robo.ur5_rtde_server import TCP_HOST, TCP_PORT, UR5_IP, open_relay, serve_relay
 from scope.camera import CAMERA_INDEX, CameraFeed
 from scope.yolo import CATEGORIES, COLORS, MODEL_PATH
@@ -51,6 +54,7 @@ h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
 .card{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:12px;margin-bottom:10px}
 .card h3{margin:0 0 8px;font-size:13px;color:var(--hi);font-weight:650}
 .actions{display:flex;gap:6px;flex-wrap:wrap}
+[hidden]{display:none!important}
 button{background:#33415d;color:#fff;border:1px solid transparent;border-radius:6px;padding:8px 10px;cursor:pointer;font:600 12px system-ui,sans-serif}
 button:hover{background:#435779}
 button:focus-visible{outline:2px solid var(--hi);outline-offset:2px}
@@ -122,6 +126,7 @@ pre{background:#151926;padding:7px;border-radius:5px;font-size:10px;margin:7px 0
   <button onclick="post('/api/cmd/reset')">RESET</button>
   <button onclick="post('/api/cmd/bird_eye')">BIRD-EYE</button>
   <button onclick="post('/api/cmd/pull_out')">PULL OUT</button>
+  <button id="confirm-pull-out" onclick="confirmPullOut()" hidden>Confirm straight and retract</button>
   <button class="ok" onclick="post('/api/cmd/stop')">STOP</button>
   <button class="estop" onclick="post('/api/cmd/estop')">DASHBOARD STOP</button>
 </div>
@@ -145,8 +150,17 @@ pre{background:#151926;padding:7px;border-radius:5px;font-size:10px;margin:7px 0
       <dl class="grid" id="flex-state"></dl>
       <div class="status" id="flex-mode"></div>
       <pre id="tendons"></pre>
+      <div class="actions" id="flex-calibration" hidden>
+        <button id="calibrate" onclick="calibrateFlex()">Calibrate</button>
+        <button id="flex-return-zero" onclick="post('/api/flex/return_zero')" disabled>Return to Flex zero</button>
+      </div>
+      <p class="status" id="flex-status" role="status"></p>
       <h3 class="control-title">Flex controls</h3>
-      <div class="command-grid">
+      <div class="actions" id="flex-modes" hidden>
+        <button data-mode="fixed" onclick="post('/api/flex/mode', {mode:'fixed'})">Fixed</button>
+        <button data-mode="free" onclick="post('/api/flex/mode', {mode:'free'})">Free</button>
+      </div>
+      <div class="command-grid" id="flex-model-controls">
         <button class="control-mode" onclick="post('/api/mode/flex')">Toggle mode</button>
         <button class="direction control-left" data-key="flex_a">A</button>
         <button class="direction control-up" data-key="flex_w">W</button>
@@ -154,6 +168,14 @@ pre{background:#151926;padding:7px;border-radius:5px;font-size:10px;margin:7px 0
         <button class="direction control-right" data-key="flex_d">D</button>
         <button class="control-forward" data-key="flex_r">R (arc+)</button>
         <button class="control-backward" data-key="flex_f">F (arc−)</button>
+      </div>
+      <div class="command-grid" id="flex-hardware-controls" hidden>
+        <button class="control-left" data-key="flex_left">Bend left</button>
+        <button class="control-up" data-key="flex_up">Bend up</button>
+        <button class="control-down" data-key="flex_down">Bend down</button>
+        <button class="control-right" data-key="flex_right">Bend right</button>
+        <button class="control-forward" data-key="flex_cw">Roll +</button>
+        <button class="control-backward" data-key="flex_ccw">Roll −</button>
       </div>
     </div>
 
@@ -175,6 +197,8 @@ pre{background:#151926;padding:7px;border-radius:5px;font-size:10px;margin:7px 0
   <h2 id="categories-heading">YOLO Categories</h2>
   <div class="panel-scroll">
     <div class="card">
+      <button id="tracking" type="button" aria-pressed="false" disabled>Tracking</button>
+      <p id="tracking-status" class="category-status" role="status"></p>
       <div class="category-options" id="category-options"></div>
       <p class="category-status" id="category-status" aria-live="polite">Showing all categories</p>
       <p class="category-error" id="category-error" role="status"></p>
@@ -243,6 +267,20 @@ function releaseKeys() {
   held.forEach((_, key) => sendKey(key, false));
   held.clear();
 }
+function calibrateFlex() {
+  const planned = document.getElementById('calibrate').dataset.planned === 'true';
+  const prompt = planned ?
+    'Is the scope physically straight and the base at its intended zero? This saves the planned position without moving.' :
+    'Release the jog controls. Is the scope straight and the base at its intended zero? The scope will stay still.';
+  if (window.confirm(prompt)) {
+    post('/api/flex/calibrate');
+  }
+}
+function confirmPullOut() {
+  if (window.confirm('Is the scope physically straight and the withdrawal path clear? The UR5 will move.')) {
+    post('/api/flex/confirm_pull_out');
+  }
+}
 window.addEventListener('blur', releaseKeys);
 window.addEventListener('pagehide', releaseKeys);
 document.addEventListener('visibilitychange', () => {
@@ -273,20 +311,82 @@ function renderState(s) {
   }));
   document.getElementById('arm-mode').textContent = `Mode: ${s.arm_mode}`;
 
-  renderReadings('flex-state', [
-    ['base_yaw', s.flex_base_yaw.toFixed(2)+'°'],
-    ['ext_yaw',  s.flex_ext_yaw.toFixed(2)+'°'],
-    ['arc_len',  (s.flex_arc_len*100).toFixed(2)+' cm'],
-    ['curv κ',   s.flex_curvature.toFixed(2)+'/m'],
-    ['θ_total',  s.flex_theta_total_deg.toFixed(2)+'°'],
-    ['θ_seg',    s.flex_theta_seg_deg.toFixed(2)+'°'],
-  ]);
-  document.getElementById('flex-mode').textContent = `Mode: ${s.flex_mode}`;
-  const t = s.tendons || {};
-  const names4 = ['R','G','B','Y'];
-  document.getElementById('tendons').textContent =
+  const flex = s.flex_hardware;
+  const hardware = Boolean(flex);
+  document.getElementById('flex-model-controls').hidden = hardware;
+  document.getElementById('flex-hardware-controls').hidden = !hardware;
+  document.getElementById('flex-modes').hidden = !hardware;
+  document.getElementById('flex-calibration').hidden = !hardware;
+  const tracking = document.getElementById('tracking');
+  const flexReady = hardware && flex.connected && flex.positioning_ready && !flex.fault && !flex.setup;
+  const armReady = s.relay_connected && s.joints_received && s.kinematics_ready && !s.motion_fault;
+  const rcmReady = armReady && s.arm_mode === 'rcm' && s.rcm_enabled;
+  tracking.setAttribute('aria-pressed', String(Boolean(flex?.tracking)));
+  tracking.disabled = !flex || (!flex.tracking && (!flexReady ||
+    flex.busy || !rcmReady || selectedCategory === null));
+  document.getElementById('tracking-status').textContent = flex?.tracking_state || '';
+  document.querySelector('[onclick*="/api/cmd/bird_eye"]').disabled =
+    hardware && (!flexReady || !armReady || flex.busy || flex.tracking);
+  document.querySelector('[onclick*="/api/cmd/pull_out"]').disabled =
+    hardware && (!flexReady || !flex.pull_out_enabled || !rcmReady ||
+    flex.busy || flex.tracking);
+  const confirmPullOutButton = document.getElementById('confirm-pull-out');
+  confirmPullOutButton.hidden = !flex?.pull_out_confirm;
+  confirmPullOutButton.disabled = !flexReady || !rcmReady;
+  document.querySelector('[onclick*="/api/cmd/pull_out"]').title =
+    hardware && !flex.pull_out_enabled ? 'Set the bench-verified pull-out clearance at startup' : '';
+
+  if (flex) {
+    const angle = value => Number.isFinite(value) ? value.toFixed(2) + '°' : '—';
+    renderReadings('flex-state', [
+      [flex.planned_zero ? 'Planned roll from zero' :
+        flex.setup || flex.planned_feedback ? 'Planned roll from start' : 'Base roll', angle(flex.roll)],
+      [flex.planned_zero ? 'Planned bend from zero' :
+        flex.setup || flex.planned_feedback ? 'Planned bend from start' : 'Bend estimate', angle(flex.bend)],
+      ['Bend limit', flex.bend_limit === 0 ? 'No software limit' : angle(flex.bend_limit)]
+    ]);
+    document.getElementById('flex-mode').textContent = flex.manual_bench ? 'Manual bench mode' : flex.setup ? 'Xbox setup' :
+      (flex.mode ? `Mode: ${flex.mode}` : '');
+    document.getElementById('tendons').textContent = flex.tendons ?
+      'ΔL [mm]  ' + flex.tendons.map((mm, axis) => `${axis + 1}:${mm.toFixed(2)}`).join('  ') : '';
+    const ready = flex.connected && !flex.fault;
+    const calibrate = document.getElementById('calibrate');
+    calibrate.disabled = !ready || flex.busy || flex.tracking || flex.setup_encoder_mismatch;
+    calibrate.dataset.planned = String(flex.planned_feedback);
+    calibrate.title = flex.setup_encoder_mismatch ? 'Calibration requires encoder feedback that follows the setup jog' :
+      flex.planned_feedback ? 'Record the current planned position as zero' : '';
+    document.getElementById('flex-return-zero').disabled =
+      !ready || flex.busy || flex.tracking || flex.setup || !(flex.calibrated || flex.planned_zero);
+    document.querySelectorAll('#flex-hardware-controls button, #flex-modes button').forEach(button => {
+      button.disabled = !ready || flex.setup || (button.dataset.mode ?
+        !flex.positioning_ready || flex.busy : !flex.positioning_ready && !flex.planned_feedback);
+      if (button.dataset.mode) button.setAttribute('aria-pressed', String(flex.mode === button.dataset.mode));
+    });
+    document.getElementById('flex-status').textContent = [
+      flex.driver_online ? (flex.simulated ? 'Simulated driver' : 'Driver connected') : 'Flex driver offline',
+      flex.fault ? `GTS fault ${flex.fault}${flex.fault_detail ? ' · ' + flex.fault_detail : ''}` : '',
+      flex.setup_encoder_mismatch ? 'Setup blocked. Planned travel and encoder feedback disagree. See the driver console.' : '',
+      flex.planned_feedback ? 'Flex positions are planned. Encoder feedback is unavailable in this mode.' : '',
+      ready && !flex.simulated && !flex.calibrated && !flex.planned_feedback ?
+        (flex.controller ? 'Xbox detected. Menu (Start) toggles setup.' : 'No Xbox controller detected through XInput.') : '',
+      flex.message
+    ].filter(Boolean).join(' · ');
+  } else {
+    renderReadings('flex-state', [
+      ['base_yaw', s.flex_base_yaw.toFixed(2)+'°'],
+      ['ext_yaw',  s.flex_ext_yaw.toFixed(2)+'°'],
+      ['arc_len',  (s.flex_arc_len*100).toFixed(2)+' cm'],
+      ['curv κ',   s.flex_curvature.toFixed(2)+'/m'],
+      ['θ_total',  s.flex_theta_total_deg.toFixed(2)+'°'],
+      ['θ_seg',    s.flex_theta_seg_deg.toFixed(2)+'°'],
+    ]);
+    document.getElementById('flex-mode').textContent = `Mode: ${s.flex_mode}`;
+    const t = s.tendons || {};
+    const names4 = ['R','G','B','Y'];
+    document.getElementById('tendons').textContent =
       'L[mm]  ' + names4.map(n=>`${n}:${t[n]?t[n][0].toFixed(1):'—'}`).join('  ') +
       '\nΔL[mm] ' + names4.map(n=>`${n}:${t[n]?(t[n][1]>=0?'+':'')+t[n][1].toFixed(1):'—'}`).join('  ');
+  }
 
   document.getElementById('diag').innerHTML =
       `Relay: <span class="${s.relay_connected?'tag-ok':'tag-bad'}">${s.relay_connected?'connected':'offline'}</span> · ` +
@@ -300,6 +400,9 @@ const cameraStatus = document.getElementById('camera-status');
 const categoryStatus = document.getElementById('category-status');
 const categoryError = document.getElementById('category-error');
 const categoryButtons = new Map();
+document.getElementById('tracking').addEventListener('click', event => {
+  post('/api/flex/tracking', {enabled: event.currentTarget.getAttribute('aria-pressed') !== 'true'});
+});
 let selectedCategory = null;
 let viewRevision = -1;
 let categoryRequest = Promise.resolve();
@@ -419,10 +522,11 @@ class _Handler(BaseHTTPRequestHandler):
         if url.path == '/':
             self._send(200, 'text/html; charset=utf-8', HTML_PAGE.encode('utf-8'))
         elif url.path == '/api/state':
-            state = self.server.node.get_state_dict()
+            with self.server.node.control_lock:
+                state = self.server.node.get_state_dict()
             if self.server.relay is not None:
                 state['motion_fault'] = self.server.relay.motion_fault()
-            else:
+            elif self.server.node.flex is None:
                 state['motion_fault'] = 'Robot connection disabled for camera preview.'
             self._json(state)
         elif url.path == '/api/config':
@@ -479,12 +583,16 @@ class _Handler(BaseHTTPRequestHandler):
             if 'category' not in body:
                 return self._json({'error': 'Expected a category ID or null'}, 400)
             try:
-                state = self.server.camera.select_category(body['category'])
+                with self.server.node.control_lock:
+                    prior = self.server.camera.status()['revision']
+                    state = self.server.camera.select_category(body['category'])
+                    if self.server.node.flex and state['revision'] != prior:
+                        self.server.node.stop_camera_tracking()
             except ValueError as error:
                 return self._json({'error': str(error)}, 400)
             return self._json(state)
 
-        if self.server.relay is None:
+        if self.server.relay is None and self.server.node.flex is None:
             return self._json({'error': 'Robot controls are disabled in camera preview.'}, 503)
 
         if self.path == '/api/cmd/estop':
@@ -499,27 +607,58 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({'error': 'Unknown endpoint'}, 404)
         if accepted is False:
             if self.path == '/api/cmd/stop':
-                return self._json({'error': 'Stop canceled local motion. Relay delivery failed.'}, 503)
+                return self._json({'error': 'Local motion canceled. A controller could not receive Stop.'}, 503)
             return self._json({'error': 'Command unavailable. Check the current mode and diagnostics.'}, 409)
         self._json({'ok': True})
 
     def _dashboard_stop(self):
+        node = self.server.node
         try:
-            with self.server.node.control_lock:
-                self.server.node.cancel_motion()
-                result = self.server.relay.submit('estop')
+            with node.control_lock:
+                node.cancel_motion()
+                flex_ok = node.flex is None or node.flex_stop_delivered
+                relay = self.server.relay
+                result = relay.submit('estop') if relay is not None else None
         except RuntimeError as error:
             return self._json({'error': str(error)}, 503)
+        if result is None:
+            return self._json({'ok': True, 'arm': 'offline', 'flex': 'sent'} if flex_ok else
+                              {'error': 'Flex Stop delivery failed.', 'arm': 'offline', 'flex': 'offline'},
+                              200 if flex_ok else 503)
         try:
             failure = result.result(timeout=DASHBOARD_CONFIRM_TIMEOUT_S)
         except FutureTimeoutError:
-            return self._json({'error': 'PolyScope did not confirm Dashboard Stop before the timeout.'}, 504)
+            return self._json({'error': 'PolyScope did not confirm Dashboard Stop before the timeout.',
+                               'flex_stop_sent': flex_ok}, 504)
         if failure:
-            return self._json({'error': failure}, 502)
-        self._json({'ok': True})
+            return self._json({'error': failure, 'flex_stop_sent': flex_ok}, 502)
+        if not flex_ok:
+            return self._json({'error': 'PolyScope stopped. Flex Stop delivery failed.'}, 503)
+        self._json({'ok': True, 'arm': 'confirmed', 'flex': 'sent' if node.flex else 'disabled'})
 
     def _dispatch(self, body):
         node = self.server.node
+        if self.path.startswith('/api/flex/'):
+            if node.flex is None:
+                raise ValueError("The Flex hardware interface is disabled.")
+            if self.path == '/api/flex/calibrate':
+                return node.flex.calibrate()
+            if self.path == '/api/flex/return_zero':
+                return node.flex.return_to_zero()
+            if self.path == '/api/flex/confirm_pull_out':
+                return node.flex.confirm_pull_out(node)
+            if self.path == '/api/flex/mode':
+                return node.flex.set_mode(body.get('mode'))
+            if self.path == '/api/flex/tracking':
+                enabled = body.get('enabled')
+                if type(enabled) is not bool:
+                    raise ValueError("Expected a boolean enabled value.")
+                if enabled and any(node._key_state.values()):
+                    raise ValueError("Release arm controls before enabling tracking.")
+                if not enabled:
+                    node.stop_camera_tracking()
+                    return True
+                return node.flex.set_tracking(True, node)
         if self.path == '/api/key':
             key, down = body.get('key'), body.get('down')
             if not isinstance(key, str) or type(down) is not bool:
@@ -564,18 +703,28 @@ def main():
                     help='Manual arm speed multiplier')
     ap.add_argument('--camera-index', type=int, default=CAMERA_INDEX, help='DirectShow camera index')
     ap.add_argument('--model', type=Path, default=MODEL_PATH, help='Path to YOLO weights')
-    ap.add_argument('--camera-only', action='store_true', help='Preview the camera without opening RTDE')
-    ap.add_argument('--vision-shm', action='store_true', help='Publish the selected target to EndoVisionShared')
+    run_mode = ap.add_mutually_exclusive_group()
+    run_mode.add_argument('--camera-only', action='store_true', help='Passive camera preview')
+    run_mode.add_argument('--flex-only', action='store_true', help='Connect Flex hardware without opening RTDE')
+    run_mode.add_argument('--arm-only', action='store_true', help='Use RTDE and modeled Flex without a motor driver')
+    ap.add_argument('--pull-out-clearance-m', type=float,
+                    help='Bench-verified distance behind the RCM along the physical camera axis')
     args = ap.parse_args()
+    if args.pull_out_clearance_m is not None and (
+            not math.isfinite(args.pull_out_clearance_m) or args.pull_out_clearance_m < 0):
+        ap.error('--pull-out-clearance-m must be finite and nonnegative')
 
     try:
         with ExitStack() as resources:
             srv = resources.enter_context(ThreadingHTTPServer((args.host_web, args.port_web), _Handler))
             srv.relay = None
             relay_port = args.relay_port
-            if not args.camera_only:
+            if not (args.camera_only or args.flex_only):
                 relay_server, srv.relay = resources.enter_context(open_relay(args.robot_ip, TCP_HOST, relay_port))
                 relay_port = relay_server.getsockname()[1]
+            srv.camera = resources.enter_context(CameraFeed(args.camera_index, args.model))
+            flex = (None if args.camera_only or args.arm_only else
+                    FlexControl(FlexClient(), srv.camera, args.pull_out_clearance_m))
             srv.node = ControlNode(
                 relay_host=TCP_HOST,
                 relay_port=relay_port,
@@ -584,8 +733,8 @@ def main():
                 tip_local=args.tip_local,
                 standoff_m=args.standoff,
                 jog_speed_scale=args.jog_speed_scale,
+                flex=flex,
             )
-            srv.camera = resources.enter_context(CameraFeed(args.camera_index, args.model, args.vision_shm))
             if srv.relay is not None:
                 relay_shutdown = threading.Event()
                 relay_thread = threading.Thread(
@@ -595,8 +744,9 @@ def main():
                 relay_thread.start()
                 resources.callback(relay_thread.join)
                 resources.callback(relay_shutdown.set)
+            if srv.relay is not None or flex is not None:
                 resources.callback(srv.node.stop)
-                srv.node.start()
+                srv.node.start(connect_arm=srv.relay is not None)
             log.info("Web panel: http://%s:%d", args.host_web, srv.server_port)
             try:
                 srv.serve_forever()

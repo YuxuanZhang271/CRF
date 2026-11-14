@@ -2,11 +2,12 @@
 
 import logging
 import threading
+import time
 from contextlib import ExitStack
 
 import cv2
 
-from .yolo import CATEGORIES, MODEL_PATH, Detector, VisionOutput, draw_detections
+from .yolo import CATEGORIES, MODEL_PATH, Detector, Observation, draw_detections, target_error
 
 
 CAMERA_INDEX = 0
@@ -34,10 +35,9 @@ def open_camera(index):
 
 
 class CameraFeed:
-    def __init__(self, index=CAMERA_INDEX, model_path=MODEL_PATH, publish_vision=False):
+    def __init__(self, index=CAMERA_INDEX, model_path=MODEL_PATH):
         self.index = index
         self.model_path = model_path
-        self.publish_vision = publish_vision
         self._condition = threading.Condition()
         self._worker = threading.Thread(target=self._run, name="scope-camera")
         self._closed = False
@@ -46,7 +46,7 @@ class CameraFeed:
         self._revision = 0
         self._frame_id = 0
         self._latest = None
-        self._vision = None
+        self._observation = None
 
     def __enter__(self):
         self._worker.start()
@@ -55,6 +55,7 @@ class CameraFeed:
     def __exit__(self, *args):
         with self._condition:
             self._closed = True
+            self._observation = None
             self._condition.notify_all()
         self._worker.join()
 
@@ -66,14 +67,17 @@ class CameraFeed:
                 self._category = category
                 self._revision += 1
                 self._latest = None
-                if self._vision is not None:
-                    self._vision.publish()
+                self._observation = None
                 self._condition.notify_all()
             return self._status()
 
     def status(self):
         with self._condition:
             return self._status()
+
+    def observation(self):
+        with self._condition:
+            return self._observation
 
     def _status(self):
         return {"category": self._category, "revision": self._revision,
@@ -98,23 +102,14 @@ class CameraFeed:
                 detector = Detector(self.model_path)
                 capture = open_camera(self.index)
                 resources.callback(capture.release)
-                if self.publish_vision:
-                    vision = VisionOutput()
-                    resources.callback(vision.close)
-                    with self._condition:
-                        self._vision = vision
-                    resources.callback(self._clear_vision)
                 self._capture(capture, detector)
         except Exception as error:
             log.exception("SCOPE camera stopped")
             with self._condition:
                 self._error = str(error) or type(error).__name__
                 self._latest = None
+                self._observation = None
                 self._condition.notify_all()
-
-    def _clear_vision(self):
-        with self._condition:
-            self._vision = None
 
     def _capture(self, capture, detector):
         while True:
@@ -123,18 +118,22 @@ class CameraFeed:
                     return
                 category, revision = self._category, self._revision
             ok, frame = capture.read()
+            captured_at = time.monotonic()
             if not ok:
                 raise RuntimeError(f"Camera {self.index} stopped returning frames")
             detections = detector.detect(frame, category)
             target = draw_detections(frame, detections, category)
+            height, width = frame.shape[:2]
+            dx, dy, centered = target_error(target, frame.shape)
             ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ok:
                 raise RuntimeError("Could not encode the camera frame as JPEG")
             with self._condition:
                 if self._closed or revision != self._revision:
                     continue
-                if self._vision is not None:
-                    self._vision.publish(target, frame.shape)
                 self._frame_id += 1
+                self._observation = Observation(
+                    self._frame_id, captured_at, revision, category, width, height,
+                    target is not None, centered, dx, dy)
                 self._latest = encoded.tobytes()
                 self._condition.notify_all()

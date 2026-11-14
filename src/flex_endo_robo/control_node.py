@@ -12,8 +12,10 @@ import numpy as np
 
 if __package__:
     from .kinematics import EndoscopeKinematics, HOME_DEG
+    from .flex_endo.flex_control import FLEX_KEYS
 else:
     from kinematics import EndoscopeKinematics, HOME_DEG
+    from flex_endo.flex_control import FLEX_KEYS
 
 # ---------- copy of flex constants ----------
 FLEX_N          = 8
@@ -58,7 +60,7 @@ class ControlNode:
     FLEX_CURV_VEL       = 10.0
     FLEX_ARC_VEL        = 0.020
     TRAJ_DURATION_S     = 3.0
-    RCM_CONE_HALF_ANGLE = math.radians(20.0)
+    RCM_CONE_HALF_ANGLE = math.radians(10.0)
     TELEOP_RESYNC_RAD   = 0.05
 
     # ★ 位置伺服单 tick 的最大关节速度限制（rad/s）；防止 IK 偶发跳变
@@ -69,7 +71,7 @@ class ControlNode:
                  tip_local=(0,0,0.20195),
                  standoff_m=0.105,
                  flex_state_callback=None,
-                 jog_speed_scale=DEFAULT_JOG_SPEED_SCALE):
+                 jog_speed_scale=DEFAULT_JOG_SPEED_SCALE, flex=None):
         if jog_speed_scale not in JOG_SPEED_SCALES:
             choices = ", ".join(map(str, JOG_SPEED_SCALES))
             raise ValueError(f"jog speed scale must be one of {choices}")
@@ -79,6 +81,8 @@ class ControlNode:
         self.relay_port  = relay_port
         self.standoff    = standoff_m
         self.flex_state_callback = flex_state_callback
+        self.flex = flex
+        self.flex_stop_delivered = False
 
         # --- kinematics ---
         self.kin = EndoscopeKinematics(
@@ -241,7 +245,7 @@ class ControlNode:
                 pass
 
     # ---------------- Lifecycle ----------------
-    def start(self):
+    def start(self, connect_arm=True):
         if self._running.is_set():
             return
         self._shutdown.clear()
@@ -250,7 +254,8 @@ class ControlNode:
                                              name="tcp-recv")
         self._tick_thread = threading.Thread(target=self._tick_loop, daemon=True,
                                              name="ctrl-tick")
-        self._recv_thread.start()
+        if connect_arm:
+            self._recv_thread.start()
         self._tick_thread.start()
         log.info(f"ControlNode started @ {self.STEP_TICK_HZ:.0f} Hz")
 
@@ -260,9 +265,11 @@ class ControlNode:
             self._shutdown.set()
             with self._lock:
                 sock = self._sock
+            self.cmd_stop()
             if sock is not None:
-                self.cmd_stop()
                 self._disconnect_socket(sock)
+            if self.flex is not None:
+                self.flex.client.close()
         for t in (self._recv_thread, self._tick_thread):
             if t and t.is_alive():
                 t.join()
@@ -288,6 +295,8 @@ class ControlNode:
                         self._tick()
             except Exception as e:
                 log.exception(f"tick error: {e}")
+                with self.control_lock:
+                    self.cmd_stop()
 
     # ==================================================================
     # Tick / helpers
@@ -297,7 +306,8 @@ class ControlNode:
         with self._lock:
             fault = self._motion_fault
         if fault and (self._teleop_servo_active or self._pull_out_state is not None
-                      or self._track_target is not None):
+                      or self._track_target is not None or
+                      (self.flex is not None and (self.flex.procedure or self.flex.tracking))):
             self.cmd_stop()
         now = time.monotonic()
         for key, updated_at in list(self._key_updated.items()):
@@ -327,7 +337,8 @@ class ControlNode:
         servo_was_active = self._teleop_servo_active
         self._servo_sent_this_tick = False
         try:
-            self._step_controls(ks, pull_out_active, tracking_active)
+            if self.flex is None or not self.flex.tick(self):
+                self._step_controls(ks, pull_out_active, tracking_active)
         finally:
             if servo_was_active and not self._servo_sent_this_tick:
                 self._send_servo_stop()
@@ -359,6 +370,8 @@ class ControlNode:
         elif arm_dx or arm_dy or arm_dz:
             self._arm_linear_step(arm_dx, arm_dy, arm_dz)
 
+        if self.flex is not None:
+            return
         with self._lock:
             dk = (ks['flex_s'] - ks['flex_w']) * self.FLEX_CURV_VEL * self.dt
             dy = (ks['flex_a'] - ks['flex_d']) * self.FLEX_YAW_VEL * self.dt
@@ -377,6 +390,16 @@ class ControlNode:
     def _joint_state_fresh(self):
         return (self.joint_received
                 and time.monotonic() - self._last_joint_at <= STATE_TIMEOUT_S)
+
+    def _inside_rcm_cone(self, axis, ref_axis):
+        return float(np.dot(axis, ref_axis)) >= math.cos(self.RCM_CONE_HALF_ANGLE) - 1e-10
+
+    def _rcm_pose_is_valid(self, joints, depth=None):
+        axis, _, tip = self.kin.tube_axis_in_base(joints)
+        offset = tip - self.rcm_world_point
+        return (self._inside_rcm_cone(axis, self.rcm_ref_axis)
+                and np.linalg.norm(np.cross(offset, axis)) <= 0.002
+                and (depth is None or abs(float(np.dot(offset, axis)) - depth) <= 0.002))
 
     def _arm_linear_step(self, dx_m, dy_m, dz_m):
         if not self._arm_ready(): return
@@ -410,7 +433,8 @@ class ControlNode:
                     else self.kin.ik_position_only(p_target, q_now))
         if q_target is None: return
         q_target = self._auto_solve_wrist1(q_target)
-        self._send_servo(q_target, q_now, self.dt)
+        self._send_servo(q_target, q_now, self.dt,
+                         validate=self._rcm_pose_is_valid if rcm_on else None)
 
     def _arm_rcm_tilt(self, angle_right_deg, angle_up_deg, insertion_m=0.0):
         if not self._arm_ready(): return
@@ -439,18 +463,19 @@ class ControlNode:
             theta = math.radians(float(angle_right_deg))
             new_axis = self.kin.rotate_about(new_axis, z_world, -theta)
             new_axis /= max(np.linalg.norm(new_axis), 1e-9)
-        cos_a = float(np.clip(np.dot(new_axis, ref_axis), -1., 1.))
-        if math.acos(cos_a) > self.RCM_CONE_HALF_ANGLE:
+        if not self._inside_rcm_cone(axis, ref_axis):
+            return
+        if not self._inside_rcm_cone(new_axis, ref_axis):
             if not insertion_m:
                 return
-            new_axis = (p_tip - rcm_pt) / distance
+            new_axis = axis
         if distance + insertion_m < 1e-6:
             return
         p_target = rcm_pt + (distance + insertion_m) * new_axis
         q_target = self.kin.ik_with_rcm(p_target, rcm_pt, q_now)
         if q_target is None: return
         q_target = self._auto_solve_wrist1(q_target)
-        self._send_servo(q_target, q_now, self.dt)
+        self._send_servo(q_target, q_now, self.dt, validate=self._rcm_pose_is_valid)
 
     def _auto_solve_wrist1(self, q):
         q = np.array(q, float).copy()
@@ -534,6 +559,10 @@ class ControlNode:
 
     # ---------- modes ----------
     def toggle_arm_mode(self):
+        if self.flex is not None and (self.flex.tracking or self.flex.procedure):
+            self.flex.cancel("Coordinated motion stopped · arm mode changed")
+            if self._teleop_servo_active:
+                self._send_servo_stop()
         with self._lock:
             if self.arm_mode == 'linear' and not self._arm_ready():
                 return False
@@ -557,6 +586,12 @@ class ControlNode:
                     log.warning("TRACKING auto-cancelled (RCM off)")
         return True
 
+    def stop_camera_tracking(self):
+        if self.flex is not None and self.flex.tracking:
+            self.flex.cancel_tracking()
+            if self._teleop_servo_active:
+                self._send_servo_stop()
+
     def _capture_rcm_unlocked(self):
         if not (self.kin.ready and self.joint_received):
             self.rcm_enabled = False; return
@@ -568,6 +603,10 @@ class ControlNode:
         self.rcm_enabled = True
 
     def toggle_flex_mode(self):
+        if self.flex is not None:
+            if self.flex.status is None:
+                return False
+            return self.flex.set_mode("free" if self.flex.status.mode == 0 else "fixed")
         with self._lock:
             self.flex_mode = 'free' if self.flex_mode == 'fixed' else 'fixed'
             m = self.flex_mode
@@ -583,8 +622,10 @@ class ControlNode:
             return False
         with self._lock:
             self._cancel_motion()
-            self._set_flex_slew_target(curvature=0., steer_yaw=0., arc_len=FLEX_ARC_MAX)
-        self._update_flex_state()
+            if self.flex is None:
+                self._set_flex_slew_target(curvature=0., steer_yaw=0., arc_len=FLEX_ARC_MAX)
+        if self.flex is None:
+            self._update_flex_state()
         q_target = np.deg2rad(np.array(HOME_DEG, float))
         q_target = self._auto_solve_wrist1(q_target)
         return self._send_trajectory(q_target, traj_duration=self.TRAJ_DURATION_S)
@@ -607,6 +648,8 @@ class ControlNode:
         return self.cmd_home()
 
     def cmd_bird_eye_view(self):
+        if self.flex is not None:
+            return self.flex.bird_eye(self)
         if not self._arm_ready():
             log.warning("BIRD-EYE waiting for URDF/joints")
             return False
@@ -623,6 +666,8 @@ class ControlNode:
         return True
 
     def cmd_pull_out(self):
+        if self.flex is not None:
+            return self.flex.pull_out(self)
         if not self._arm_ready():
             return False
         with self._lock:
@@ -724,6 +769,8 @@ class ControlNode:
                 log.info(f"PULL OUT complete ({s_end_cur*100:.1f} cm behind RCM)")
 
     def _cancel_motion(self):
+        if self.flex is not None:
+            self.flex_stop_delivered = self.flex.stop()
         self._key_updated.clear()
         for key in self._key_state:
             self._key_state[key] = False
@@ -735,7 +782,8 @@ class ControlNode:
 
     def cmd_stop(self):
         self.cancel_motion()
-        return self._send({"type": "stop"})
+        arm_ok = self._send({"type": "stop"}) if self._recv_thread and self._recv_thread.ident else True
+        return arm_ok and (self.flex is None or self.flex_stop_delivered)
 
     def cancel_motion(self):
         with self._lock:
@@ -767,6 +815,8 @@ class ControlNode:
             self._targets_state.update(targets)
 
     def start_tracking(self, key):
+        if self.flex is not None:
+            return False
         if not isinstance(key, str) or key not in {k for k, _, _ in TRACK_TARGETS}:
             return False
         if not self._arm_ready():
@@ -951,7 +1001,7 @@ class ControlNode:
             log.info(f"TRACKING locked on {key}: d={dist_m*100:.1f}cm aim={aim_deg:.2f}°")
 
     # ---------- transport ----------
-    def _send_servo(self, q_target, q_now, dt):
+    def _send_servo(self, q_target, q_now, dt, validate=None):
         q_target = np.asarray(q_target, float)
         if q_target.shape != (6,) or not np.isfinite(q_target).all():
             return False
@@ -969,6 +1019,8 @@ class ControlNode:
         if md > max_step:
             q_target = q_base + delta * (max_step / md)
 
+        if validate is not None and (not validate(q_now) or not validate(q_target)):
+            return False
         if not self._send({"type": "servo_joint", "positions": q_target.tolist()}):
             return False
         with self._lock:
@@ -1008,10 +1060,23 @@ class ControlNode:
 
     # ---------- key state ----------
     def set_key(self, key, down):
+        if self.flex is not None and key in FLEX_KEYS:
+            if down and any(self._key_state.values()):
+                return False
+            if down and (self.flex.tracking or self.flex.procedure) and self._teleop_servo_active:
+                self._send_servo_stop()
+            return self.flex.set_key(key, down)
         if key not in self._key_state:
+            return False
+        if self.flex is not None and key.startswith("flex_"):
             return False
         if down and key.startswith("arm_") and not self._arm_ready():
             return False
+        if down and self.flex is not None:
+            if self.flex.tracking or self.flex.procedure or self.flex.pending or self.flex.keys:
+                self.flex.cancel("Coordinated motion stopped · manual arm input")
+                if self._teleop_servo_active:
+                    self._send_servo_stop()
         self._key_state[key] = down
         if down:
             self._key_updated[key] = time.monotonic()
@@ -1020,6 +1085,8 @@ class ControlNode:
         return True
 
     def refresh_keys(self, held):
+        if self.flex is not None:
+            self.flex.heartbeat(held)
         now = time.monotonic()
         for key in held:
             if key in self._key_updated and now - self._key_updated[key] <= KEY_TIMEOUT_S:
@@ -1063,4 +1130,6 @@ class ControlNode:
                 dL = -FLEX_TENDON_R*math.cos(phi - alpha)*theta_total
                 tendons[name] = (self.flex_arc_len + dL, dL)
             state['tendons'] = {n:(L*1000, dL*1000) for n,(L,dL) in tendons.items()}
+            if self.flex is not None:
+                state['flex_hardware'] = self.flex.snapshot()
         return state
