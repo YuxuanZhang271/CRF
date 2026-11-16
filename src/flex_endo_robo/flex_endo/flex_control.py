@@ -8,7 +8,9 @@ import numpy as np
 from . import flex_ipc as ipc
 
 
-FLEX_KEYS = ("flex_left", "flex_right", "flex_up", "flex_down")
+BEND_KEYS = ("flex_left", "flex_right", "flex_up", "flex_down")
+ROLL_KEYS = ("flex_roll_minus", "flex_roll_plus")
+FLEX_KEYS = BEND_KEYS + ROLL_KEYS
 POSITION_TIMEOUT_S = 30.0
 KEY_TIMEOUT_S = 0.65
 STRAIGHT_BEND_DEG = 0.25
@@ -24,6 +26,7 @@ TRACK_BEND_STEP_DEG = 0.32 * TRACK_SPEED_MULTIPLIER
 TRACK_ROLL_STEP_DEG = 1.0 * TRACK_SPEED_MULTIPLIER
 HORIZON_DEADBAND_DEG = 0.15
 PIVOT_TOLERANCE_M = 0.002
+MAX_FLEX_BEND_DEG = 60  # Match the native driver's maximum travel envelope.
 
 
 class FlexControl:
@@ -97,12 +100,18 @@ class FlexControl:
             return True
         if not self.jog_ready() or not self.stop_acknowledged():
             return False
+        if key in ROLL_KEYS and not self.status.flags & ipc.ROLL_JOG_SUPPORTED:
+            raise ValueError("Rebuild and restart the Flex driver to enable roll jogging.")
         self.cancel_tracking()
         if self.procedure or self.pending:
             self.cancel("Flex positioning canceled by manual input")
             return False
         self.keys[key] = time.monotonic()
-        self.resume_horizon()
+        if key in ROLL_KEYS:
+            self._horizon_paused = True
+            self._zero_hold_joints = None
+        elif not any(k in self.keys for k in ROLL_KEYS):
+            self.resume_horizon()
         return True
 
     def resume_horizon(self):
@@ -166,15 +175,30 @@ class FlexControl:
         self.client.send()
         self._owned = False
 
-    def calibrate(self):
+    def calibrate(self, bend_limit=None):
         if (not self.ready(calibrated=False) or not self.stop_acknowledged()
                 or not self._available_for_request() or self.keys or self.pending
                 or self.procedure or self.tracking):
             raise ValueError("Calibration requires stationary Flex hardware with all motion controls released.")
         if self.status.flags & ipc.SETUP_ENCODER_MISMATCH:
             raise ValueError("Setup travel and encoder feedback disagree. Check the encoder wiring, direction, and pulse scale.")
+        if bend_limit is not None and not self.status.flags & ipc.BEND_LIMIT_SUPPORTED:
+            raise ValueError("Rebuild and restart the Flex driver to adjust the bend limit.")
         self.resume_horizon()
-        return self._request(ipc.CALIBRATE)
+        return self._request(ipc.CALIBRATE, x=0 if bend_limit is None else bend_limit)
+
+    def set_bend_limit(self, degrees):
+        s = self.status
+        if not self.ready(calibrated=False) or not s.flags & ipc.BEND_LIMIT_SUPPORTED:
+            raise ValueError("A connected Flex driver with adjustable limits is required.")
+        if s.bend_limit == 0:
+            raise ValueError("Use CALIBRATE to set the first Flex bend limit.")
+        if (not self.stop_acknowledged() or not self._available_for_request()
+                or self.keys or self.pending or self.procedure or self.tracking):
+            raise ValueError("Wait for Flex to finish moving before applying the bend limit.")
+        if math.hypot(s.bend_x, s.bend_y) > degrees + 1e-6:
+            raise ValueError("Bring Flex inside the requested bend limit first.")
+        return self._request(ipc.SET_BEND_LIMIT, x=degrees)
 
     def return_to_zero(self):
         s = self.status
@@ -326,7 +350,7 @@ class FlexControl:
                 return
         elif not node._inside_rcm_cone(axis_target, ref):
             radial = axis_target - np.dot(axis_target, ref) * ref
-            cone = node.RCM_CONE_HALF_ANGLE
+            cone = node.rcm_cone_half_angle
             axis_target = math.cos(cone) * ref + math.sin(cone) * radial / np.linalg.norm(radial)
             if np.dot(axis_target - axis, tangent) <= 1e-8:
                 self._wait_at_tracking_limit("UR5 RCM cone reached")
@@ -598,8 +622,15 @@ class FlexControl:
                 self._owned = False
                 self.client.command(ipc.IDLE)
                 label = {ipc.POSITION: "Bird-eye", ipc.CALIBRATE: "Calibration",
-                         ipc.RETURN_ZERO: "Return to Flex zero"}[action]
-                if result != ipc.DONE:
+                         ipc.RETURN_ZERO: "Return to Flex zero", ipc.SET_BEND_LIMIT: "Bend limit update"}[action]
+                if action == ipc.SET_BEND_LIMIT:
+                    if result == ipc.DONE:
+                        self.message = f"Flex bend limit set to {s.bend_limit:g}°."
+                    elif result == ipc.LIMIT:
+                        self.message = "Bring Flex inside the requested bend limit first."
+                    else:
+                        self.message = f"{label} {ipc.RESULTS[result]}."
+                elif result != ipc.DONE:
                     self.cancel(f"{label} {ipc.RESULTS[result]}")
                 elif not self.procedure:
                     if action == ipc.RETURN_ZERO and node._arm_ready():
@@ -620,11 +651,15 @@ class FlexControl:
         elif self.procedure:
             self._step_pull_out(node)
         elif self.keys and self.jog_ready() and not self.pending and self.stop_acknowledged():
-            left, right, up, down = (int(k in self.keys) for k in FLEX_KEYS)
-            x, y = right - left, down - up
-            roll = (self._horizon_correction(node, x, y, JOG_BEND_STEP_DEG, JOG_ROLL_STEP_DEG)
-                    if s.positioning_ready else 0.)
-            self.client.command(ipc.JOG, x=x, y=y, roll=roll)
+            if any(k in self.keys for k in ROLL_KEYS):
+                minus, plus = (int(k in self.keys) for k in ROLL_KEYS)
+                self.client.command(ipc.ROLL_JOG, roll=plus - minus)
+            else:
+                left, right, up, down = (int(k in self.keys) for k in BEND_KEYS)
+                x, y = right - left, down - up
+                roll = (self._horizon_correction(node, x, y, JOG_BEND_STEP_DEG, JOG_ROLL_STEP_DEG)
+                        if s.positioning_ready else 0.)
+                self.client.command(ipc.JOG, x=x, y=y, roll=roll)
             self._owned = True
         elif (not self.pending and self.stop_request is None and self.ready()
               and s.action in (ipc.IDLE, ipc.HORIZON) and not self._horizon_paused):
@@ -647,6 +682,8 @@ class FlexControl:
         s = self.status
         manual_bench = bool(s and s.flags & ipc.MANUAL_BENCH)
         planned_zero = bool(s and s.flags & ipc.PLANNED_ZERO)
+        bend = math.hypot(s.bend_x, s.bend_y) if s else None
+        plane = math.radians(s.roll) + math.atan2(-s.bend_x, s.bend_y) if s else None
         return {
             "connected": self.client.ready,
             "driver_online": s is not None,
@@ -658,15 +695,20 @@ class FlexControl:
             "planned_zero": planned_zero,
             "busy": bool(self.keys or self.pending or self.procedure or
                          (s and s.action != ipc.HORIZON and (s.moving or s.action == ipc.JOG))),
-            "bend": math.hypot(s.bend_x, s.bend_y) if s else None,
+            "bend": bend,
+            "bend_point": [bend * math.sin(plane), -bend * math.cos(plane)] if s else None,
             "roll": s.roll if s else None,
             "tendons": list(s.tendons) if s and (s.calibrated or planned_zero) else None,
             "bend_limit": s.bend_limit if s else None,
+            "bend_limit_max": MAX_FLEX_BEND_DEG,
+            "bend_limit_supported": bool(s and s.flags & ipc.BEND_LIMIT_SUPPORTED),
+            "moving": s.moving if s and self.client.ready else None,
             "fault": s.fault if s else 0,
             "fault_detail": s.fault_detail if s else "",
             "startup_recheck": bool(s and s.flags & ipc.STARTUP_RECHECK),
             "recheck_pending": self._startup_recheck is not None,
             "setup_encoder_mismatch": bool(s and s.flags & ipc.SETUP_ENCODER_MISMATCH),
+            "roll_jog_supported": bool(s and s.flags & ipc.ROLL_JOG_SUPPORTED),
             "message": self.message,
             "tracking": self.tracking is not None,
             "tracking_state": self.tracking_state,

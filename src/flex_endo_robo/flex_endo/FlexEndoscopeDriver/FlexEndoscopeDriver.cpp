@@ -20,7 +20,7 @@ using namespace flex;
 constexpr double Pi = 3.14159265358979323846;
 constexpr double BendPulsesPerDegree = 68000.0 * 4.0 * Pi / 180.0;
 constexpr double RollPulsesPerDegree = 123000.0 * (100.0 / 40.0) / 360.0;
-constexpr double BendLimit = 60.0, RollLimit = 180.0;
+constexpr double MaxBendLimit = 60.0, RollLimit = 180.0;
 constexpr double SetupRollLimit = 20.0;
 constexpr DWORD PollIntervalMs = 10;
 constexpr double MinPositionDurationMs = 20.0;
@@ -309,6 +309,13 @@ private:
     }
 
 public:
+    bool rollBy(double pulses, bool verifyFeedback) {
+        const Axes& feedback = verifyFeedback ? encoder_ : profile_;
+        Axes target = feedback;
+        target[4] += pulses;
+        return positionAxes(target, verifyFeedback, false, JogSpeedScale);
+    }
+
     bool setupJog(int x, int y, bool verifyFeedback) {
         if (jogActive_) return true;
         const double bendSpeed = BendPositionSpeed * JogSpeedScale;
@@ -461,6 +468,10 @@ bool within(Pose p, double bend, double roll) {
     return std::hypot(p.x, p.y) <= bend + 1e-6 && std::abs(p.roll) <= roll + 1e-6;
 }
 
+bool validBendLimit(double degrees) {
+    return degrees >= 1.0 && degrees <= MaxBendLimit && std::trunc(degrees) == degrees;
+}
+
 Pose rotateBend(Pose p, double angle) {
     const double rad = angle * Pi / 180.0;
     return {p.x * std::cos(rad) - p.y * std::sin(rad),
@@ -544,7 +555,7 @@ private:
         status_.stamp = now;
         status_.fault = motion_.fault();
         status_.faultAxisStatus = motion_.faultAxisStatus();
-        status_.flags = (calibrated_ ? Calibrated : 0) |
+        status_.flags = RollJogSupported | BendLimitSupported | (calibrated_ ? Calibrated : 0) |
                         (motion_.moving() ? Moving : 0) | (simulated_ ? Simulated : 0) |
                         (manualBench_ ? ManualBench : 0) |
                         (plannedZero_ ? PlannedZero : 0) | (plannedFull_ ? PlannedFull : 0) |
@@ -557,7 +568,7 @@ private:
         status_.x = current.x;
         status_.y = current.y;
         status_.roll = current.roll;
-        status_.bendLimit = calibrated_ || plannedZero_ ? BendLimit : 0.0;
+        status_.bendLimit = calibrated_ || plannedZero_ ? bendLimit_ : 0.0;
         for (size_t i = 0; i < 4; ++i) status_.tendon[i] = (values[i] - ref[i]) / 68000.0;
         if (!statusMapping_.write(status_)) halt();
     }
@@ -567,7 +578,7 @@ private:
         const bool read = commands_.read(cmd);
         const uint64_t now = GetTickCount64();
         const bool validCommand = read && valid(cmd) && cmd.driver == status_.driver &&
-                                  cmd.app && cmd.sequence && cmd.action <= RecheckStartup &&
+                                  cmd.app && cmd.sequence && cmd.action <= SetBendLimit &&
                                   !cmd.reserved && fresh(cmd.stamp, now, CommandTimeoutMs);
         if (!read || (appLive_ && !validCommand)) {
             halt();
@@ -639,7 +650,8 @@ private:
             if (cmd.request && cmd.request > status_.request && status_.action == Idle &&
                 motion_.moving()) return;
             if (cmd.request && cmd.request > status_.request) acceptRequest(cmd);
-            if (cmd.action == Idle || cmd.action == Jog || cmd.action == Track || cmd.action == Horizon) {
+            if (cmd.action == Idle || cmd.action == Jog || cmd.action == RollJog ||
+                cmd.action == Track || cmd.action == Horizon) {
                 if (!positioningReady() || manualBench_) serviceSetupJog(cmd);
                 else serviceContinuous(cmd);
             }
@@ -657,6 +669,21 @@ private:
     }
 
     void acceptRequest(const Command& cmd) {
+        if (cmd.action == SetBendLimit) {
+            if ((!calibrated_ && !plannedZero_) || status_.action != Idle || motion_.moving() ||
+                !validBendLimit(cmd.x)) {
+                acknowledge(cmd, Refused);
+                return;
+            }
+            const Pose pose = readPose(positionFeedback(), reference_);
+            if (std::hypot(pose.x, pose.y) > cmd.x + 1e-6) {
+                acknowledge(cmd, Limit);
+                return;
+            }
+            bendLimit_ = cmd.x;
+            acknowledge(cmd, Done);
+            return;
+        }
         if (cmd.action == ReturnZero) {
             if ((!calibrated_ && !plannedZero_) || status_.action != Idle || motion_.moving()) {
                 acknowledge(cmd, Refused);
@@ -664,7 +691,7 @@ private:
             }
             Pose travel = readPose(reference_, travelReference_);
             if (plannedZero_) travel.roll = readPose(reference_, setupReference_).roll;
-            if (!within(travel, BendLimit, plannedZero_ ? SetupRollLimit : RollLimit)) {
+            if (!within(travel, MaxBendLimit, plannedZero_ ? SetupRollLimit : RollLimit)) {
                 acknowledge(cmd, Limit);
                 return;
             }
@@ -673,48 +700,43 @@ private:
             acknowledge(cmd, Accepted);
             return;
         }
-        if (usesPlannedFeedback() && cmd.action == Calibrate) {
+        if (cmd.action == Calibrate) {
             if (status_.action != Idle || motion_.moving()) {
                 acknowledge(cmd, Refused);
                 return;
             }
-            reference_ = motion_.profile();
-            if (!plannedZero_) travelReference_ = reference_;
-            plannedZero_ = true;
-            acknowledge(cmd, Done);
-            return;
-        }
-        switch (cmd.action) {
-        case Calibrate:
-            if (status_.action != Idle || motion_.moving()) {
+            if (cmd.x != 0.0 && !validBendLimit(cmd.x)) {
                 acknowledge(cmd, Refused);
                 return;
             }
-            if (!calibrated_ && !setupFeedbackMatches()) {
+            const bool planned = usesPlannedFeedback();
+            if (!planned && !calibrated_ && !setupFeedbackMatches()) {
                 std::fprintf(stderr, "Calibration refused: setup profile and encoder travel disagree. "
                                      "Check the GTS encoder wiring, direction, and pulse scale.\n");
                 acknowledge(cmd, Refused);
                 return;
             }
-            reference_ = motion_.encoder();
-            if (!calibrated_) travelReference_ = reference_;
-            calibrated_ = true;
+            reference_ = planned ? motion_.profile() : motion_.encoder();
+            if (!calibrated_ && !plannedZero_) travelReference_ = reference_;
+            plannedZero_ = planned;
+            calibrated_ = !planned;
+            if (cmd.x != 0.0) bendLimit_ = cmd.x;
             acknowledge(cmd, Done);
-            break;
-        case Position:
+            return;
+        }
+        if (cmd.action == Position) {
             if (!positioningReady() || motion_.moving() || status_.action != Idle || !finiteAxes(cmd)) {
                 acknowledge(cmd, Refused);
                 return;
             }
             positionTarget_ = {cmd.x, cmd.y, cmd.roll};
-            if (!withinTravel(positionTarget_, reference_, BendLimit, rollLimit())) {
+            if (!withinTravel(positionTarget_, reference_, rollLimit())) {
                 acknowledge(cmd, Limit);
                 return;
             }
             positionStarted_ = false;
             status_.action = Position;
             acknowledge(cmd, Accepted);
-            break;
         }
     }
 
@@ -729,7 +751,7 @@ private:
             return;
         }
         if (!plannedFull_) {
-            move(nextPosition(current, target), reference_, BendLimit, RollLimit);
+            move(nextPosition(current, target), reference_, RollLimit);
         } else if (positionStarted_) {
             halt();
             acknowledge(cmd, Refused);
@@ -773,7 +795,7 @@ private:
             return;
         }
         if (!positioningReady() || !finiteAxes(cmd) ||
-            (cmd.action == Horizon && (cmd.x || cmd.y)) ||
+            ((cmd.action == Horizon || cmd.action == RollJog) && (cmd.x || cmd.y)) ||
             std::max({std::abs(cmd.x), std::abs(cmd.y), std::abs(cmd.roll)}) > 1.0) {
             status_.sequence = cmd.sequence;
             halt();
@@ -805,7 +827,8 @@ private:
             if (status_.action != Idle) halt();
             return;
         }
-        status_.action = cmd.action;
+        const bool manualRoll = cmd.action == RollJog;
+        status_.action = manualRoll ? Jog : cmd.action;
         status_.result = Accepted;
         if (motion_.moving()) return;
         const Pose current = readPose(positionFeedback(), reference_);
@@ -818,9 +841,21 @@ private:
         const double rollTarget = current.roll + std::clamp(cmd.roll * rollStep,
             std::min(0.0, std::max(-roll, -roll - zeroRoll) - current.roll),
             std::max(0.0, std::min(roll, roll - zeroRoll) - current.roll));
+        if (manualRoll) {
+            const Pose next{current.x, current.y, rollTarget};
+            const double pulses = std::trunc((rollTarget - current.roll) * RollPulsesPerDegree);
+            if (!pulses || !withinTravel(next, reference_, roll)) {
+                halt();
+                status_.result = Limit;
+                blockedSequence_ = cmd.sequence;
+            } else if (!motion_.rollBy(pulses, !usesPlannedFeedback())) {
+                halt();
+            }
+            return;
+        }
         Pose next = nextJog(current, cmd.x, cmd.y, rollTarget, bendStep);
         // A roll correction can run out of tendon travel before a bend-only step does.
-        if (!withinTravel(next, reference_, BendLimit, roll)) {
+        if (!withinTravel(next, reference_, roll)) {
             if (horizon) {
                 halt();
                 status_.result = Limit;
@@ -836,14 +871,14 @@ private:
             return;
         }
         const double speedScale = horizon ? HorizonSpeedScale : tracking ? TrackSpeedScale : JogSpeedScale;
-        move(next, reference_, BendLimit, roll, speedScale);
+        move(next, reference_, roll, speedScale);
     }
 
-    static bool canBendJog(Pose current, int x, int y) {
+    static bool canBendJog(Pose current, int x, int y, double limit) {
         const double bend = std::hypot(current.x, current.y);
         const double projectedBend = std::hypot(current.x + x * SetupBendStopMargin,
                                                current.y + y * SetupBendStopMargin);
-        return projectedBend <= BendLimit || projectedBend < bend;
+        return projectedBend <= limit || projectedBend < bend;
     }
 
     void serviceSetupJog(const Command& cmd) {
@@ -853,25 +888,27 @@ private:
             return;
         }
         const auto direction = [](double v) { return v == -1 || v == 0 || v == 1; };
-        if (cmd.action != Jog || !direction(cmd.x) || !direction(cmd.y) || cmd.roll != 0) {
+        const bool bendJog = cmd.action == Jog && direction(cmd.x) && direction(cmd.y) && cmd.roll == 0;
+        const bool rollJog = cmd.action == RollJog && direction(cmd.roll) && cmd.x == 0 && cmd.y == 0;
+        if (!bendJog && !rollJog) {
             halt();
             status_.result = Refused;
             blockedSequence_ = cmd.sequence;
             return;
         }
-        const std::array<int, 2> intent{int(cmd.x), int(cmd.y)};
-        if (intent == std::array<int, 2>{}) {
+        const std::array<int, 3> intent{int(cmd.x), int(cmd.y), int(cmd.roll)};
+        if (intent == std::array<int, 3>{}) {
             if (status_.action != Idle) halt();
             return;
         }
         if (intent != setupIntent_) {
-            if (setupIntent_ != std::array<int, 2>{} && !motion_.stop()) return;
+            if (setupIntent_ != std::array<int, 3>{} && !motion_.stop()) return;
             setupIntent_ = intent;
         }
-        const auto [x, y] = intent;
+        const auto [x, y, roll] = intent;
         const Axes& profile = motion_.profile();
-        if (plannedZero_ && (!canBendJog(readPose(profile, reference_), x, y) ||
-                             !canBendJog(readPose(profile, travelReference_), x, y))) {
+        if ((x || y) && plannedZero_ && (!canBendJog(readPose(profile, reference_), x, y, bendLimit_) ||
+                                        !canBendJog(readPose(profile, travelReference_), x, y, MaxBendLimit))) {
             halt();
             status_.result = Limit;
             blockedSequence_ = cmd.sequence;
@@ -886,7 +923,24 @@ private:
         }
         status_.action = Jog;
         status_.result = Accepted;
-        if (!motion_.setupJog(x, y, verifyFeedback)) halt();
+        if (!roll) {
+            if (!motion_.setupJog(x, y, verifyFeedback)) halt();
+            return;
+        }
+        if (motion_.moving()) return;
+        const double current = profile[4];
+        const double travel = std::floor(SetupRollLimit * RollPulsesPerDegree);
+        const double lower = std::min(current, std::ceil(setupReference_[4] - travel));
+        const double upper = std::max(current, std::floor(setupReference_[4] + travel));
+        const double target = std::clamp(std::round(current + roll * JogRollStep * RollPulsesPerDegree),
+                                         lower, upper);
+        if (std::abs(target - current) < 1.0) {
+            halt();
+            status_.result = Limit;
+            blockedSequence_ = cmd.sequence;
+        } else if (!motion_.rollBy(target - current, verifyFeedback)) {
+            halt();
+        }
     }
 
     bool setupFeedbackMatches() const {
@@ -899,16 +953,16 @@ private:
         return true;
     }
 
-    bool withinTravel(Pose next, const Axes& reference, double bend, double roll) const {
-        if (!within(next, bend, roll)) return false;
+    bool withinTravel(Pose next, const Axes& reference, double roll) const {
+        if (!within(next, bendLimit_, roll)) return false;
         if (!calibrated_ && !plannedZero_) return true;
         const Pose zero = readPose(reference, travelReference_);
         const double zeroRoll = usesPlannedFeedback() ? readPose(reference, setupReference_).roll : zero.roll;
-        return within({next.x + zero.x, next.y + zero.y, next.roll + zeroRoll}, bend, roll);
+        return within({next.x + zero.x, next.y + zero.y, next.roll + zeroRoll}, MaxBendLimit, roll);
     }
 
-    void move(Pose next, const Axes& reference, double bend, double roll, double speedScale = 1.0) {
-        if (!withinTravel(next, reference, bend, roll)) {
+    void move(Pose next, const Axes& reference, double roll, double speedScale = 1.0) {
+        if (!withinTravel(next, reference, roll)) {
             motion_.stop();
             status_.result = Limit;
             status_.action = Idle;
@@ -923,10 +977,11 @@ private:
     bool manualBench_;
     bool plannedFull_;
     bool plannedZero_ = false;
+    double bendLimit_ = MaxBendLimit;
     bool positionStarted_ = false;
     bool managedSession_ = false;
     uint64_t startedAt_ = 0;
-    std::array<int, 2> setupIntent_{};
+    std::array<int, 3> setupIntent_{};
     bool waitForNeutral_ = false;
     uint64_t blockedSequence_ = 0;
     uint64_t recheckApp_ = 0;

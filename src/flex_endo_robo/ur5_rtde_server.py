@@ -39,6 +39,11 @@ def parse_command(line):
     kind = cmd.get("type")
     if kind in ("stop", "estop"):
         return kind, ()
+    if kind == "interrupt":
+        request = cmd.get("request")
+        if type(request) is not int or request <= 0:
+            raise ValueError("expected an interrupt request ID")
+        return kind, (request,)
     if kind == "servo_joint":
         return kind, (joint_vector(cmd.get("positions")),)
     if kind == "move_joint":
@@ -74,6 +79,7 @@ class Relay:
         self.pending_move = None
         self.servo_target = None
         self.pending_stop = None
+        self.interrupt_result = None
         self.dashboard_result = None
         self.closed = False
         self.telemetry = None
@@ -87,11 +93,11 @@ class Relay:
     def submit(self, kind, args=()):
         with self.lock:
             if self.closed:
-                if kind == "estop":
+                if kind in ("estop", "interrupt"):
                     raise RuntimeError("RTDE relay has stopped")
                 return
             now = time.monotonic()
-            if kind in ("stop", "estop"):
+            if kind in ("stop", "estop", "interrupt"):
                 self.pending_move = None
                 self.servo_target = None
                 if kind == "estop":
@@ -102,7 +108,11 @@ class Relay:
                     return self.dashboard_result
                 if self.pending_stop is None:
                     self.pending_stop = "stop"
-            elif self.fault is not None:
+                if kind == "interrupt":
+                    if self.interrupt_result is None:
+                        self.interrupt_result = Future()
+                    return self.interrupt_result
+            elif self.fault is not None or self.interrupt_result is not None:
                 return
             elif kind == "move_joint":
                 self.servo_target = None
@@ -145,6 +155,7 @@ class Relay:
                                 "type": "robot_state",
                                 "joints": joints,
                                 "tcp_pose": pose,
+                                "moving": max(map(abs, velocities)) >= STATIONARY_RAD_S,
                                 "timestamp": time.time(),
                             }, velocities)
                         previous_stamp = stamp
@@ -202,18 +213,35 @@ class Relay:
                 self.dashboard_result.set_result(None)
             log.warning("Dashboard confirmed the program stopped")
 
+    def _finish_interrupt(self, result, error):
+        with self.lock:
+            if result is not None and self.interrupt_result is result:
+                self.interrupt_result = None
+                result.set_result(error)
+
     def _tick(self):
         with self.lock:
             stop, self.pending_stop = self.pending_stop, None
             move = self.pending_move
             servo = self.servo_target
             sample = self.telemetry
+            interrupt = self.interrupt_result
 
         if stop == "estop":
+            self._finish_interrupt(interrupt, "STOP took over the UR5 shutdown.")
             self._execute_dashboard_stop()
+            return
         elif stop == "stop":
             self._stop_motion()
+            if interrupt is not None and self.handoff_deadline is None:
+                self.handoff_deadline = time.monotonic() + STOP_TIMEOUT_S
+                self.quiet_sample = None
 
+        if interrupt is not None:
+            self._update_handoff(sample)
+            if self.handoff_deadline is None:
+                self._finish_interrupt(interrupt, None)
+            return
         if stop or self.fault:
             return
 
@@ -280,6 +308,10 @@ class Relay:
                         first_fault = self.fault is None
                         if first_fault:
                             self.fault = str(error)
+                        interrupt = self.interrupt_result
+                    self._finish_interrupt(interrupt, f"UR5 interrupt failed: {error}")
+                    if interrupt is not None:
+                        self.handoff_deadline = self.quiet_sample = None
                     if first_fault:
                         log.exception("RTDE relay fault; motion disabled until relay restart")
                         try:
@@ -295,6 +327,8 @@ class Relay:
                 self.closed = True
                 dashboard_pending = self.pending_stop == "estop"
                 self.pending_stop = None
+                interrupt = self.interrupt_result
+            self._finish_interrupt(interrupt, "UR5 relay stopped during INTERRUPT.")
             if dashboard_pending:
                 try:
                     self._execute_dashboard_stop()
@@ -310,6 +344,7 @@ def handle_client(conn, relay, shutdown):
     conn.settimeout(0.1)
     buffer = b""
     last_state_at = None
+    interrupt = None
     while not shutdown.is_set():
         readable, _, _ = select.select([conn], [], [], PERIOD)
         if readable:
@@ -325,10 +360,19 @@ def handle_client(conn, relay, shutdown):
                     raise ValueError("command exceeds size limit")
                 if line.strip():
                     try:
-                        relay.submit(*parse_command(line))
+                        kind, args = parse_command(line)
+                        if kind == "interrupt":
+                            interrupt = (args[0], relay.submit(kind))
+                        else:
+                            relay.submit(kind, args)
                     except (ValueError, OverflowError) as error:
                         log.warning("Ignoring invalid command: %s", error)
 
+        if interrupt is not None and interrupt[1].done():
+            request, result = interrupt
+            response = {"type": "interrupt_result", "request": request, "error": result.result()}
+            conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
+            interrupt = None
         telemetry = relay.state()
         if telemetry is not None:
             sent_at, state = telemetry

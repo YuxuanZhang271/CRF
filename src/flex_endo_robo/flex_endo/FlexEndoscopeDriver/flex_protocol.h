@@ -12,10 +12,11 @@ constexpr wchar_t DriverMutex[] = L"Local\\CRFFlexV1Driver";
 constexpr uint64_t CommandTimeoutMs = 350;
 constexpr uint64_t VisionTimeoutMs = 500;
 
-enum Action : uint32_t { Idle, Stop, Calibrate, Horizon, Jog, Position, Track, ReturnZero, RecheckStartup };
+enum Action : uint32_t { Idle, Stop, Calibrate, Horizon, Jog, Position, Track, ReturnZero, RecheckStartup, RollJog, SetBendLimit };
 enum Flags : uint32_t {
     Calibrated = 1, Moving = 4, Simulated = 8, SetupEncoderMismatch = 32,
-    ManualBench = 64, PlannedZero = 128, PlannedFull = 256, StartupRecheck = 512
+    ManualBench = 64, PlannedZero = 128, PlannedFull = 256, StartupRecheck = 512,
+    RollJogSupported = 1024, BendLimitSupported = 2048
 };
 enum Result : uint32_t { None, Accepted, Done, Refused, Canceled, Limit };
 

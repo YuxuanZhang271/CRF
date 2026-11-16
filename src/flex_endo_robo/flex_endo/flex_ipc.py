@@ -16,14 +16,18 @@ STATUS = struct.Struct("<4I5Q4IiI8d")
 VISION = struct.Struct("<4I4Q4I2diI")
 assert (COMMAND.size, STATUS.size, VISION.size) == (96, 144, 88)
 
-IDLE, STOP, CALIBRATE, HORIZON, JOG, POSITION, TRACK, RETURN_ZERO, RECHECK_STARTUP = range(9)
+(IDLE, STOP, CALIBRATE, HORIZON, JOG, POSITION, TRACK, RETURN_ZERO,
+ RECHECK_STARTUP, ROLL_JOG, SET_BEND_LIMIT) = range(11)
 CALIBRATED, MOVING, SIMULATED, SETUP_ENCODER_MISMATCH = (1, 4, 8, 32)
 MANUAL_BENCH = 64
 PLANNED_ZERO = 128
 PLANNED_FULL = 256
 STARTUP_RECHECK = 512
+ROLL_JOG_SUPPORTED = 1024
+BEND_LIMIT_SUPPORTED = 2048
 NO_RESULT, ACCEPTED, DONE, REFUSED, CANCELED, LIMIT = range(6)
-ACTIONS = ("idle", "stop", "calibrate", "horizon", "jog", "position", "track", "return to zero", "recheck startup")
+ACTIONS = ("idle", "stop", "calibrate", "horizon", "jog", "position", "track", "return to zero",
+           "recheck startup", "roll jog", "set bend limit")
 RESULTS = ("", "in progress", "complete", "refused", "canceled", "limit reached")
 AXIS_FAULT_BITS = (
     (0x02, "drive alarm"),
