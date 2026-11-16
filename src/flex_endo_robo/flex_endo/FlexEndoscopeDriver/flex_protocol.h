@@ -16,7 +16,8 @@ enum Action : uint32_t { Idle, Stop, Calibrate, Horizon, Jog, Position, Track, R
 enum Flags : uint32_t {
     Calibrated = 1, Moving = 4, Simulated = 8, SetupEncoderMismatch = 32,
     ManualBench = 64, PlannedZero = 128, PlannedFull = 256, StartupRecheck = 512,
-    RollJogSupported = 1024, BendLimitSupported = 2048
+    RollJogSupported = 1024, BendLimitSupported = 2048,
+    TrackHorizonSupported = 4096, WideBendRange = 8192, AtSavedZero = 16384
 };
 enum Result : uint32_t { None, Accepted, Done, Refused, Canceled, Limit };
 

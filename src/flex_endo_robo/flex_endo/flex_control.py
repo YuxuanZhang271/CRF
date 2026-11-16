@@ -15,7 +15,9 @@ POSITION_TIMEOUT_S = 30.0
 KEY_TIMEOUT_S = 0.65
 STRAIGHT_BEND_DEG = 0.25
 TRACK_ARM_SPEED_RAD_S = math.radians(3)
-PULL_OUT_ALIGN_SPEED_RAD_S = math.radians(2)
+PULL_OUT_ALIGN_SPEED_RAD_S = math.radians(4)
+PULL_OUT_ALIGN_TOLERANCE_RAD = math.radians(0.35)
+PULL_OUT_RETRACT_SPEED_M_S = 0.050
 # Match the per-command increments in the native Flex driver.
 JOG_SPEED_MULTIPLIER = 1.5
 TRACK_SPEED_MULTIPLIER = 3.0
@@ -25,15 +27,22 @@ JOG_ROLL_STEP_DEG = HORIZON_ROLL_STEP_DEG * JOG_SPEED_MULTIPLIER
 TRACK_BEND_STEP_DEG = 0.32 * TRACK_SPEED_MULTIPLIER
 TRACK_ROLL_STEP_DEG = 1.0 * TRACK_SPEED_MULTIPLIER
 HORIZON_DEADBAND_DEG = 0.15
+TRACK_HORIZON_TOLERANCE_DEG = 1.0
 PIVOT_TOLERANCE_M = 0.002
-MAX_FLEX_BEND_DEG = 60  # Match the native driver's maximum travel envelope.
+MIN_FLEX_BEND_DEG = 30
+DEFAULT_FLEX_BEND_DEG = 60
+MAX_FLEX_BEND_DEG = 90  # Match the native driver's maximum travel envelope.
 
 
 class FlexControl:
-    def __init__(self, client, camera, pull_out_clearance=None):
+    def __init__(self, client, camera, pull_out_clearance=None, *, camera_roll_offset_deg=0.):
         self.client = client
         self.camera = camera
         self.pull_out_clearance = pull_out_clearance
+        self.camera_roll_offset_deg = camera_roll_offset_deg
+        angle = math.radians(camera_roll_offset_deg)
+        c, s = math.cos(angle), math.sin(angle)
+        self._image_to_flex = np.array(((c, -s), (s, c)))
         self.keys = {}
         self.pending = None
         self.tracking = None
@@ -89,6 +98,11 @@ class FlexControl:
     def _available_for_request(self):
         s = self.status
         return s.action == ipc.HORIZON or (s.action == ipc.IDLE and not s.moving)
+
+    @property
+    def bend_limit_max(self):
+        s = self.status
+        return MAX_FLEX_BEND_DEG if s is None or s.flags & ipc.WIDE_BEND_RANGE else DEFAULT_FLEX_BEND_DEG
 
     def set_key(self, key, down):
         if not down:
@@ -184,6 +198,8 @@ class FlexControl:
             raise ValueError("Setup travel and encoder feedback disagree. Check the encoder wiring, direction, and pulse scale.")
         if bend_limit is not None and not self.status.flags & ipc.BEND_LIMIT_SUPPORTED:
             raise ValueError("Rebuild and restart the Flex driver to adjust the bend limit.")
+        if bend_limit is not None and bend_limit > self.bend_limit_max:
+            raise ValueError("Rebuild and restart the Flex driver to use the expanded bend range.")
         self.resume_horizon()
         return self._request(ipc.CALIBRATE, x=0 if bend_limit is None else bend_limit)
 
@@ -193,6 +209,8 @@ class FlexControl:
             raise ValueError("A connected Flex driver with adjustable limits is required.")
         if s.bend_limit == 0:
             raise ValueError("Use CALIBRATE to set the first Flex bend limit.")
+        if degrees > self.bend_limit_max:
+            raise ValueError("Rebuild and restart the Flex driver to use the expanded bend range.")
         if (not self.stop_acknowledged() or not self._available_for_request()
                 or self.keys or self.pending or self.procedure or self.tracking):
             raise ValueError("Wait for Flex to finish moving before applying the bend limit.")
@@ -229,6 +247,8 @@ class FlexControl:
         if (not self.ready() or not self.stop_acknowledged() or not self._available_for_request()
                 or self.keys or self.pending or self.procedure):
             raise ValueError("Tracking requires calibrated, idle Flex hardware.")
+        if not self.status.flags & ipc.TRACK_HORIZON_SUPPORTED:
+            raise ValueError("Rebuild and restart the Flex driver for horizon-constrained tracking.")
         obs = self.camera.observation()
         if obs is None or obs.category is None or not self._fresh(obs):
             raise ValueError("Select one YOLO category and wait for a fresh camera frame.")
@@ -261,6 +281,18 @@ class FlexControl:
         if depth <= 0 or not node._rcm_pivot_is_valid(axis_now, tip_now):
             self._wait_at_tracking_limit("UR5 is off the captured RCM pivot")
             return
+        horizon_error = self._horizon_error(node, q_now) if obs.valid else 0.
+        if obs.valid and not outside_cone and abs(horizon_error) > TRACK_HORIZON_TOLERANCE_DEG:
+            self._tracking_command = None
+            if self.status.action == ipc.TRACK:
+                self.client.command(ipc.IDLE)
+                self._owned = False
+                self.tracking_state = "Leveling horizon"
+            else:
+                correcting = self._hold_horizon(node, horizon_error)
+                self.tracking_state = ("Leveling horizon" if correcting else
+                                       "Tracking limited · Flex cannot level the horizon within its travel limits")
+            return
         if not obs.valid or obs.centered:
             self._tracking_limit = None
             self._tracking_command = None
@@ -269,20 +301,19 @@ class FlexControl:
                 return
             self.tracking_state = "Centered" if obs.valid else "Waiting for target"
             if obs.valid:
-                self._hold_horizon(node)
+                self._hold_horizon(node, horizon_error)
             else:
                 self.client.command(ipc.IDLE)
                 self._owned = False
             return
 
-        # The prototype maps image right/down to the two tendon axes. Both
-        # the camera and actuator frame rotate with axis 5.
+        # Convert image right/down to tendon and arm steering coordinates.
         error = np.array((obs.dx, obs.dy), dtype=float)
         norm = float(np.linalg.norm(error))
         if not math.isfinite(norm) or not norm:
             self.cancel_tracking("Tracking stopped · invalid target coordinates")
             return
-        direction = error / norm
+        direction = self._image_to_flex @ (error / norm)
         s = self.status
         bend = np.array((s.bend_x, s.bend_y))
         gain = min(1., max(0.15, norm / (0.12 * min(obs.width, obs.height))))
@@ -304,14 +335,15 @@ class FlexControl:
         next_bend = np.linalg.norm(bend + TRACK_BEND_STEP_DEG * step)
         if not outside_cone and not blocked and (next_bend <= s.bend_limit or next_bend < current_bend):
             x, y = step
-            self.client.command(ipc.TRACK, frame=obs.frame, x=x, y=y,
-                                roll=self._horizon_correction(
-                                    node, x, y, TRACK_BEND_STEP_DEG, TRACK_ROLL_STEP_DEG))
-            if self._tracking_command is None or self.client.sequence != self._tracking_command[0]:
-                self._tracking_command = (self.client.sequence, bend, s.roll, step)
-            self._owned = True
-            self.tracking_state = "Following with Flex"
-            return
+            required_roll = self._horizon_error(node, q_now, x, y, TRACK_BEND_STEP_DEG)
+            roll = self._horizon_roll_command(required_roll, TRACK_ROLL_STEP_DEG)
+            if abs(required_roll - roll * TRACK_ROLL_STEP_DEG) <= TRACK_HORIZON_TOLERANCE_DEG:
+                self.client.command(ipc.TRACK, frame=obs.frame, x=x, y=y, roll=roll)
+                if self._tracking_command is None or self.client.sequence != self._tracking_command[0]:
+                    self._tracking_command = (self.client.sequence, bend, s.roll, step)
+                self._owned = True
+                self.tracking_state = "Following with Flex"
+                return
 
         self._tracking_command = None
         if s.action == ipc.TRACK or (s.moving and (outside_cone or s.action != ipc.HORIZON)):
@@ -339,7 +371,7 @@ class FlexControl:
         tangent = np.cross(np.cross(camera_rotation[:, 2], image_tangent), axis)
         length = float(np.linalg.norm(tangent))
         if length < 1e-6:
-            self._wait_at_tracking_limit("no available RCM tilt toward the target")
+            self._wait_at_tracking_limit("no available RCM tilt toward the target", node if not outside_cone else None)
             return
         angle = TRACK_ARM_SPEED_RAD_S * node.dt
         axis_target = math.cos(angle) * axis + math.sin(angle) * tangent / length
@@ -353,22 +385,33 @@ class FlexControl:
             cone = node.rcm_cone_half_angle
             axis_target = math.cos(cone) * ref + math.sin(cone) * radial / np.linalg.norm(radial)
             if np.dot(axis_target - axis, tangent) <= 1e-8:
-                self._wait_at_tracking_limit("UR5 RCM cone reached")
+                self._wait_at_tracking_limit("UR5 RCM cone reached", node)
                 return
         q_target = node.kin.ik_along_axis(pivot + depth * axis_target, axis_target, q_seed)
+
         def validate_start(q):
             start_axis, _, start_tip = node.kin.tube_axis_in_base(q)
             return node._rcm_pivot_is_valid(start_axis, start_tip, depth)
 
+        horizon_limit = TRACK_HORIZON_TOLERANCE_DEG
+        if outside_cone:
+            horizon_limit = max(horizon_limit, abs(horizon_error) - 1e-6)
+        horizon_blocked = False
+
         def validate_target(q):
+            nonlocal horizon_blocked
             target_axis, _, target_tip = node.kin.tube_axis_in_base(q)
             allowed = (node._inside_rcm_cone(target_axis, ref) if seed_inside
                        else np.dot(target_axis - axis, ref) > 1e-8)
-            return allowed and node._rcm_pivot_is_valid(target_axis, target_tip, depth)
+            if not allowed or not node._rcm_pivot_is_valid(target_axis, target_tip, depth):
+                return False
+            horizon_blocked = abs(self._horizon_error(node, q)) > horizon_limit
+            return not horizon_blocked
 
         if q_target is None or not node._send_servo(
                 q_target, q_now, node.dt, validate=validate_target, validate_start=validate_start):
-            self._wait_at_tracking_limit("no feasible RCM correction")
+            reason = "arm assist would tilt the horizon" if horizon_blocked else "no feasible RCM correction"
+            self._wait_at_tracking_limit(reason, node if not outside_cone else None)
             return
         if outside_cone:
             self.client.command(ipc.IDLE)
@@ -376,22 +419,22 @@ class FlexControl:
             self.tracking_state = "Returning UR5 to the RCM cone"
         else:
             self.tracking_state = "Following with arm assist"
-            self._hold_horizon(node)
+            self._hold_horizon(node, horizon_error)
 
-    def _wait_at_tracking_limit(self, reason):
+    def _wait_at_tracking_limit(self, reason, node=None):
         self._tracking_command = None
-        self.client.command(ipc.IDLE)
-        self._owned = False
+        if node is not None:
+            self._hold_horizon(node)
+        else:
+            self.client.command(ipc.IDLE)
+            self._owned = False
         self.tracking_state = f"Tracking limited · {reason}. Waiting for target to move."
 
     def _valid_arm_pose(self, node, q):
         return node._rcm_pose_is_valid(q)
 
-    def _horizon_correction(self, node, x, y, bend_step, roll_step):
+    def _horizon_error(self, node, q, x=0., y=0., bend_step=0.):
         s = self.status
-        if self._horizon_paused or not node._arm_ready():
-            return 0.
-        q = node.joint_positions.copy()
         scale = max(1., math.hypot(x, y))
         x_next, y_next = s.bend_x + x * bend_step / scale, s.bend_y + y * bend_step / scale
         radius = math.hypot(x_next, y_next)
@@ -402,23 +445,33 @@ class FlexControl:
             plane = math.radians(s.roll) + math.atan2(-x_next, y_next)
             target, _ = node.kin.solve_horizon_flex_yaw(
                 q, steer_yaw=plane - neutral, theta_total=math.radians(radius))
-        target = math.degrees(target)
-        delta = (target - s.roll + 180.) % 360. - 180.
+        return (math.degrees(target) - self.camera_roll_offset_deg - s.roll + 180.) % 360. - 180.
+
+    def _horizon_roll_command(self, delta, roll_step):
+        roll = self.status.roll
         limit = self._roll_limit()
-        bounded = min(limit - s.roll, max(-limit - s.roll, delta))
+        bounded = min(limit - roll, max(-limit - roll, delta))
         if abs(bounded) <= HORIZON_DEADBAND_DEG:
             return 0.
         return float(np.clip(bounded / roll_step, -1., 1.))
 
-    def _hold_horizon(self, node):
+    def _horizon_correction(self, node, x, y, bend_step, roll_step):
+        if self._horizon_paused or not node._arm_ready():
+            return 0.
+        delta = self._horizon_error(node, node.joint_positions.copy(), x, y, bend_step)
+        return self._horizon_roll_command(delta, roll_step)
+
+    def _hold_horizon(self, node, error=None):
         s = self.status
-        roll = self._horizon_correction(node, 0., 0., 0., HORIZON_ROLL_STEP_DEG)
+        roll = (self._horizon_correction(node, 0., 0., 0., HORIZON_ROLL_STEP_DEG) if error is None
+                else self._horizon_roll_command(error, HORIZON_ROLL_STEP_DEG))
         if roll:
             self.client.command(ipc.HORIZON, roll=roll)
             self._owned = s.result != ipc.LIMIT or s.sequence != self.client.sequence
         else:
             self.client.command(ipc.IDLE)
             self._owned = False
+        return self._owned
 
     def _roll_limit(self):
         return 20. if self.status.planned_feedback else 180.
@@ -453,8 +506,8 @@ class FlexControl:
         base, distal = node.kin.solve_horizon_flex_yaw(q, theta_total=max(0., required))
         # The physical bending-plane yaw is base plus distal compensation.
         # Tendon x points image-right and tendon y points image-down.
-        tendon_angle = distal
-        roll = math.degrees(base)
+        tendon_angle = distal + math.radians(self.camera_roll_offset_deg)
+        roll = (math.degrees(base) - self.camera_roll_offset_deg + 180.) % 360. - 180.
         if abs(roll) > self._roll_limit():
             raise ValueError("Bird-eye needs more base roll than is available at this UR5 pose.")
         if not self._position(-bend * math.sin(tendon_angle), bend * math.cos(tendon_angle), roll):
@@ -468,8 +521,11 @@ class FlexControl:
             raise ValueError("Configure the bench-verified pull-out clearance before enabling Pull Out.")
         if not self._rcm_ready(node) or not self.ready():
             raise ValueError("Pull Out requires active RCM and calibrated Flex feedback.")
-        if any(node._key_state.values()):
-            raise ValueError("Release arm controls before starting Pull Out.")
+        if any(node._key_state.values()) or node._arm_moving is not False or node._teleop_servo_active:
+            raise ValueError("Release the arm controls and wait for the UR5 to stop before starting Pull Out.")
+        if (self.keys or self.pending or self.procedure or self.tracking
+                or not self.stop_acknowledged() or not self._available_for_request()):
+            raise ValueError("Wait for Flex to be idle before starting Pull Out.")
         q = node.joint_positions.copy()
         axis, _, tip = node.kin.tube_axis_in_base(q)
         if not self._valid_arm_pose(node, q):
@@ -483,27 +539,38 @@ class FlexControl:
         alignment = float(np.dot(rotation[:, 2], axis))
         if abs(alignment) < 0.98:
             raise ValueError("Pull Out requires aligned camera and shaft axes.")
-        if not self.return_to_zero():
+        flex_at_zero = self._straight() and bool(self.status.flags & ipc.AT_SAVED_ZERO)
+        if not flex_at_zero and not self.return_to_zero():
             return False
+        self._horizon_paused = True
+        self._zero_hold_joints = None
+        if flex_at_zero:
+            self.client.command(ipc.IDLE)
         sign = -math.copysign(1., alignment)
         self.procedure = {
-            "stage": "straighten", "depth": depth, "offset": axial_offset,
+            "stage": "prepare", "depth": depth, "offset": axial_offset, "flex_zero": flex_at_zero,
             "end": sign * self.pull_out_clearance, "sign": sign,
             "deadline": time.monotonic() + POSITION_TIMEOUT_S,
         }
-        self.message = "Pull Out · straightening Flex"
+        self.message = "Pull Out · preparing RCM and Flex"
         return True
 
     def confirm_pull_out(self, node):
         if (not self.procedure or self.procedure["stage"] != "confirm"
-                or not self._rcm_ready(node) or not self.ready() or not self._straight()):
-            raise ValueError("Start Pull Out and wait for Flex to reach its saved zero before confirming.")
-        return self._begin_pull_out_alignment()
+                or not self._rcm_ready(node) or not self.ready() or not self._straight()
+                or node._arm_moving is not False):
+            raise ValueError("Wait for the UR5 and Flex to finish resetting before confirming.")
+        q = node.joint_positions.copy()
+        axis, _, _ = node.kin.tube_axis_in_base(q)
+        if (float(np.dot(axis, node.rcm_ref_axis)) < math.cos(PULL_OUT_ALIGN_TOLERANCE_RAD)
+                or not node._rcm_pose_is_valid(q, self.procedure["depth"])):
+            raise ValueError("The UR5 moved away from the reset pose. Start Pull Out again.")
+        return self._begin_pull_out_retraction()
 
-    def _begin_pull_out_alignment(self):
-        self.procedure["stage"] = "align"
+    def _begin_pull_out_retraction(self):
+        self.procedure["stage"] = "retract"
         self.procedure["deadline"] = time.monotonic() + POSITION_TIMEOUT_S
-        self.message = "Pull Out · aligning to RCM"
+        self.message = "Pull Out · retracting"
         return True
 
     def _straight(self):
@@ -512,8 +579,13 @@ class FlexControl:
 
     def _step_pull_out(self, node):
         st = self.procedure
-        if not self._rcm_ready(node) or not self.ready() or time.monotonic() >= st["deadline"]:
-            self.cancel("Pull Out stopped · feedback unavailable or timed out")
+        if not self._rcm_ready(node) or not self.ready():
+            self.cancel("Pull Out stopped · UR5 or Flex feedback unavailable")
+            return
+        stage = st["stage"]
+        if time.monotonic() >= st["deadline"]:
+            phase = {"prepare": "RCM/Flex reset", "confirm": "straightness confirmation", "retract": "withdrawal"}[stage]
+            self.cancel(f"Pull Out stopped · {phase} timed out")
             return
         q = node.joint_positions.copy()
         axis, _, tip = node.kin.tube_axis_in_base(q)
@@ -522,32 +594,49 @@ class FlexControl:
             return
         ref, pivot = node.rcm_ref_axis, node.rcm_world_point
         actual_error = math.acos(float(np.clip(np.dot(axis, ref), -1., 1.)))
-        straight = self._straight()
-        if st["stage"] == "straighten":
-            if straight and self.status.planned_feedback:
-                st["stage"] = "confirm"
-                st["deadline"] = time.monotonic() + POSITION_TIMEOUT_S
-                self.message = "Pull Out · verify the scope is physically straight"
-            elif straight:
-                self._begin_pull_out_alignment()
+        flex_ready = st["flex_zero"] and self._straight()
+        aligned = actual_error <= PULL_OUT_ALIGN_TOLERANCE_RAD
+        if stage == "confirm":
+            if (not flex_ready or not aligned or node._arm_moving is not False
+                    or not node._rcm_pivot_is_valid(axis, tip, st["depth"])):
+                self.cancel("Pull Out stopped · reset pose changed before confirmation")
             return
-        if st["stage"] == "confirm":
-            if not straight:
-                self.cancel("Pull Out stopped · Flex moved before confirmation")
-            return
-        if not straight:
-            self.cancel("Pull Out stopped · straightness lost")
-            return
-        if st["stage"] == "align":
-            if actual_error < math.radians(0.35):
-                st["stage"] = "retract"
-                self.message = "Pull Out · retracting"
-                return
-            cross = np.cross(axis, ref)
-            axis_target = node.kin.rotate_about(axis, cross / np.linalg.norm(cross),
-                                                min(actual_error, PULL_OUT_ALIGN_SPEED_RAD_S * node.dt))
+        # Keep the target advancing from the last nearby servo command while
+        # RTDE follows it. The measured pose still gates every phase change.
+        q_seed = node._q_cmd
+        if q_seed is None or np.max(np.abs(q_seed - q)) > node.TELEOP_RESYNC_RAD:
+            q_seed = q
+        if stage == "prepare":
             depth = st["depth"]
+            if not node._rcm_pivot_is_valid(axis, tip, depth):
+                self.cancel("Pull Out stopped · insertion depth changed during reset")
+                return
+            if aligned:
+                if node._arm_moving is not False or node._teleop_servo_active:
+                    return
+                if not flex_ready:
+                    self.message = "Pull Out · RCM aligned, waiting for Flex zero"
+                elif self.status.planned_feedback:
+                    st["stage"] = "confirm"
+                    st["deadline"] = time.monotonic() + POSITION_TIMEOUT_S
+                    self.message = "Pull Out · verify the scope is physically straight"
+                else:
+                    self._begin_pull_out_retraction()
+                return
+            seed_axis = node.kin.tube_axis_in_base(q_seed)[0] if q_seed is not q else axis
+            angle = math.acos(float(np.clip(np.dot(seed_axis, ref), -1., 1.)))
+            step = PULL_OUT_ALIGN_SPEED_RAD_S * node.dt
+            if angle <= step:
+                axis_target = ref
+            else:
+                cross = np.cross(seed_axis, ref)
+                axis_target = node.kin.rotate_about(seed_axis, cross / np.linalg.norm(cross), step)
+            self.message = ("Pull Out · aligning to RCM" if flex_ready else
+                            "Pull Out · aligning RCM and returning Flex to zero")
         else:
+            if not flex_ready:
+                self.cancel("Pull Out stopped · Flex straightness lost")
+                return
             if actual_error > math.radians(1):
                 self.cancel("Pull Out stopped · RCM alignment lost")
                 return
@@ -556,15 +645,21 @@ class FlexControl:
             current = float(np.dot(end - pivot, ref))
             remaining = st["sign"] * (st["end"] - current)
             if remaining <= 0.001:
-                self.procedure = None
-                self.message = "Pull Out complete"
+                if node._arm_moving is False and not node._teleop_servo_active:
+                    self.procedure = None
+                    self.message = "Pull Out complete"
                 return
-            step = st["sign"] * min(remaining, node.ARM_AXIS_VEL * node.dt)
-            depth = current + step + st["offset"]
+            end_seed = node.kin.straight_camera_position_in_base(q_seed) if q_seed is not q else end
+            commanded = float(np.dot(end_seed - pivot, ref))
+            step = PULL_OUT_RETRACT_SPEED_M_S * node.dt
+            command_remaining = st["sign"] * (st["end"] - commanded)
+            next_end = (st["end"] if command_remaining <= step else commanded + st["sign"] * step)
+            depth = next_end + st["offset"]
         p_target = pivot + depth * axis_target
-        q_target = node.kin.ik_along_axis(p_target, axis_target, q)
+        q_target = node.kin.ik_along_axis(p_target, axis_target, q_seed)
         if q_target is None or not node._send_servo(
-                q_target, q, node.dt, validate=lambda target: node._rcm_pose_is_valid(target, depth)):
+                q_target, q, node.dt, validate=lambda target: node._rcm_pose_is_valid(target, depth),
+                validate_start=node._rcm_pose_is_valid):
             self.cancel("Pull Out stopped · RCM correction unavailable")
 
     def tick(self, node):
@@ -632,6 +727,8 @@ class FlexControl:
                         self.message = f"{label} {ipc.RESULTS[result]}."
                 elif result != ipc.DONE:
                     self.cancel(f"{label} {ipc.RESULTS[result]}")
+                elif self.procedure and action == ipc.RETURN_ZERO:
+                    self.procedure["flex_zero"] = True
                 elif not self.procedure:
                     if action == ipc.RETURN_ZERO and node._arm_ready():
                         self._zero_hold_joints = node.joint_positions.copy()
@@ -700,7 +797,8 @@ class FlexControl:
             "roll": s.roll if s else None,
             "tendons": list(s.tendons) if s and (s.calibrated or planned_zero) else None,
             "bend_limit": s.bend_limit if s else None,
-            "bend_limit_max": MAX_FLEX_BEND_DEG,
+            "bend_limit_default": DEFAULT_FLEX_BEND_DEG,
+            "bend_limit_max": self.bend_limit_max,
             "bend_limit_supported": bool(s and s.flags & ipc.BEND_LIMIT_SUPPORTED),
             "moving": s.moving if s and self.client.ready else None,
             "fault": s.fault if s else 0,
@@ -711,6 +809,7 @@ class FlexControl:
             "roll_jog_supported": bool(s and s.flags & ipc.ROLL_JOG_SUPPORTED),
             "message": self.message,
             "tracking": self.tracking is not None,
+            "tracking_horizon_supported": bool(s and s.flags & ipc.TRACK_HORIZON_SUPPORTED),
             "tracking_state": self.tracking_state,
             "pull_out_enabled": self.pull_out_clearance is not None,
             "pull_out_confirm": bool(self.procedure and self.procedure["stage"] == "confirm"),

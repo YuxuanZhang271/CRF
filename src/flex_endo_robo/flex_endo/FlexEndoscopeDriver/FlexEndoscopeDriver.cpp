@@ -20,7 +20,8 @@ using namespace flex;
 constexpr double Pi = 3.14159265358979323846;
 constexpr double BendPulsesPerDegree = 68000.0 * 4.0 * Pi / 180.0;
 constexpr double RollPulsesPerDegree = 123000.0 * (100.0 / 40.0) / 360.0;
-constexpr double MaxBendLimit = 60.0, RollLimit = 180.0;
+constexpr double MinBendLimit = 30.0, DefaultBendLimit = 60.0, MaxBendLimit = 90.0;
+constexpr double RollLimit = 180.0;
 constexpr double SetupRollLimit = 20.0;
 constexpr DWORD PollIntervalMs = 10;
 constexpr double MinPositionDurationMs = 20.0;
@@ -469,7 +470,7 @@ bool within(Pose p, double bend, double roll) {
 }
 
 bool validBendLimit(double degrees) {
-    return degrees >= 1.0 && degrees <= MaxBendLimit && std::trunc(degrees) == degrees;
+    return degrees >= MinBendLimit && degrees <= MaxBendLimit && std::trunc(degrees) == degrees;
 }
 
 Pose rotateBend(Pose p, double angle) {
@@ -555,10 +556,12 @@ private:
         status_.stamp = now;
         status_.fault = motion_.fault();
         status_.faultAxisStatus = motion_.faultAxisStatus();
-        status_.flags = RollJogSupported | BendLimitSupported | (calibrated_ ? Calibrated : 0) |
+        status_.flags = RollJogSupported | BendLimitSupported | TrackHorizonSupported | WideBendRange |
+                        (calibrated_ ? Calibrated : 0) |
                         (motion_.moving() ? Moving : 0) | (simulated_ ? Simulated : 0) |
                         (manualBench_ ? ManualBench : 0) |
                         (plannedZero_ ? PlannedZero : 0) | (plannedFull_ ? PlannedFull : 0) |
+                        (!status_.fault && atSavedZero() ? AtSavedZero : 0) |
                         (motion_.canRecheckStartup() ? StartupRecheck : 0) |
                         (!usesPlannedFeedback() && !calibrated_ && !motion_.moving() && !setupFeedbackMatches() ?
                          SetupEncoderMismatch : 0);
@@ -762,16 +765,20 @@ private:
         }
     }
 
-    void serviceReturnZero(const Command& cmd) {
-        if (motion_.moving()) return;
+    bool atSavedZero() const {
+        if ((!calibrated_ && !plannedZero_) || motion_.moving()) return false;
         const Axes& values = plannedZero_ ? motion_.profile() : motion_.encoder();
         const double tolerance = plannedZero_ ? 1.0 : EncoderTolerancePulses;
-        bool atZero = true;
         for (size_t i = 0; i < values.size(); ++i) {
             const double target = plannedZero_ ? std::round(reference_[i]) : reference_[i];
-            atZero &= std::abs(values[i] - target) <= tolerance;
+            if (std::abs(values[i] - target) > tolerance) return false;
         }
-        if (atZero) {
+        return true;
+    }
+
+    void serviceReturnZero(const Command& cmd) {
+        if (motion_.moving()) return;
+        if (atSavedZero()) {
             status_.action = Idle;
             acknowledge(cmd, Done);
             return;
@@ -838,9 +845,11 @@ private:
         const double bendStep = horizon ? 0.0 : tracking ? TrackBendStep : JogBendStep;
         const double rollStep = horizon ? HorizonRollStep : tracking ? TrackRollStep : JogRollStep;
         const double zeroRoll = readPose(reference_, usesPlannedFeedback() ? setupReference_ : travelReference_).roll;
-        const double rollTarget = current.roll + std::clamp(cmd.roll * rollStep,
+        const double requestedRoll = cmd.roll * rollStep;
+        const double rollDelta = std::clamp(requestedRoll,
             std::min(0.0, std::max(-roll, -roll - zeroRoll) - current.roll),
             std::max(0.0, std::min(roll, roll - zeroRoll) - current.roll));
+        const double rollTarget = current.roll + rollDelta;
         if (manualRoll) {
             const Pose next{current.x, current.y, rollTarget};
             const double pulses = std::trunc((rollTarget - current.roll) * RollPulsesPerDegree);
@@ -854,9 +863,9 @@ private:
             return;
         }
         Pose next = nextJog(current, cmd.x, cmd.y, rollTarget, bendStep);
-        // A roll correction can run out of tendon travel before a bend-only step does.
-        if (!withinTravel(next, reference_, roll)) {
-            if (horizon) {
+        // Visual tracking requires the commanded roll and tendon motion together.
+        if ((tracking && std::abs(rollDelta - requestedRoll) > 1e-6) || !withinTravel(next, reference_, roll)) {
+            if (horizon || tracking) {
                 halt();
                 status_.result = Limit;
                 blockedSequence_ = cmd.sequence;
@@ -977,7 +986,7 @@ private:
     bool manualBench_;
     bool plannedFull_;
     bool plannedZero_ = false;
-    double bendLimit_ = MaxBendLimit;
+    double bendLimit_ = DefaultBendLimit;
     bool positionStarted_ = false;
     bool managedSession_ = false;
     uint64_t startedAt_ = 0;

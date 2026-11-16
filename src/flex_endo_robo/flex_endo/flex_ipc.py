@@ -25,6 +25,9 @@ PLANNED_FULL = 256
 STARTUP_RECHECK = 512
 ROLL_JOG_SUPPORTED = 1024
 BEND_LIMIT_SUPPORTED = 2048
+TRACK_HORIZON_SUPPORTED = 4096
+WIDE_BEND_RANGE = 8192
+AT_SAVED_ZERO = 16384
 NO_RESULT, ACCEPTED, DONE, REFUSED, CANCELED, LIMIT = range(6)
 ACTIONS = ("idle", "stop", "calibrate", "horizon", "jog", "position", "track", "return to zero",
            "recheck startup", "roll jog", "set bend limit")

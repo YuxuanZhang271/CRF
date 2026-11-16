@@ -22,9 +22,11 @@ from flex_endo_robo.control_node import (
     DEFAULT_JOG_SPEED_SCALE,
     FLEX_MAX_BEND,
     JOG_SPEED_SCALES,
+    MAX_RCM_CONE_DEG,
+    MIN_RCM_CONE_DEG,
     ControlNode,
 )
-from flex_endo_robo.flex_endo.flex_control import MAX_FLEX_BEND_DEG, FlexControl
+from flex_endo_robo.flex_endo.flex_control import MAX_FLEX_BEND_DEG, MIN_FLEX_BEND_DEG, FlexControl
 from flex_endo_robo.flex_endo.flex_ipc import FlexClient
 from flex_endo_robo.ur5_rtde_server import TCP_HOST, TCP_PORT, UR5_IP, open_relay, serve_relay
 from scope.camera import CAMERA_INDEX, CameraFeed
@@ -36,11 +38,23 @@ FLEX_STOP_CONFIRM_TIMEOUT_S = 1.0
 ARM_INTERRUPT_CONFIRM_TIMEOUT_S = 2.0
 
 
-def angle_limit(body, maximum, name):
+def angle_limit(body, minimum, maximum, name):
     degrees = body.get('degrees')
-    if type(degrees) not in (int, float) or not 1 <= degrees <= maximum or degrees != int(degrees):
-        raise ValueError(f'{name} must be a whole number from 1° to {maximum}°.')
+    if type(degrees) not in (int, float) or not minimum <= degrees <= maximum or degrees != int(degrees):
+        raise ValueError(f'{name} must be a whole number from {minimum}° to {maximum}°.')
     return int(degrees)
+
+
+def parse_pull_out_clearance(body):
+    value = body.get('clearance_mm')
+    if type(value) in (int, float):
+        try:
+            clearance = value / 1000.0
+            if math.isfinite(clearance) and clearance >= 0:
+                return clearance
+        except OverflowError:
+            pass
+    raise ValueError('Pull Out clearance must be a finite nonnegative distance in millimetres.')
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -69,7 +83,9 @@ h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
   align-items:start;gap:6px;padding:8px}
 .primary-actions button{padding-inline:6px;white-space:nowrap}
 .stop-actions{justify-content:flex-end;min-width:0}
-#confirm-pull-out{grid-column:1/-1;justify-self:start}
+#pull-out-distance-form,#confirm-pull-out{grid-column:1/-1;justify-self:start}
+#pull-out-distance-form{flex-wrap:wrap}
+#pull-out-distance{width:85px}
 .control-settings{margin-top:8px;align-items:center}
 .limit-editor{display:flex;align-items:center;gap:5px;min-width:0}
 .limit-editor label{color:var(--dim);font-size:11px}
@@ -134,6 +150,7 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
 .status-chip dd::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor;margin-right:4px}
 .status-chip[data-tone="ok"] dd{color:var(--ok)}
 .status-chip[data-tone="active"] dd{color:var(--hi)}
+.status-chip[data-tone="tracking"] dd{color:#91baff}
 .status-chip[data-tone="error"] dd{color:var(--bad)}
 .console{margin-top:10px}
 .console-output{height:clamp(84px,18dvh,210px);overflow:auto;padding:7px;border-radius:5px;
@@ -172,12 +189,18 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
   <div class="card primary-actions">
     <div class="actions">
       <button onclick="post('/api/cmd/bird_eye')">BIRD-EYE</button>
-      <button onclick="post('/api/cmd/pull_out')">PULL OUT</button>
+      <button id="pull-out" disabled>PULL OUT</button>
     </div>
     <div class="actions stop-actions">
       <button id="interrupt" class="interrupt" onclick="interruptMotion()" title="Cancel motion and keep the session open">INTERRUPT</button>
       <button id="stop" class="estop" onclick="stopSession()" title="Stop motion and shut down the app">STOP</button>
     </div>
+    <form class="limit-editor" id="pull-out-distance-form" novalidate>
+      <label for="pull-out-distance">Pull Out clearance (mm)</label>
+      <input id="pull-out-distance" type="number" min="0" step="any" required disabled
+        title="Distance from the captured RCM to the final scope tip on the withdrawal side">
+      <button type="submit" disabled>APPLY</button>
+    </form>
     <button id="confirm-pull-out" onclick="confirmPullOut()" hidden>Confirm straight and retract</button>
   </div>
 
@@ -186,7 +209,7 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
       <div class="actions control-settings">
         <form class="limit-editor" id="arm-limit-form" novalidate>
           <label for="arm-limit">Tip limit (°)</label>
-          <input id="arm-limit" type="number" min="1" step="1" required disabled>
+          <input id="arm-limit" type="number" min="10" step="1" required disabled>
           <button type="submit" disabled>APPLY</button>
         </form>
         <button id="arm-reset" onclick="post('/api/cmd/reset')" aria-label="Reset arm">RESET</button>
@@ -217,7 +240,7 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
       <div class="actions control-settings">
         <form class="limit-editor" id="flex-limit-form" novalidate>
           <label for="flex-limit">Bend limit (°)</label>
-          <input id="flex-limit" type="number" min="1" step="1" required disabled>
+          <input id="flex-limit" type="number" min="30" step="1" required disabled>
           <button type="submit" disabled>APPLY</button>
         </form>
         <div class="actions" id="flex-calibration" hidden>
@@ -276,6 +299,7 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
           <div class="plot-ring"></div><div class="plot-tip" hidden></div>
         </div>
         <div class="status plot-reading">Tilt —</div>
+        <div class="status" id="rcm-insertion">Insertion —</div>
       </figure>
       <figure class="motion-plot" id="flex-plot" data-available="false">
         <figcaption>FlexEndo</figcaption>
@@ -422,7 +446,7 @@ async function calibrateFlex() {
   }
 }
 function confirmPullOut() {
-  if (window.confirm('Is the scope physically straight and the withdrawal path clear? The UR5 will move.')) {
+  if (window.confirm('Is the scope physically straight and the withdrawal path clear? The UR5 will retract.')) {
     post('/api/flex/confirm_pull_out');
   }
 }
@@ -446,6 +470,8 @@ async function pollState() {
     renderStatusBar({});
     syncLimitEditor('arm', null, null, false);
     syncLimitEditor('flex', null, null, false);
+    syncPullOutDistance(null, false);
+    pullOutButton.disabled = true;
     if (!stopping) reportStatus('state-feed', 'APP', 'Control state unavailable.', 'error');
   }
   setTimeout(pollState, 200);
@@ -462,7 +488,7 @@ function syncLimitEditor(kind, current, maximum, editable, canApply = editable) 
 
 function limitFromInput(field) {
   if (!field.validity.valid || !Number.isInteger(field.valueAsNumber)) {
-    writeOutput('CMD', `Enter a whole angle from 1° to ${field.max}°.`, 'error');
+    writeOutput('CMD', `Enter a whole angle from ${field.min}° to ${field.max}°.`, 'error');
     return null;
   }
   return field.valueAsNumber;
@@ -484,6 +510,48 @@ for (const kind of ['arm', 'flex']) {
     }
   });
 }
+
+const pullOutButton = document.getElementById('pull-out');
+const pullOutDistance = document.getElementById('pull-out-distance');
+const pullOutForm = document.getElementById('pull-out-distance-form');
+let applyingPullOutDistance = false;
+
+function syncPullOutDistance(clearanceM, editable) {
+  if (!pullOutDistance.dataset.dirty) {
+    const millimetres = Number.isFinite(clearanceM) ? clearanceM * 1000 : null;
+    pullOutDistance.value = Number.isFinite(millimetres) ? Number(millimetres.toPrecision(15)) : '';
+  }
+  pullOutDistance.disabled = !editable || applyingPullOutDistance;
+  pullOutForm.querySelector('button').disabled = pullOutDistance.disabled;
+}
+
+pullOutDistance.addEventListener('input', () => {
+  pullOutDistance.dataset.dirty = 'true';
+  pullOutButton.disabled = true;
+});
+pullOutForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (pullOutDistance.disabled || applyingPullOutDistance || stopping || interrupting) return;
+  const clearance_mm = pullOutDistance.valueAsNumber;
+  if (!pullOutDistance.validity.valid || !Number.isFinite(clearance_mm)) {
+    writeOutput('CMD', 'Enter a finite nonnegative Pull Out clearance in millimetres.', 'error');
+    return;
+  }
+  applyingPullOutDistance = true;
+  pullOutButton.disabled = true;
+  pullOutDistance.disabled = true;
+  pullOutForm.querySelector('button').disabled = true;
+  if (await post('/api/limits/pull_out', {clearance_mm})) {
+    delete pullOutDistance.dataset.dirty;
+    writeOutput('ARM', `Pull Out clearance set to ${clearance_mm} mm.`, 'success');
+  }
+  applyingPullOutDistance = false;
+});
+pullOutButton.addEventListener('click', () => {
+  if (!pullOutButton.disabled && !stopping && !interrupting) {
+    post('/api/cmd/pull_out', {clearance_mm: pullOutDistance.valueAsNumber});
+  }
+});
 
 function formatReading(value, unit, decimals = 2) {
   return Number.isFinite(value) ? `${value.toFixed(decimals)}${unit}` : null;
@@ -547,6 +615,10 @@ function renderMeasurements(s = {}) {
 
   const rcm = s.arm_mode === 'rcm' ? s.rcm_tip_angles : null;
   renderMotionPlot('rcm-plot', rcm ? [rcm[0], -rcm[1]] : null, s.rcm_cone_deg, 'Tilt');
+  const insertion = s.arm_mode === 'rcm' && Number.isFinite(s.rcm_insertion_m) ?
+    Math.round(s.rcm_insertion_m * 10000) / 10 : null;
+  const insertionText = formatReading(insertion, ' mm', 1) ?? '—';
+  document.getElementById('rcm-insertion').textContent = `Insertion ${insertion > 0 ? '+' : ''}${insertionText}`;
 
   const flex = s.flex_hardware;
   const roll = flex ? flex.roll : s.flex_base_yaw;
@@ -599,6 +671,7 @@ function renderStatusBar(s) {
   const flexStill = !flex || (flex.connected && !flexFault && flex.moving === false);
   if (sessionStopped) setStatusChip('motion-status', 'Stopped', 'ok');
   else if (stopping || s.stopping || interrupting || s.interrupting) setStatusChip('motion-status', 'Stopping', 'active');
+  else if (flex?.tracking || s.tracking) setStatusChip('motion-status', 'Tracking', 'tracking');
   else if (s.arm_moving === true || flex?.moving === true) setStatusChip('motion-status', 'Moving', 'active');
   else if ((s.arm_enabled || flex) && armStill && flexStill) setStatusChip('motion-status', 'Standstill', 'ok');
   else setStatusChip('motion-status', 'Unavailable');
@@ -627,18 +700,20 @@ function renderState(s) {
   reportStatus('arm-mode', 'ARM', armReady ? `Arm mode ${s.arm_mode.toUpperCase()}.` : '');
   tracking.setAttribute('aria-pressed', String(Boolean(flex?.tracking)));
   tracking.disabled = !flex || (!flex.tracking && (!flexReady ||
-    flex.busy || !rcmReady || selectedCategory === null));
+    !flex.tracking_horizon_supported || flex.busy || !rcmReady || selectedCategory === null));
   reportStatus('tracking', 'TRACKING', flex?.tracking_state);
   const birdEye = document.querySelector('[onclick*="/api/cmd/bird_eye"]');
   birdEye.disabled = hardware && (!flexReady || !armReady || flex.busy || flex.tracking);
-  document.querySelector('[onclick*="/api/cmd/pull_out"]').disabled =
-    hardware && (!flexReady || !flex.pull_out_enabled || !rcmReady ||
-    flex.busy || flex.tracking);
+  syncPullOutDistance(s.arm_enabled ? s.pull_out_clearance_m : null,
+    s.arm_enabled && limitEditable && !s.pull_out_active);
+  pullOutButton.disabled = !limitEditable || !rcmReady || s.arm_moving !== false || s.pull_out_active ||
+    !Number.isFinite(pullOutDistance.valueAsNumber) || Boolean(pullOutDistance.dataset.dirty) ||
+    applyingPullOutDistance || (hardware && (!flexReady || flex.busy || flex.tracking));
   const confirmPullOutButton = document.getElementById('confirm-pull-out');
   confirmPullOutButton.hidden = !flex?.pull_out_confirm;
   confirmPullOutButton.disabled = !flexReady || !rcmReady;
-  reportStatus('pull-out-setup', 'ARM', hardware && !flex.pull_out_enabled ?
-    'Pull Out requires a bench-verified clearance at startup.' : '');
+  reportStatus('pull-out-setup', 'ARM', s.arm_enabled && s.pull_out_clearance_m == null ?
+    'Enter the bench-verified Pull Out clearance in the control panel and click APPLY.' : '');
 
   if (flex) {
     const ready = flex.connected && !flex.fault;
@@ -646,7 +721,7 @@ function renderState(s) {
     calibrate.disabled = !ready || flex.busy || flex.tracking || flex.setup_encoder_mismatch;
     calibrate.dataset.planned = String(flex.planned_feedback);
     const editable = limitEditable && !calibrate.disabled && flex.bend_limit_supported;
-    syncLimitEditor('flex', flex.bend_limit || flex.bend_limit_max, flex.bend_limit_max,
+    syncLimitEditor('flex', flex.bend_limit || flex.bend_limit_default, flex.bend_limit_max,
       editable, editable && flex.bend_limit > 0);
     const recheck = document.getElementById('flex-recheck');
     recheck.hidden = !flex.startup_recheck && !flex.recheck_pending;
@@ -667,6 +742,8 @@ function renderState(s) {
       'Straighten and align Flex before calibrating. CALIBRATE also saves the bend limit.' : '');
     reportStatus('flex-capability', 'FLEX', ready && (!flex.bend_limit_supported || !flex.roll_jog_supported) ?
       'Rebuild and restart the Flex driver for adjustable bend limits and roll jogging.' : '');
+    reportStatus('tracking-capability', 'TRACKING', ready && !flex.tracking_horizon_supported ?
+      'Rebuild and restart the Flex driver for horizon-constrained tracking and the expanded bend range.' : '');
     reportStatus('flex-message', 'FLEX', flex.message);
   } else {
     syncLimitEditor('flex', s.flex_model_bend_limit, s.flex_model_bend_max_deg, Boolean(s.arm_enabled && limitEditable));
@@ -975,12 +1052,15 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == '/api/limits/arm':
             if self.server.relay is None:
                 raise ValueError('The arm is disabled for this session.')
-            maximum = round(math.degrees(node.RCM_CONE_HALF_ANGLE))
-            return node.set_rcm_cone_limit(angle_limit(body, maximum, 'RCM tip limit'))
+            return node.set_rcm_cone_limit(angle_limit(body, MIN_RCM_CONE_DEG, MAX_RCM_CONE_DEG, 'RCM tip limit'))
         if self.path == '/api/limits/flex':
             maximum = MAX_FLEX_BEND_DEG if flex else round(math.degrees(FLEX_MAX_BEND))
-            degrees = angle_limit(body, maximum, 'Flex bend limit')
+            degrees = angle_limit(body, MIN_FLEX_BEND_DEG, maximum, 'Flex bend limit')
             return flex.set_bend_limit(degrees) if flex else node.set_model_bend_limit(degrees)
+        if self.path == '/api/limits/pull_out':
+            if self.server.relay is None:
+                raise ValueError('Pull Out requires an enabled arm.')
+            return node.set_pull_out_clearance(parse_pull_out_clearance(body))
         if flex is not None and (
                 self.path in ('/api/cmd/bird_eye', '/api/cmd/pull_out', '/api/flex/calibrate',
                               '/api/flex/return_zero', '/api/flex/confirm_pull_out')
@@ -994,7 +1074,8 @@ class _Handler(BaseHTTPRequestHandler):
             if node.flex is None:
                 raise ValueError("The Flex hardware interface is disabled.")
             if self.path == '/api/flex/calibrate':
-                degrees = angle_limit(body, MAX_FLEX_BEND_DEG, 'Flex bend limit') if 'degrees' in body else None
+                degrees = (angle_limit(body, MIN_FLEX_BEND_DEG, MAX_FLEX_BEND_DEG, 'Flex bend limit')
+                           if 'degrees' in body else None)
                 return node.flex.calibrate(degrees)
             if self.path == '/api/flex/return_zero':
                 return node.flex.return_to_zero()
@@ -1022,11 +1103,17 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(held, list) or not all(isinstance(key, str) for key in held):
                 raise ValueError("Expected a list of held keys")
             return node.refresh_keys(held)
+        if self.path == '/api/cmd/pull_out':
+            if 'clearance_mm' in body:
+                expected = parse_pull_out_clearance(body)
+                clearance = node.pull_out_clearance_m
+                if clearance is None or not math.isclose(clearance, expected, abs_tol=1e-12):
+                    raise ValueError('Pull Out clearance changed. Review the current setting and try again.')
+            return node.cmd_pull_out()
         commands = {
             '/api/mode/arm': node.toggle_arm_mode,
             '/api/cmd/reset': node.cmd_reset,
             '/api/cmd/bird_eye': node.cmd_bird_eye_view,
-            '/api/cmd/pull_out': node.cmd_pull_out,
         }
         return commands[self.path]()
 
@@ -1052,6 +1139,8 @@ def main():
                     choices=JOG_SPEED_SCALES,
                     help='Manual arm speed multiplier')
     ap.add_argument('--camera-index', type=int, default=CAMERA_INDEX, help='DirectShow camera index')
+    ap.add_argument('--camera-roll-offset-deg', type=float, default=0.0,
+                    help='Measured optical roll relative to the modeled Flex camera, about its forward axis')
     ap.add_argument('--model', type=Path, default=MODEL_PATH, help='Path to YOLO weights')
     run_mode = ap.add_mutually_exclusive_group()
     run_mode.add_argument('--camera-only', action='store_true', help='Passive camera preview')
@@ -1060,6 +1149,8 @@ def main():
     ap.add_argument('--pull-out-clearance-m', type=float,
                     help='Bench-verified distance behind the RCM along the physical camera axis')
     args = ap.parse_args()
+    if not -180.0 <= args.camera_roll_offset_deg <= 180.0:
+        ap.error('--camera-roll-offset-deg must be between -180 and 180')
     if args.pull_out_clearance_m is not None and (
             not math.isfinite(args.pull_out_clearance_m) or args.pull_out_clearance_m < 0):
         ap.error('--pull-out-clearance-m must be finite and nonnegative')
@@ -1076,7 +1167,8 @@ def main():
                 relay_port = relay_server.getsockname()[1]
             srv.camera = resources.enter_context(CameraFeed(args.camera_index, args.model))
             flex = (None if args.camera_only or args.arm_only else
-                    FlexControl(FlexClient(), srv.camera, args.pull_out_clearance_m))
+                    FlexControl(FlexClient(), srv.camera, args.pull_out_clearance_m,
+                                camera_roll_offset_deg=args.camera_roll_offset_deg))
             srv.node = ControlNode(
                 relay_host=TCP_HOST,
                 relay_port=relay_port,

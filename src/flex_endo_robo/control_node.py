@@ -13,10 +13,10 @@ import numpy as np
 
 if __package__:
     from .kinematics import EndoscopeKinematics
-    from .flex_endo.flex_control import FLEX_KEYS
+    from .flex_endo.flex_control import FLEX_KEYS, PULL_OUT_RETRACT_SPEED_M_S
 else:
     from kinematics import EndoscopeKinematics
-    from flex_endo.flex_control import FLEX_KEYS
+    from flex_endo.flex_control import FLEX_KEYS, PULL_OUT_RETRACT_SPEED_M_S
 
 # ---------- copy of flex constants ----------
 FLEX_N          = 8
@@ -24,6 +24,8 @@ FLEX_SEG_LEN    = 0.008
 FLEX_ARC_MIN    = 0.030
 FLEX_ARC_MAX    = 0.050
 FLEX_MAX_BEND   = math.pi / 2.0
+MIN_RCM_CONE_DEG = 10
+MAX_RCM_CONE_DEG = 30
 FLEX_TENDON_R   = 0.004
 FLEX_TENDONS    = [(0,'R'), (90,'G'), (180,'B'), (270,'Y')]
 FLEX_STRAIGHT_KAPPA_TOL = 1e-3
@@ -60,7 +62,7 @@ class ControlNode:
     FLEX_YAW_VEL        = 1.0
     FLEX_CURV_VEL       = 10.0
     FLEX_ARC_VEL        = 0.020
-    RCM_CONE_HALF_ANGLE = math.radians(10.0)
+    RCM_CONE_HALF_ANGLE = math.radians(MIN_RCM_CONE_DEG)
     TELEOP_RESYNC_RAD   = 0.05
 
     # ★ 位置伺服单 tick 的最大关节速度限制（rad/s）；防止 IK 偶发跳变
@@ -126,6 +128,7 @@ class ControlNode:
         self.flex_max_bend = FLEX_MAX_BEND
 
         self._pull_out_state  = None
+        self._modeled_pull_out_clearance = PULL_OUT_BEHIND_RCM_M
         self._flex_slew_target = None
         self._model_horizon_paused = False
 
@@ -685,6 +688,23 @@ class ControlNode:
         log.info(f"BIRD-EYE {math.degrees(theta_t):.1f} deg")
         return True
 
+    @property
+    def pull_out_clearance_m(self):
+        return self._modeled_pull_out_clearance if self.flex is None else self.flex.pull_out_clearance
+
+    @property
+    def pull_out_active(self):
+        return self._pull_out_state is not None or (self.flex is not None and self.flex.procedure is not None)
+
+    def set_pull_out_clearance(self, clearance_m):
+        if self.pull_out_active:
+            raise ValueError("Wait for Pull Out to finish before adjusting the clearance.")
+        if self.flex is None:
+            self._modeled_pull_out_clearance = clearance_m
+        else:
+            self.flex.pull_out_clearance = clearance_m
+        return True
+
     def cmd_pull_out(self):
         if self.flex is not None:
             return self.flex.pull_out(self)
@@ -713,6 +733,7 @@ class ControlNode:
             self._pull_out_state = {
                 'stage':'align','axis_cmd': axis_cur.copy(),
                 'd_tip_align': d_tip,'tip_from_end': tip_from_end,
+                'end': self.pull_out_clearance_m,
                 's_end_cmd': None,'waiting_logged': False}
         self._update_flex_state()
         log.info("PULL OUT started (align stage)")
@@ -773,20 +794,20 @@ class ControlNode:
 
         if st['stage'] == 'retract':
             s_end_cur = float(np.dot(p_end_cur - rcm_pt, ref_axis))
+            if s_end_cur >= st['end'] - 0.003:
+                with self._lock:
+                    self._pull_out_state = None; self._flex_slew_target = None
+                log.info(f"PULL OUT complete ({s_end_cur*100:.1f} cm behind RCM)")
+                return
             if st['s_end_cmd'] is None: st['s_end_cmd'] = s_end_cur
-            step_m = self.ARM_AXIS_VEL*self.dt
-            s_end_next = (PULL_OUT_BEHIND_RCM_M if st['s_end_cmd']+step_m >= PULL_OUT_BEHIND_RCM_M
-                          else st['s_end_cmd']+step_m)
+            step_m = PULL_OUT_RETRACT_SPEED_M_S * self.dt
+            s_end_next = min(st['end'], st['s_end_cmd'] + step_m)
             st['s_end_cmd'] = s_end_next
             p_tip_t = rcm_pt + (st['tip_from_end'] + s_end_next)*ref_axis
             q_t = self.kin.ik_along_axis(p_tip_t, ref_axis, q_now)
             if q_t is not None:
                 q_t = self._auto_solve_wrist1(q_t)
                 self._send_servo(q_t, q_now, self.dt, validate=self._rcm_pose_is_valid)
-            if s_end_next >= PULL_OUT_BEHIND_RCM_M - 1e-4 and s_end_cur >= PULL_OUT_BEHIND_RCM_M - 0.003:
-                with self._lock:
-                    self._pull_out_state = None; self._flex_slew_target = None
-                log.info(f"PULL OUT complete ({s_end_cur*100:.1f} cm behind RCM)")
 
     def _cancel_motion(self):
         if self.flex is not None:
@@ -1109,9 +1130,7 @@ class ControlNode:
                 self._key_updated[key] = now
 
     # ---------- state snapshot ----------
-    def _rcm_tip_angles(self, q):
-        _, _, tip = self.kin.tube_axis_in_base(q)
-        offset = tip - self.rcm_world_point
+    def _rcm_tip_angles(self, offset):
         if np.linalg.norm(offset) < 1e-6:
             return None
         ref = self.rcm_ref_axis
@@ -1131,6 +1150,13 @@ class ControlNode:
         with self._lock:
             fresh = self._joint_state_fresh()
             q = self.joint_positions.copy() if fresh else None
+            rcm_tip_angles = rcm_insertion_m = None
+            if q is not None and self.kin.ready and self.arm_mode == 'rcm' and self.rcm_enabled:
+                axis, _, tip = self.kin.tube_axis_in_base(q)
+                offset = tip - self.rcm_world_point
+                rcm_tip_angles = self._rcm_tip_angles(offset)
+                # FWD inserts along the negative shaft axis. A pure tilt leaves this axial depth unchanged.
+                rcm_insertion_m = self.rcm_ref_depth - float(np.dot(offset, axis))
             eff = max(1e-6, self.flex_arc_len - FLEX_SEG_LEN)
             theta_total = min(self.flex_max_bend, eff*max(0., self.flex_curvature))
             state = {
@@ -1138,9 +1164,11 @@ class ControlNode:
                 'rcm_enabled': self.rcm_enabled,
                 'rcm_point': None if self.rcm_world_point is None else self.rcm_world_point.tolist(),
                 'rcm_cone_deg': round(math.degrees(self.rcm_cone_half_angle)),
-                'rcm_cone_max_deg': round(math.degrees(self.RCM_CONE_HALF_ANGLE)),
-                'rcm_tip_angles': (self._rcm_tip_angles(q) if q is not None and self.kin.ready
-                                   and self.arm_mode == 'rcm' and self.rcm_enabled else None),
+                'rcm_cone_max_deg': MAX_RCM_CONE_DEG,
+                'rcm_tip_angles': rcm_tip_angles,
+                'rcm_insertion_m': rcm_insertion_m,
+                'pull_out_clearance_m': self.pull_out_clearance_m,
+                'pull_out_active': self.pull_out_active,
                 'joints_deg': (np.rad2deg(q).tolist() if q is not None else None),
                 'flex_base_yaw': math.degrees(self.flex_base_yaw),
                 'flex_arc_len':  self.flex_arc_len,
