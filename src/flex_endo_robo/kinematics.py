@@ -95,6 +95,34 @@ def _wrap_pi(angle_rad: float) -> float:
     return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def rcm_tangent_basis(reference):
+    right = np.cross(reference, [0., 0., 1.])
+    if np.linalg.norm(right) < 1e-6:
+        right = np.cross(reference, [0., 1., 0.])
+    right /= np.linalg.norm(right)
+    return right, np.cross(reference, right)
+
+
+def rcm_tip_angles(axis, reference):
+    right, up = rcm_tangent_basis(reference)
+    tangent = np.array([np.dot(axis, right), np.dot(axis, up)])
+    radius = float(np.linalg.norm(tangent))
+    along = float(np.dot(axis, reference))
+    if radius < 1e-9:
+        return np.array([0., 0. if along >= 0. else 180.])
+    return tangent * (math.degrees(math.atan2(radius, along)) / radius)
+
+
+def rcm_axis_from_angles(angles, reference):
+    radius = float(np.linalg.norm(angles))
+    if radius == 0.:
+        return reference
+    right, up = rcm_tangent_basis(reference)
+    angle = math.radians(radius)
+    direction = (angles[0] * right + angles[1] * up) / radius
+    return math.cos(angle) * reference + math.sin(angle) * direction
+
+
 class EndoscopeKinematics:
     """KDL chain + FK/IK helpers for the UR5 + endoscope + endo_flex."""
 
@@ -150,6 +178,10 @@ class EndoscopeKinematics:
                 raise RuntimeError(f"URDF chain joint order does not match RTDE: {joint_names}")
             self.fk_solver = PyKDL.ChainFkSolverPos_recursive(self.chain)
             self.ik_solver = PyKDL.ChainIkSolverPos_LMA(self.chain)
+            self.jacobian_solver = PyKDL.ChainJntToJacSolver(self.chain)
+            self.tip_reach_bound = float(np.linalg.norm(self.tip_local)) + sum(
+                self.chain.getSegment(i).getFrameToTip().p.Norm()
+                for i in range(self.chain.getNrOfSegments()))
 
             # Optional chain to flex_base_link (same 6 UR5 joints, includes
             # endoscope_to_flex_joint fixed transform from the URDF).
@@ -207,6 +239,40 @@ class EndoscopeKinematics:
                       [f.M[2, 0], f.M[2, 1], f.M[2, 2]]], dtype=float)
         p = np.array([f.p.x(), f.p.y(), f.p.z()], dtype=float)
         return R, p
+
+    def tip_travel_bound(self, start, delta, samples=1):
+        """Bound tip travel in metres per unit progress along a joint segment."""
+        delta = np.asarray(delta, dtype=float)
+        angle_sum = float(np.sum(np.abs(delta)))
+        if not math.isfinite(angle_sum) or angle_sum > 1e6:
+            raise ValueError("Invalid UR5 joint segment")
+        if not angle_sum:
+            return 0.
+        local_tip = PyKDL.Vector(*map(float, self.tip_local))
+        joints = PyKDL.JntArray(6)
+        jacobian = PyKDL.Jacobian(6)
+        linear = 0.
+        for sample in range(samples):
+            joints_at_sample = start + delta * ((sample + 0.5) / samples)
+            for i, value in enumerate(joints_at_sample):
+                joints[i] = float(value)
+            frame = PyKDL.Frame()
+            if (self.fk_solver.JntToCart(joints, frame) < 0 or
+                    self.jacobian_solver.JntToJac(joints, jacobian) < 0):
+                raise RuntimeError("Could not compute UR5 tip velocity")
+            jacobian.changeRefPoint(frame.M * local_tip)
+            rates = np.array([[jacobian[row, col] for col in range(6)] for row in range(3)]) @ delta
+            linear = max(linear, float(np.linalg.norm(rates)))
+        # Bound variation between midpoint samples using the reach and the
+        # summed rotation of the revolute joints along the interpolated path.
+        margin = angle_sum**2 / (2 * samples)
+        return linear + self.tip_reach_bound * margin
+
+    def limit_tip_step(self, start, target, seconds, linear_limit):
+        delta = np.asarray(target) - start
+        travel = self.tip_travel_bound(start, delta)
+        scale = min(1., linear_limit * seconds / max(travel, 1e-12))
+        return start + scale * delta
 
     def flex_base_frame_in_base(self, q):
         """Return (R_3x3, p_3) of flex_base_link (start_cylinder) in base_link frame."""
@@ -350,10 +416,9 @@ class EndoscopeKinematics:
         """
         Incremental world-frame rotation of the rigid shaft about the RCM.
 
-        Same construction as the RCM-mode arrow keys (`_arm_rcm_tilt`):
-        `d_tilt` pitches about the horizontal axis perpendicular to the
-        shaft's horizontal projection (about +z for a vertical shaft), then
-        `d_yaw` rotates about world +z.  The world rotations are
+        For modeled tracking, `d_tilt` pitches about the horizontal axis
+        perpendicular to the shaft's horizontal projection, then
+        `d_yaw` rotates about world +z. The world rotations are
         left-multiplied onto the full endoscope_link orientation.
         """
         R_new = np.array(R_shaft, dtype=float)

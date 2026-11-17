@@ -27,7 +27,7 @@ from flex_endo_robo.control_node import (
     ControlNode,
 )
 from flex_endo_robo.flex_endo.flex_control import MAX_FLEX_BEND_DEG, MIN_FLEX_BEND_DEG, FlexControl
-from flex_endo_robo.flex_endo.flex_ipc import FlexClient
+from flex_endo_robo.flex_endo.flex_ipc import MIN_SPEED_DEG_S, SPEED_PRESETS_DEG_S, FlexClient
 from flex_endo_robo.ur5_rtde_server import TCP_HOST, TCP_PORT, UR5_IP, open_relay, serve_relay
 from scope.camera import CAMERA_INDEX, CameraFeed
 from scope.yolo import CATEGORIES, COLORS, MODEL_PATH
@@ -55,6 +55,17 @@ def parse_pull_out_clearance(body):
         except OverflowError:
             pass
     raise ValueError('Pull Out clearance must be a finite nonnegative distance in millimetres.')
+
+
+def parse_flex_speed_limit(body):
+    speed = body.get('speed')
+    if type(speed) in (int, float):
+        try:
+            if math.isfinite(speed) and speed >= MIN_SPEED_DEG_S:
+                return float(speed)
+        except OverflowError:
+            pass
+    raise ValueError('Enter a finite FlexEndo speed of at least 0.1°/s.')
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -87,11 +98,17 @@ h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
 #pull-out-distance-form{flex-wrap:wrap}
 #pull-out-distance{width:85px}
 .control-settings{margin-top:8px;align-items:center}
+.device-actions{margin-inline-start:auto;justify-content:flex-end}
 .limit-editor{display:flex;align-items:center;gap:5px;min-width:0}
 .limit-editor label{color:var(--dim);font-size:11px}
-.limit-editor input{width:50px;padding:6px 3px 6px 6px;border:1px solid var(--edge);border-radius:5px;
+.limit-editor input,.limit-editor select{padding:6px;border:1px solid var(--edge);border-radius:5px;
   background:var(--bg);color:var(--fg);font:12px ui-monospace,Consolas,monospace}
-.limit-editor input:disabled{opacity:.45}
+.limit-editor input{width:50px;padding-right:3px}
+.limit-editor select{min-width:0}
+.device-limits{flex:1 1 auto}
+.device-limits input{width:45px}
+.device-limits button{margin-inline-start:auto}
+.limit-editor input:disabled,.limit-editor select:disabled{opacity:.45}
 .limit-editor button{padding-inline:6px}
 [hidden]{display:none!important}
 button{background:#33415d;color:#fff;border:1px solid transparent;border-radius:6px;padding:8px 10px;cursor:pointer;font:600 12px system-ui,sans-serif}
@@ -204,15 +221,24 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
     <button id="confirm-pull-out" onclick="confirmPullOut()" hidden>Confirm straight and retract</button>
   </div>
 
-    <div class="card"><h3>Arm state</h3>
+    <div class="card"><h3>UR5</h3>
       <dl class="grid" id="arm-state"></dl>
       <div class="actions control-settings">
-        <form class="limit-editor" id="arm-limit-form" novalidate>
+        <form class="limit-editor device-limits" id="arm-limit-form" novalidate>
           <label for="arm-limit">Tip limit (°)</label>
           <input id="arm-limit" type="number" min="10" step="1" required disabled>
+          <label for="arm-linear-speed">Speed limit</label>
+          <select id="arm-linear-speed" required disabled>
+            <option value="12.5">0.5x</option>
+            <option value="25" selected>1x</option>
+            <option value="50">2x</option>
+            <option value="125">5x</option>
+          </select>
           <button type="submit" disabled>APPLY</button>
         </form>
-        <button id="arm-reset" onclick="post('/api/cmd/reset')" aria-label="Reset arm">RESET</button>
+        <div class="actions device-actions">
+          <button id="arm-reset" onclick="post('/api/cmd/reset')" aria-label="Reset arm">RESET</button>
+        </div>
       </div>
       <h3 class="control-title">Arm controls</h3>
       <div class="command-grid">
@@ -226,7 +252,7 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
       </div>
     </div>
 
-    <div class="card"><h3>Flex state</h3>
+    <div class="card"><h3>FlexEndo</h3>
       <div class="flex-readings">
         <div>
           <p class="reading-label" id="angle-label">Angle</p>
@@ -238,12 +264,19 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
         </div>
       </div>
       <div class="actions control-settings">
-        <form class="limit-editor" id="flex-limit-form" novalidate>
+        <form class="limit-editor device-limits" id="flex-limit-form" novalidate>
           <label for="flex-limit">Bend limit (°)</label>
           <input id="flex-limit" type="number" min="30" step="1" required disabled>
+          <label for="flex-speed">Speed limit</label>
+          <select id="flex-speed" required disabled>
+            <option value="5">0.5x</option>
+            <option value="10" selected>1x</option>
+            <option value="20">2x</option>
+            <option value="50">5x</option>
+          </select>
           <button type="submit" disabled>APPLY</button>
         </form>
-        <div class="actions" id="flex-calibration" hidden>
+        <div class="actions device-actions" id="flex-calibration" hidden>
           <button id="calibrate" onclick="calibrateFlex()">CALIBRATE</button>
           <button id="flex-return-zero" onclick="post('/api/flex/return_zero')" aria-label="Reset Flex to saved zero" disabled>RESET</button>
           <button id="flex-recheck" onclick="post('/api/flex/recheck_startup')" hidden>Recheck Flex inputs</button>
@@ -263,12 +296,34 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
         <button class="direction control-up" data-key="flex_up" aria-label="Bend up">↑</button>
         <button class="direction control-down" data-key="flex_down" aria-label="Bend down">↓</button>
         <button class="direction control-right" data-key="flex_right" aria-label="Bend right">→</button>
-        <button class="control-forward" data-key="flex_roll_plus" aria-label="Jog positive base roll" disabled>roll+</button>
-        <button class="control-backward" data-key="flex_roll_minus" aria-label="Jog negative base roll" disabled>roll-</button>
+        <button class="control-forward" data-key="flex_roll_plus" aria-label="Jog positive Flex roll" disabled>roll+</button>
+        <button class="control-backward" data-key="flex_roll_minus" aria-label="Jog negative Flex roll" disabled>roll-</button>
       </div>
     </div>
 
-</div>
+    <div class="motion-plots">
+      <figure class="motion-plot" id="rcm-plot" data-available="false">
+        <figcaption>UR5 RCM tip</figcaption>
+        <div class="plot-field" aria-hidden="true">
+          <div class="plot-ring"></div><div class="plot-tip" hidden></div>
+        </div>
+        <div class="status plot-reading">Tilt —</div>
+        <div class="status" id="rcm-insertion">Insertion —</div>
+      </figure>
+      <figure class="motion-plot" id="flex-plot" data-available="false">
+        <figcaption>FlexEndo</figcaption>
+        <div class="plot-field" aria-hidden="true">
+          <div class="plot-ring"></div><div class="plot-roll" hidden></div><div class="plot-tip" hidden></div>
+        </div>
+        <div class="status plot-reading">Bend —</div>
+        <div class="status plot-roll-reading roll-label">Roll —</div>
+      </figure>
+    </div>
+    <section class="card console" aria-labelledby="console-heading">
+      <h3 id="console-heading">Console</h3>
+      <div class="console-output" id="console-output" role="log" aria-labelledby="console-heading" tabindex="0"></div>
+    </section>
+  </div>
 </section>
 
 <section class="panel camera-panel" aria-labelledby="camera-heading">
@@ -292,28 +347,6 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
       <button id="tracking" type="button" aria-pressed="false" disabled>Tracking</button>
       <div class="category-options" id="category-options"></div>
     </div>
-    <div class="motion-plots">
-      <figure class="motion-plot" id="rcm-plot" data-available="false">
-        <figcaption>UR5 RCM tip</figcaption>
-        <div class="plot-field" aria-hidden="true">
-          <div class="plot-ring"></div><div class="plot-tip" hidden></div>
-        </div>
-        <div class="status plot-reading">Tilt —</div>
-        <div class="status" id="rcm-insertion">Insertion —</div>
-      </figure>
-      <figure class="motion-plot" id="flex-plot" data-available="false">
-        <figcaption>FlexEndo</figcaption>
-        <div class="plot-field" aria-hidden="true">
-          <div class="plot-ring"></div><div class="plot-roll" hidden></div><div class="plot-tip" hidden></div>
-        </div>
-        <div class="status plot-reading">Bend —</div>
-        <div class="status plot-roll-reading roll-label">Roll —</div>
-      </figure>
-    </div>
-    <section class="card console" aria-labelledby="console-heading">
-      <h3 id="console-heading">Console</h3>
-      <div class="console-output" id="console-output" role="log" aria-labelledby="console-heading" tabindex="0"></div>
-    </section>
   </div>
 </aside>
 </main>
@@ -434,6 +467,7 @@ async function interruptMotion() {
   button.disabled = stopping;
 }
 async function calibrateFlex() {
+  if (applyingLimits.has('flex')) return;
   const field = document.getElementById('flex-limit');
   const degrees = field.disabled ? undefined : limitFromInput(field);
   if (degrees === null) return;
@@ -468,8 +502,8 @@ async function pollState() {
   } catch (e) {
     renderMeasurements();
     renderStatusBar({});
-    syncLimitEditor('arm', null, null, false);
-    syncLimitEditor('flex', null, null, false);
+    syncDeviceLimits('arm', null, null, null, false, false);
+    syncDeviceLimits('flex', null, null, null, false, false);
     syncPullOutDistance(null, false);
     pullOutButton.disabled = true;
     if (!stopping) reportStatus('state-feed', 'APP', 'Control state unavailable.', 'error');
@@ -477,13 +511,20 @@ async function pollState() {
   setTimeout(pollState, 200);
 }
 
-function syncLimitEditor(kind, current, maximum, editable, canApply = editable) {
+const speedFieldIds = {arm: 'arm-linear-speed', flex: 'flex-speed'};
+const applyingLimits = new Set();
+
+function syncDeviceLimits(kind, current, maximum, speed, angleEditable, speedEditable, canApplyAngle = angleEditable) {
   const field = document.getElementById(`${kind}-limit`);
-  const form = document.getElementById(`${kind}-limit-form`);
+  const speedField = document.getElementById(speedFieldIds[kind]);
+  const applying = applyingLimits.has(kind);
   if (Number.isFinite(maximum)) field.max = maximum;
   if (!field.dataset.dirty) field.value = current ?? '';
-  field.disabled = !editable;
-  form.querySelector('button').disabled = !canApply;
+  if (!speedField.dataset.dirty) speedField.value = speed ?? '';
+  field.disabled = !angleEditable || applying;
+  field.dataset.apply = String(canApplyAngle);
+  speedField.disabled = !speedEditable || applying;
+  field.form.querySelector('button').disabled = applying || (!canApplyAngle && !speedEditable);
 }
 
 function limitFromInput(field) {
@@ -496,17 +537,46 @@ function limitFromInput(field) {
 
 for (const kind of ['arm', 'flex']) {
   const field = document.getElementById(`${kind}-limit`);
-  const form = document.getElementById(`${kind}-limit-form`);
+  const speedField = document.getElementById(speedFieldIds[kind]);
+  const form = field.form;
+  const button = form.querySelector('button');
   field.addEventListener('input', () => { field.dataset.dirty = 'true'; });
+  speedField.addEventListener('change', () => { speedField.dataset.dirty = 'true'; });
   form.addEventListener('submit', async event => {
     event.preventDefault();
-    if (form.querySelector('button').disabled || stopping || interrupting) return;
-    const degrees = limitFromInput(field);
-    if (degrees === null) return;
-    if (await post(`/api/limits/${kind}`, {degrees})) {
-      delete field.dataset.dirty;
-      if (kind === 'arm') writeOutput('ARM', `RCM tip limit set to ${degrees}°.`, 'success');
-      else if (field.dataset.modeled === 'true') writeOutput('FLEX', `Modeled bend limit set to ${degrees}°.`, 'success');
+    if (button.disabled || stopping || interrupting) return;
+    const payload = {};
+    if (field.dataset.dirty && !field.disabled && field.dataset.apply === 'true') {
+      const degrees = limitFromInput(field);
+      if (degrees === null) return;
+      payload.degrees = degrees;
+    }
+    if (speedField.dataset.dirty && !speedField.disabled) {
+      if (!speedField.validity.valid) {
+        writeOutput('CMD', 'Choose a speed preset.', 'error');
+        return;
+      }
+      payload.speed = Number(speedField.value);
+    }
+    if (!Object.keys(payload).length) {
+      if (kind === 'flex' && field.dataset.dirty && !field.disabled && field.dataset.apply === 'false') {
+        writeOutput('FLEX', 'Use CALIBRATE to save the first bend limit.');
+      }
+      return;
+    }
+
+    applyingLimits.add(kind);
+    button.disabled = field.disabled = speedField.disabled = true;
+    try {
+      if (await post(`/api/limits/${kind}`, payload)) {
+        if ('degrees' in payload) delete field.dataset.dirty;
+        if ('speed' in payload) delete speedField.dataset.dirty;
+        if (kind === 'arm' || field.dataset.modeled === 'true') {
+          writeOutput(kind === 'arm' ? 'UR5' : 'FLEX', 'Limits applied.', 'success');
+        }
+      }
+    } finally {
+      applyingLimits.delete(kind);
     }
   });
 }
@@ -568,14 +638,14 @@ function placeMarker(marker, x, y) {
   marker.style.top = `${50 - y * 40}%`;
 }
 
-function renderMotionPlot(id, point, limit, label, roll = null) {
+function renderMotionPlot(id, point, limit, label, roll = null, outsideCone = null) {
   const plot = document.getElementById(id);
   const field = plot.querySelector('.plot-field');
   const tip = plot.querySelector('.plot-tip');
   const rollAvailable = Number.isFinite(roll);
   const limited = limit > 0;
   const magnitude = point && Math.hypot(...point);
-  const outside = limited && magnitude > limit + 0.01;
+  const outside = outsideCone ?? (limited && magnitude > limit + 0.01);
   field.dataset.limited = String(limited);
   field.dataset.outside = String(outside);
   plot.dataset.available = String(Boolean(point) || rollAvailable);
@@ -587,7 +657,8 @@ function renderMotionPlot(id, point, limit, label, roll = null) {
   const boundary = limited ? `${Number(limit.toFixed(1))}° limit` :
     limit === 0 ? 'No software limit' : 'Limit —';
   const reading = plot.querySelector('.plot-reading');
-  reading.textContent = `${label} ${formatReading(magnitude, '°', 1) ?? '—'} · ${boundary}`;
+  const detail = outsideCone ? ' · Outside limit. Jog inward.' : '';
+  reading.textContent = `${label} ${formatReading(magnitude, '°', outsideCone ? 2 : 1) ?? '—'} · ${boundary}${detail}`;
   reading.classList.toggle('unavailable', !point && rollAvailable);
   const rollMarker = plot.querySelector('.plot-roll');
   if (rollMarker) {
@@ -614,7 +685,8 @@ function renderMeasurements(s = {}) {
   armMode.setAttribute('aria-pressed', String(s.arm_mode === 'rcm'));
 
   const rcm = s.arm_mode === 'rcm' ? s.rcm_tip_angles : null;
-  renderMotionPlot('rcm-plot', rcm ? [rcm[0], -rcm[1]] : null, s.rcm_cone_deg, 'Tilt');
+  renderMotionPlot('rcm-plot', rcm, s.rcm_cone_deg, 'Tilt',
+    null, s.rcm_outside_cone);
   const insertion = s.arm_mode === 'rcm' && Number.isFinite(s.rcm_insertion_m) ?
     Math.round(s.rcm_insertion_m * 10000) / 10 : null;
   const insertionText = formatReading(insertion, ' mm', 1) ?? '—';
@@ -691,7 +763,8 @@ function renderState(s) {
   const rcmReady = armReady && s.arm_mode === 'rcm' && s.rcm_enabled;
   const limitEditable = !stopping && !interrupting && !s.stopping && !s.interrupting;
   const armLimitReady = armReady && s.arm_moving === false && limitEditable;
-  syncLimitEditor('arm', s.rcm_cone_deg, s.rcm_cone_max_deg, armLimitReady);
+  const armSpeedEditable = armLimitReady && !s.pull_out_active && !s.tracking && !flex?.tracking;
+  syncDeviceLimits('arm', s.rcm_cone_deg, s.rcm_cone_max_deg, s.arm_linear_speed_mm_s, armSpeedEditable, armSpeedEditable);
   document.getElementById('arm-reset').disabled = !armReady || !limitEditable;
   document.getElementById('arm-mode').disabled = (!armReady && s.arm_mode !== 'rcm') || !limitEditable;
   document.getElementById('flex-limit').dataset.modeled = String(!hardware);
@@ -717,12 +790,13 @@ function renderState(s) {
 
   if (flex) {
     const ready = flex.connected && !flex.fault;
+    const flexSpeedEditable = limitEditable && ready && !flex.busy && !flex.tracking;
     const calibrate = document.getElementById('calibrate');
     calibrate.disabled = !ready || flex.busy || flex.tracking || flex.setup_encoder_mismatch;
     calibrate.dataset.planned = String(flex.planned_feedback);
     const editable = limitEditable && !calibrate.disabled && flex.bend_limit_supported;
-    syncLimitEditor('flex', flex.bend_limit || flex.bend_limit_default, flex.bend_limit_max,
-      editable, editable && flex.bend_limit > 0);
+    syncDeviceLimits('flex', flex.bend_limit || flex.bend_limit_default, flex.bend_limit_max,
+      flex.speed_limit_deg_s, editable, flexSpeedEditable, editable && flex.bend_limit > 0);
     const recheck = document.getElementById('flex-recheck');
     recheck.hidden = !flex.startup_recheck && !flex.recheck_pending;
     recheck.disabled = flex.recheck_pending;
@@ -741,12 +815,14 @@ function renderState(s) {
     reportStatus('flex-setup', 'FLEX', ready && !flex.calibrated && !flex.planned_zero && !flex.setup_encoder_mismatch ?
       'Straighten and align Flex before calibrating. CALIBRATE also saves the bend limit.' : '');
     reportStatus('flex-capability', 'FLEX', ready && (!flex.bend_limit_supported || !flex.roll_jog_supported) ?
-      'Rebuild and restart the Flex driver for adjustable bend limits and roll jogging.' : '');
+      'Rebuild and restart the Flex driver for adjustable bend limits and coordinated roll jogging.' : '');
     reportStatus('tracking-capability', 'TRACKING', ready && !flex.tracking_horizon_supported ?
       'Rebuild and restart the Flex driver for horizon-constrained tracking and the expanded bend range.' : '');
     reportStatus('flex-message', 'FLEX', flex.message);
   } else {
-    syncLimitEditor('flex', s.flex_model_bend_limit, s.flex_model_bend_max_deg, Boolean(s.arm_enabled && limitEditable));
+    const editable = Boolean(s.arm_enabled && limitEditable && !s.pull_out_active && !s.tracking);
+    syncDeviceLimits('flex', s.flex_model_bend_limit, s.flex_model_bend_max_deg, s.flex_model_speed_deg_s,
+      editable, editable);
   }
 }
 
@@ -1049,14 +1125,30 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, body):
         node = self.server.node
         flex = node.flex
-        if self.path == '/api/limits/arm':
+        if self.path in ('/api/speed/arm/linear', '/api/limits/arm'):
             if self.server.relay is None:
                 raise ValueError('The arm is disabled for this session.')
-            return node.set_rcm_cone_limit(angle_limit(body, MIN_RCM_CONE_DEG, MAX_RCM_CONE_DEG, 'RCM tip limit'))
+            if self.path == '/api/limits/arm' and 'degrees' in body:
+                degrees = angle_limit(body, MIN_RCM_CONE_DEG, MAX_RCM_CONE_DEG, 'RCM tip limit')
+                if 'speed' in body and body['speed'] is None:
+                    raise ValueError('Choose a UR5 speed preset.')
+                return node.set_rcm_cone_limit(degrees, speed=body.get('speed'), relay=self.server.relay)
+            if (any(node._key_state.values()) or node.pull_out_active or node._track_target
+                    or (flex and flex.tracking)):
+                raise ValueError('Finish the current motion and release the controls before changing speed.')
+            return self.server.relay.set_speed_limit(body.get('speed'))
+        if self.path == '/api/speed/flex':
+            speed = parse_flex_speed_limit(body)
+            return flex.set_speed_limit(speed) if flex else node.set_model_flex_speed(speed)
         if self.path == '/api/limits/flex':
+            speed = parse_flex_speed_limit(body) if 'speed' in body else None
+            if speed is not None and speed not in SPEED_PRESETS_DEG_S:
+                raise ValueError('Choose a FlexEndo speed preset.')
+            if speed is not None and 'degrees' not in body:
+                return flex.set_speed_limit(speed) if flex else node.set_model_flex_speed(speed)
             maximum = MAX_FLEX_BEND_DEG if flex else round(math.degrees(FLEX_MAX_BEND))
             degrees = angle_limit(body, MIN_FLEX_BEND_DEG, maximum, 'Flex bend limit')
-            return flex.set_bend_limit(degrees) if flex else node.set_model_bend_limit(degrees)
+            return flex.set_bend_limit(degrees, speed=speed) if flex else node.set_model_bend_limit(degrees, speed=speed)
         if self.path == '/api/limits/pull_out':
             if self.server.relay is None:
                 raise ValueError('Pull Out requires an enabled arm.')
@@ -1137,7 +1229,7 @@ def main():
     ap.add_argument('--standoff', type=float, default=0.105)
     ap.add_argument('--jog-speed-scale', type=float, default=DEFAULT_JOG_SPEED_SCALE,
                     choices=JOG_SPEED_SCALES,
-                    help='Manual arm speed multiplier')
+                    help='Manual arm speed factor relative to the speed limits (10 uses the full limit)')
     ap.add_argument('--camera-index', type=int, default=CAMERA_INDEX, help='DirectShow camera index')
     ap.add_argument('--camera-roll-offset-deg', type=float, default=0.0,
                     help='Measured optical roll relative to the modeled Flex camera, about its forward axis')
@@ -1163,7 +1255,9 @@ def main():
             srv.relay = None
             relay_port = args.relay_port
             if not (args.camera_only or args.flex_only):
-                relay_server, srv.relay = resources.enter_context(open_relay(args.robot_ip, TCP_HOST, relay_port))
+                relay_server, srv.relay = resources.enter_context(open_relay(
+                    args.robot_ip, TCP_HOST, relay_port, urdf_path=args.urdf,
+                    rcm_point_local=args.rcm_local, tip_local=args.tip_local))
                 relay_port = relay_server.getsockname()[1]
             srv.camera = resources.enter_context(CameraFeed(args.camera_index, args.model))
             flex = (None if args.camera_only or args.arm_only else

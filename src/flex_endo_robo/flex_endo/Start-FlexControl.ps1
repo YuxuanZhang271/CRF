@@ -136,7 +136,7 @@ try {
         throw "The Web UI exited with code $LASTEXITCODE."
     }
 } finally {
-    # The driver stops on heartbeat expiry and exits even after an app failure.
+    # Heartbeat expiry stops motion. Closing the app ends the managed driver session.
     [void]$driver.WaitForExit(21000)
     $driver.Dispose()
 }

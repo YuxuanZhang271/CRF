@@ -22,15 +22,13 @@ constexpr double BendPulsesPerDegree = 68000.0 * 4.0 * Pi / 180.0;
 constexpr double RollPulsesPerDegree = 123000.0 * (100.0 / 40.0) / 360.0;
 constexpr double MinBendLimit = 30.0, DefaultBendLimit = 60.0, MaxBendLimit = 90.0;
 constexpr double RollLimit = 180.0;
-constexpr double SetupRollLimit = 20.0;
+constexpr double DefaultSpeedLimit = 10.0, MinSpeedLimit = 0.1; // degrees/s
 constexpr DWORD PollIntervalMs = 10;
 constexpr double MinPositionDurationMs = 20.0;
 constexpr double PositionBendStep = 0.18, PositionRollStep = 0.60;
-constexpr double JogSpeedMultiplier = 1.5;
 constexpr double TrackSpeedMultiplier = 3.0;
 constexpr double HorizonRollStep = 0.80;
-// Keep these increments in sync with FlexControl's jog and tracking commands.
-constexpr double JogBendStep = 0.24 * JogSpeedMultiplier, JogRollStep = HorizonRollStep * JogSpeedMultiplier;
+// Keep these increments in sync with FlexControl's tracking commands.
 constexpr double TrackBendStep = 0.32 * TrackSpeedMultiplier, TrackRollStep = 1.0 * TrackSpeedMultiplier;
 constexpr double PositionTolerance = 0.15;
 constexpr DWORD ConfigSettleMs = 100;
@@ -40,10 +38,15 @@ constexpr uint64_t SetupReportSettleMs = 100;
 constexpr double EncoderTolerancePulses = 25.0;
 constexpr double BendPositionSpeed = 40.0, RollPositionSpeed = 15.0; // pulses/ms
 constexpr double HorizonSpeedScale = 1.25;
-constexpr double JogSpeedScale = HorizonSpeedScale * JogSpeedMultiplier;
 constexpr double TrackSpeedScale = HorizonSpeedScale * TrackSpeedMultiplier;
-// Preserve the stopping look-ahead time for held velocity jogs.
-constexpr double SetupBendStopMargin = 0.5 * JogSpeedMultiplier;
+// Raise the jog and return-to-zero profiles together. Keep the manual
+// segment time and rates in sync with FlexControl.
+constexpr double JogSpeedScale = 1.5 * TrackSpeedScale;
+constexpr double JogSegmentSeconds = 0.20;
+constexpr double JogBendRate = 1000.0 * BendPositionSpeed * JogSpeedScale / BendPulsesPerDegree;
+constexpr double JogRollRate = 1000.0 * RollPositionSpeed * JogSpeedScale / RollPulsesPerDegree;
+constexpr double StraightRollBendTolerance = 0.05;
+constexpr double RollChordTolerance = 0.10; // degrees of bend
 constexpr long MotionMask = 0x1f, DriveEnabled = 0x200, ProfileMoving = 0x400;
 // Axis status bits for drive alarm, following error, limits, and I/O stops.
 constexpr long AxisFaultBits = 0x1f2;
@@ -58,6 +61,13 @@ BOOL WINAPI consoleEvent(DWORD event) {
 
 std::wstring objectName(const wchar_t* suffix) {
     return std::wstring(Prefix) + suffix;
+}
+
+bool applicationRunning() {
+    const HANDLE application = OpenMutexW(SYNCHRONIZE, FALSE, ApplicationMutex);
+    if (!application) return GetLastError() != ERROR_FILE_NOT_FOUND;
+    CloseHandle(application);
+    return true;
 }
 
 template<class T> class Mapping {
@@ -80,12 +90,13 @@ public:
         return view_ && write(blank);
     }
 
-    bool read(T& value) { return copy(value, false); }
+    bool read(T& value, bool* busy = nullptr) { return copy(value, false, busy); }
     bool write(T value) { return copy(value, true); }
 
 private:
-    bool copy(T& value, bool writing) {
+    bool copy(T& value, bool writing, bool* busy = nullptr) {
         const DWORD result = WaitForSingleObject(mutex_, 2);
+        if (busy) *busy = result == WAIT_TIMEOUT;
         if (result != WAIT_OBJECT_0) {
             if (result == WAIT_ABANDONED) {
                 *view_ = T{};
@@ -146,8 +157,25 @@ public:
         return valid;
     }
 
-    bool sample() {
-        if (fault_ || simulated_) return !fault_;
+    bool sample(uint64_t now = GetTickCount64()) {
+        if (fault_) return false;
+        if (simulated_) {
+            if (simulatedStepMs_ > 0.0) {
+                const double fraction = std::min(1.0, (now - simulatedStepAt_) / simulatedStepMs_);
+                for (size_t i = 0; i < profile_.size(); ++i) {
+                    profile_[i] = stepProfile_[i] + fraction * (stepTarget_[i] - stepProfile_[i]);
+                }
+                if (fraction == 1.0) simulatedStepMs_ = 0.0;
+            }
+            if (jogActive_) {
+                for (size_t i = 0; i < profile_.size(); ++i) {
+                    profile_[i] += simulatedJogVelocity_[i] * (now - simulatedJogAt_);
+                }
+                simulatedJogAt_ = now;
+            }
+            encoder_ = profile_;
+            return true;
+        }
         const Axes previous = encoder_;
         if (!check(GT_GetEncPos(1, encoder_.data(), 5), "GT_GetEncPos") ||
             !check(GT_GetPrfPos(1, profile_.data(), 5), "GT_GetPrfPos")) return false;
@@ -212,6 +240,7 @@ public:
 
     bool stop() {
         stepMask_ = 0;
+        simulatedStepMs_ = 0.0;
         setupJogMask_ = 0;
         jogActive_ = false;
         if (setupReportMask_ && !setupReportAt_)
@@ -238,6 +267,9 @@ public:
         return simulated_ || (enabled_ == MotionMask && GetTickCount64() >= enableReadyAt_);
     }
 
+    double speedLimit() const { return speedLimit_; }
+    void setSpeedLimit(double limit) { speedLimit_ = limit; }
+
     bool position(Pose next, const Axes& reference, bool planned, double speedScale = 1.0) {
         const Axes target{
             reference[0] - next.x * BendPulsesPerDegree,
@@ -250,7 +282,7 @@ public:
     }
 
     bool returnToZero(const Axes& reference, bool planned) {
-        return positionAxes(reference, !planned, true);
+        return positionAxes(reference, !planned, true, JogSpeedScale);
     }
 
 private:
@@ -260,43 +292,55 @@ private:
 
     bool positionAxes(const Axes& target, bool verifyEncoder, bool exact, double speedScale = 1.0) {
         const Axes& positionFeedback = verifyEncoder ? encoder_ : profile_;
+        Axes command{};
+        double durationMs = MinPositionDurationMs;
+        double maxDistance = 0.0;
+        for (size_t i = 0; i < target.size(); ++i) {
+            const double error = target[i] - positionFeedback[i];
+            const double position = profile_[i] + error;
+            if (position < std::numeric_limits<long>::min() ||
+                position > std::numeric_limits<long>::max()) { fault_ = -111; return false; }
+            command[i] = !exact && std::abs(error) < 1.0 ? profile_[i] :
+                         simulated_ ? position : std::lround(position);
+            const double speed = (i == 4 ? RollPositionSpeed : BendPositionSpeed) * speedScale;
+            const double distance = std::abs(command[i] - profile_[i]);
+            maxDistance = std::max(maxDistance, distance);
+            durationMs = std::max(durationMs, distance / speed);
+        }
+        const double dx = std::max(std::abs(command[0] - profile_[0]), std::abs(command[2] - profile_[2]))
+                          / BendPulsesPerDegree;
+        const double dy = std::max(std::abs(command[1] - profile_[1]), std::abs(command[3] - profile_[3]))
+                          / BendPulsesPerDegree;
+        const double roll = (command[4] - profile_[4]) / RollPulsesPerDegree;
+        durationMs = std::max(durationMs, 1000.0 * std::hypot(dx, dy, roll) / speedLimit_);
         if (simulated_) {
-            if (!verifyEncoder) profile_ = target;
-            else {
-                for (size_t i = 0; i < target.size(); ++i) profile_[i] += target[i] - encoder_[i];
+            if (command != profile_) {
+                stepProfile_ = profile_;
+                stepTarget_ = command;
+                simulatedStepAt_ = GetTickCount64();
+                simulatedStepMs_ = durationMs;
             }
-            encoder_ = profile_;
             return true;
         }
         const double acceleration = 0.5 * std::max(1.0, speedScale / HorizonSpeedScale);
-        if (trapAcceleration_ != acceleration) {
+        if (!trapMode_) {
             for (short axis = 1; axis <= 5; ++axis) {
-                TTrapPrm parameters{acceleration, acceleration, 0.0, 1};
-                if (!check(GT_PrfTrap(axis), "GT_PrfTrap", axis) ||
-                    !check(GT_SetTrapPrm(axis, &parameters), "GT_SetTrapPrm", axis)) return false;
+                if (!check(GT_PrfTrap(axis), "GT_PrfTrap", axis)) return false;
             }
-            trapAcceleration_ = acceleration;
-        }
-        double durationMs = MinPositionDurationMs;
-        for (size_t i = 0; i < target.size(); ++i) {
-            const double speed = (i == 4 ? RollPositionSpeed : BendPositionSpeed) * speedScale;
-            durationMs = std::max(durationMs, std::abs(target[i] - positionFeedback[i]) / speed);
+            trapMode_ = true;
         }
         long mask = 0;
         for (short axis = 1; axis <= 5; ++axis) {
             const size_t i = axis - 1;
-            const double error = target[i] - positionFeedback[i];
-            if (!exact && std::abs(error) < 1.0) continue;
-            // The configured profile and encoder maps use the same pulse scale.
-            const double position = profile_[i] + error;
-            if (position < std::numeric_limits<long>::min() ||
-                position > std::numeric_limits<long>::max()) { fault_ = -111; return false; }
-            const long command = std::lround(position);
-            const double profileDistance = std::abs(command - profile_[i]);
+            const double profileDistance = std::abs(command[i] - profile_[i]);
             if (profileDistance < 0.5) continue;
-            if (!check(GT_SetPos(axis, command), "GT_SetPos", axis) ||
+            // Equal ramp times keep the tendon lengths in step with base roll.
+            const double axisAcceleration = acceleration * profileDistance / maxDistance;
+            TTrapPrm parameters{axisAcceleration, axisAcceleration, 0.0, 1};
+            if (!check(GT_SetTrapPrm(axis, &parameters), "GT_SetTrapPrm", axis) ||
+                !check(GT_SetPos(axis, static_cast<long>(command[i])), "GT_SetPos", axis) ||
                 !check(GT_SetVel(axis, profileDistance / durationMs), "GT_SetVel", axis)) return false;
-            stepTarget_[i] = command;
+            stepTarget_[i] = command[i];
             mask |= 1L << i;
         }
         if (!mask) return true;
@@ -319,18 +363,18 @@ public:
 
     bool setupJog(int x, int y, bool verifyFeedback) {
         if (jogActive_) return true;
-        const double bendSpeed = BendPositionSpeed * JogSpeedScale;
+        const double bendSpeed = std::min(BendPositionSpeed * JogSpeedScale,
+            speedLimit_ * BendPulsesPerDegree / (1000.0 * std::hypot(x, y)));
         const Axes velocity{-x * bendSpeed, -y * bendSpeed, x * bendSpeed, y * bendSpeed,
                             0.0};
         if (simulated_) {
-            for (size_t i = 0; i < velocity.size(); ++i) {
-                profile_[i] += velocity[i] * PollIntervalMs;
-                encoder_[i] = profile_[i];
-            }
+            simulatedJogVelocity_ = velocity;
+            simulatedJogAt_ = GetTickCount64();
+            jogActive_ = true;
             return true;
         }
         if (moving()) return true;
-        trapAcceleration_ = 0.0;
+        trapMode_ = false;
         long mask = 0;
         for (short axis = 1; axis <= 5; ++axis) {
             const size_t i = axis - 1;
@@ -354,7 +398,9 @@ public:
 
     const Axes& encoder() const { return encoder_; }
     const Axes& profile() const { return profile_; }
-    bool moving() const { return moving_ || stepMask_ || setupReportPending(); }
+    bool moving() const {
+        return moving_ || stepMask_ || simulatedStepMs_ > 0.0 || (simulated_ && jogActive_) || setupReportPending();
+    }
     bool setupReportPending() const { return setupReportAt_ != 0; }
     bool setupFeedbackMismatch() const { return setupFeedbackMismatch_; }
     int fault() const { return fault_; }
@@ -439,7 +485,12 @@ private:
     long stepMask_ = 0;
     long setupJogMask_ = 0;
     bool jogActive_ = false;
-    double trapAcceleration_ = 0.0;
+    bool trapMode_ = false;
+    double speedLimit_ = DefaultSpeedLimit;
+    double simulatedStepMs_ = 0.0;
+    uint64_t simulatedStepAt_ = 0;
+    uint64_t simulatedJogAt_ = 0;
+    Axes simulatedJogVelocity_{};
     bool verifyEncoder_ = false, setupFeedbackMismatch_ = false;
     uint64_t stepDeadline_ = 0;
     uint64_t enableReadyAt_ = 0;
@@ -466,7 +517,9 @@ bool finiteAxes(const Command& cmd) {
 }
 
 bool within(Pose p, double bend, double roll) {
-    return std::hypot(p.x, p.y) <= bend + 1e-6 && std::abs(p.roll) <= roll + 1e-6;
+    // A coordinated step can round each axis to the nearest whole pulse.
+    return std::hypot(p.x, p.y) <= bend + 1.0 / BendPulsesPerDegree &&
+           std::abs(p.roll) <= roll + 0.5 / RollPulsesPerDegree;
 }
 
 bool validBendLimit(double degrees) {
@@ -483,6 +536,8 @@ Pose nextJog(Pose current, double x, double y, double rollTarget, double bendSte
     const double scale = std::max(1.0, std::hypot(x, y));
     current.x += x * bendStep / scale;
     current.y += y * bendStep / scale;
+    // Counter-rotate the bend in tendon coordinates to keep its plane fixed
+    // in the shaft frame while the distal frame rolls about its viewing axis.
     Pose next = rotateBend(current, current.roll - rollTarget);
     next.roll = rollTarget;
     return next;
@@ -525,12 +580,13 @@ public:
             std::puts("Flex driver started. Use the Web UI to jog and calibrate. Q exits.");
         while (!InterlockedCompareExchange(&quitting, 0, 0)) {
             if (_kbhit() && (_getch() | 32) == 'q') break;
-            if (!motion_.sample()) {
+            const uint64_t now = GetTickCount64();
+            if (!motion_.sample(now)) {
                 if (!status_.fault) halt();
                 status_.fault = motion_.fault();
             }
             process();
-            publish(GetTickCount64());
+            publish(now);
             Sleep(PollIntervalMs);
         }
         halt();
@@ -543,11 +599,11 @@ private:
     bool usesPlannedFeedback() const { return manualBench_ || plannedFull_; }
     bool positioningReady() const { return calibrated_ || (plannedFull_ && plannedZero_); }
     const Axes& positionFeedback() const { return calibrated_ ? motion_.encoder() : motion_.profile(); }
-    double rollLimit() const { return plannedFull_ ? SetupRollLimit : RollLimit; }
 
     void halt() {
         motion_.stop();
         setupIntent_ = {};
+        manualIntent_ = {};
         if (status_.action != Idle || status_.result == Accepted) status_.result = Canceled;
         status_.action = Idle;
     }
@@ -556,7 +612,8 @@ private:
         status_.stamp = now;
         status_.fault = motion_.fault();
         status_.faultAxisStatus = motion_.faultAxisStatus();
-        status_.flags = RollJogSupported | BendLimitSupported | TrackHorizonSupported | WideBendRange |
+        status_.flags = RollJogSupported | CoupledRollSupported | BendLimitSupported | CombinedLimitsSupported |
+                        TrackHorizonSupported | WideBendRange |
                         (calibrated_ ? Calibrated : 0) |
                         (motion_.moving() ? Moving : 0) | (simulated_ ? Simulated : 0) |
                         (manualBench_ ? ManualBench : 0) |
@@ -572,36 +629,39 @@ private:
         status_.y = current.y;
         status_.roll = current.roll;
         status_.bendLimit = calibrated_ || plannedZero_ ? bendLimit_ : 0.0;
+        status_.speedLimit = motion_.speedLimit();
         for (size_t i = 0; i < 4; ++i) status_.tendon[i] = (values[i] - ref[i]) / 68000.0;
         if (!statusMapping_.write(status_)) halt();
     }
 
     void process() {
         Command cmd{};
-        const bool read = commands_.read(cmd);
+        bool busy = false;
+        const bool read = commands_.read(cmd, &busy);
         const uint64_t now = GetTickCount64();
+        if (busy && fresh(lastCommandAt_, now, CommandTimeoutMs)) return;
         const bool validCommand = read && valid(cmd) && cmd.driver == status_.driver &&
-                                  cmd.app && cmd.sequence && cmd.action <= SetBendLimit &&
+                                  cmd.app && cmd.sequence && cmd.action <= SetSpeedLimit &&
                                   !cmd.reserved && fresh(cmd.stamp, now, CommandTimeoutMs);
-        if (!read || (appLive_ && !validCommand)) {
+        const bool heartbeatLost = !validCommand || !fresh(lastCommandAt_, now, CommandTimeoutMs);
+        const bool wasConnected = status_.app != 0;
+        if (wasConnected && (heartbeatLost || cmd.app != status_.app)) {
             halt();
-            blockedSequence_ = validCommand ? cmd.sequence : status_.sequence;
-            waitForNeutral_ = true;
+            status_.app = 0;
         }
-        if (managedSession_) {
-            if (appLive_ && !validCommand) {
-                InterlockedExchange(&quitting, 1);
-                return;
-            }
-            if (!appLive_ && !validCommand && GetTickCount64() - startedAt_ > 20000) {
-                std::fputs("Flex control session timed out waiting for the Web UI.\n", stderr);
-                InterlockedExchange(&quitting, 1);
-                return;
-            }
+        if (!validCommand && managedSession_ &&
+            (lastCommandAt_ ? !applicationRunning() : now - startedAt_ > 20000)) {
+            std::fputs(lastCommandAt_ ? "Flex managed session ended after the Web UI closed.\n" :
+                       "Flex control session timed out waiting for the Web UI.\n", stderr);
+            InterlockedExchange(&quitting, 1);
+            return;
         }
-        appLive_ = validCommand;
+        if (wasConnected && heartbeatLost)
+            std::fputs("Flex command heartbeat lost. Motion stopped. Waiting for the Web UI.\n", stderr);
+        if (!validCommand) return;
+        lastCommandAt_ = cmd.stamp;
         if (motion_.fault()) {
-            if (validCommand && cmd.action == RecheckStartup && cmd.request &&
+            if (cmd.action == RecheckStartup && cmd.request &&
                 (cmd.app != recheckApp_ || cmd.sequence > status_.sequence) &&
                 motion_.canRecheckStartup()) {
                 recheckApp_ = cmd.app;
@@ -617,18 +677,18 @@ private:
         }
         // Settle the drives when the app connects with neutral intent, before acknowledging
         // the session and exposing jog controls.
-        if (!validCommand) return;
         if (!motion_.ready()) {
             if (cmd.action == Idle) motion_.enable();
             return;
         }
-        if (cmd.app != status_.app) {
-            if (status_.app || status_.action != Idle) halt();
+        if (!status_.app) {
+            if (cmd.action != Idle) return;
             status_.app = cmd.app;
             status_.sequence = cmd.sequence;
             status_.request = 0;
             status_.result = None;
             blockedSequence_ = cmd.sequence;
+            waitForNeutral_ = false;
         }
 
         if (cmd.sequence > status_.sequence && cmd.action == Stop) {
@@ -655,7 +715,7 @@ private:
             if (cmd.request && cmd.request > status_.request) acceptRequest(cmd);
             if (cmd.action == Idle || cmd.action == Jog || cmd.action == RollJog ||
                 cmd.action == Track || cmd.action == Horizon) {
-                if (!positioningReady() || manualBench_) serviceSetupJog(cmd);
+                if (!calibrated_ && !plannedZero_) serviceSetupJog(cmd);
                 else serviceContinuous(cmd);
             }
             if (cmd.action == Position && cmd.request == status_.request && status_.result == Accepted)
@@ -672,9 +732,19 @@ private:
     }
 
     void acceptRequest(const Command& cmd) {
+        if (cmd.action == SetSpeedLimit) {
+            if (status_.action != Idle || motion_.moving() || !std::isfinite(cmd.x) || cmd.x < MinSpeedLimit) {
+                acknowledge(cmd, Refused);
+                return;
+            }
+            motion_.setSpeedLimit(cmd.x);
+            acknowledge(cmd, Done);
+            return;
+        }
         if (cmd.action == SetBendLimit) {
             if ((!calibrated_ && !plannedZero_) || status_.action != Idle || motion_.moving() ||
-                !validBendLimit(cmd.x)) {
+                !validBendLimit(cmd.x) ||
+                (cmd.y != 0.0 && (!std::isfinite(cmd.y) || cmd.y < MinSpeedLimit))) {
                 acknowledge(cmd, Refused);
                 return;
             }
@@ -684,6 +754,7 @@ private:
                 return;
             }
             bendLimit_ = cmd.x;
+            if (cmd.y != 0.0) motion_.setSpeedLimit(cmd.y);
             acknowledge(cmd, Done);
             return;
         }
@@ -694,7 +765,7 @@ private:
             }
             Pose travel = readPose(reference_, travelReference_);
             if (plannedZero_) travel.roll = readPose(reference_, setupReference_).roll;
-            if (!within(travel, MaxBendLimit, plannedZero_ ? SetupRollLimit : RollLimit)) {
+            if (!within(travel, MaxBendLimit, RollLimit)) {
                 acknowledge(cmd, Limit);
                 return;
             }
@@ -733,7 +804,7 @@ private:
                 return;
             }
             positionTarget_ = {cmd.x, cmd.y, cmd.roll};
-            if (!withinTravel(positionTarget_, reference_, rollLimit())) {
+            if (!withinTravel(positionTarget_, reference_)) {
                 acknowledge(cmd, Limit);
                 return;
             }
@@ -754,7 +825,7 @@ private:
             return;
         }
         if (!plannedFull_) {
-            move(nextPosition(current, target), reference_, RollLimit);
+            move(nextPosition(current, target), reference_);
         } else if (positionStarted_) {
             halt();
             acknowledge(cmd, Refused);
@@ -801,8 +872,10 @@ private:
             status_.sequence = cmd.sequence;
             return;
         }
-        if (!positioningReady() || !finiteAxes(cmd) ||
-            ((cmd.action == Horizon || cmd.action == RollJog) && (cmd.x || cmd.y)) ||
+        const bool manualRoll = cmd.action == RollJog;
+        const bool manual = cmd.action == Jog || manualRoll;
+        if ((!positioningReady() && !manual) || !finiteAxes(cmd) ||
+            ((cmd.action == Horizon || manualRoll) && (cmd.x || cmd.y)) ||
             std::max({std::abs(cmd.x), std::abs(cmd.y), std::abs(cmd.roll)}) > 1.0) {
             status_.sequence = cmd.sequence;
             halt();
@@ -834,60 +907,73 @@ private:
             if (status_.action != Idle) halt();
             return;
         }
-        const bool manualRoll = cmd.action == RollJog;
+        const std::array<double, 3> intent = manual
+            ? std::array<double, 3>{cmd.x, cmd.y, manualRoll ? cmd.roll : 0.0}
+            : std::array<double, 3>{};
+        if (intent != manualIntent_) {
+            if ((status_.action != Idle || motion_.moving()) && !motion_.stop()) return;
+            manualIntent_ = intent;
+        }
         status_.action = manualRoll ? Jog : cmd.action;
         status_.result = Accepted;
         if (motion_.moving()) return;
         const Pose current = readPose(positionFeedback(), reference_);
-        const double roll = rollLimit();
         const bool horizon = cmd.action == Horizon;
         const bool tracking = cmd.action == Track;
-        const double bendStep = horizon ? 0.0 : tracking ? TrackBendStep : JogBendStep;
-        const double rollStep = horizon ? HorizonRollStep : tracking ? TrackRollStep : JogRollStep;
+        const double speed = motion_.speedLimit();
+        const double bendStep = horizon || manualRoll ? 0.0 : tracking ? TrackBendStep :
+                                std::min(speed, JogBendRate) * JogSegmentSeconds;
+        double rollStep = horizon ? HorizonRollStep : tracking ? TrackRollStep :
+                          std::min(speed, JogRollRate) * JogSegmentSeconds;
+        if (manualRoll) {
+            const double bend = std::hypot(current.x, current.y);
+            if (bend <= StraightRollBendTolerance && std::abs(cmd.roll) == 1.0) {
+                // A straight scope needs no material tendon compensation.
+                // Target the travel limit so roll can stay at speed while held.
+                rollStep = 2 * RollLimit;
+            } else {
+                const double radius = bend * Pi / 180.0;
+                const double rate = std::min({JogRollRate, speed / std::hypot(1.0, radius),
+                                              JogBendRate / std::max(radius, 1e-9)});
+                const double chordStep = std::sqrt(8.0 * RollChordTolerance / bend) * 180.0 / Pi;
+                rollStep = std::min(rate * JogSegmentSeconds, chordStep);
+            }
+        }
         const double zeroRoll = readPose(reference_, usesPlannedFeedback() ? setupReference_ : travelReference_).roll;
         const double requestedRoll = cmd.roll * rollStep;
         const double rollDelta = std::clamp(requestedRoll,
-            std::min(0.0, std::max(-roll, -roll - zeroRoll) - current.roll),
-            std::max(0.0, std::min(roll, roll - zeroRoll) - current.roll));
-        const double rollTarget = current.roll + rollDelta;
-        if (manualRoll) {
-            const Pose next{current.x, current.y, rollTarget};
-            const double pulses = std::trunc((rollTarget - current.roll) * RollPulsesPerDegree);
-            if (!pulses || !withinTravel(next, reference_, roll)) {
-                halt();
-                status_.result = Limit;
-                blockedSequence_ = cmd.sequence;
-            } else if (!motion_.rollBy(pulses, !usesPlannedFeedback())) {
-                halt();
-            }
-            return;
-        }
-        Pose next = nextJog(current, cmd.x, cmd.y, rollTarget, bendStep);
-        // Visual tracking requires the commanded roll and tendon motion together.
-        if ((tracking && std::abs(rollDelta - requestedRoll) > 1e-6) || !withinTravel(next, reference_, roll)) {
-            if (horizon || tracking) {
-                halt();
-                status_.result = Limit;
-                blockedSequence_ = cmd.sequence;
-                return;
-            }
-            next = nextJog(current, cmd.x, cmd.y, current.roll, bendStep);
-        }
-        if (horizon && next.roll == current.roll) {
+            std::min(0.0, std::max(-RollLimit, -RollLimit - zeroRoll) - current.roll),
+            std::max(0.0, std::min(RollLimit, RollLimit - zeroRoll) - current.roll));
+        const Pose next = manual ? boundedJog(current, cmd.x, cmd.y, rollDelta, bendStep) :
+                          nextJog(current, cmd.x, cmd.y, current.roll + rollDelta, bendStep);
+        const bool noPulse = std::max({std::abs(next.x - current.x) * BendPulsesPerDegree,
+                                       std::abs(next.y - current.y) * BendPulsesPerDegree,
+                                       std::abs(next.roll - current.roll) * RollPulsesPerDegree}) < 1.0;
+        // Tracking requires the commanded roll and tendon motion together.
+        if (noPulse || (tracking && std::abs(rollDelta - requestedRoll) > 1e-6) ||
+            !withinTravel(next, reference_)) {
             halt();
             status_.result = Limit;
             blockedSequence_ = cmd.sequence;
             return;
         }
         const double speedScale = horizon ? HorizonSpeedScale : tracking ? TrackSpeedScale : JogSpeedScale;
-        move(next, reference_, roll, speedScale);
+        move(next, reference_, speedScale);
     }
 
-    static bool canBendJog(Pose current, int x, int y, double limit) {
-        const double bend = std::hypot(current.x, current.y);
-        const double projectedBend = std::hypot(current.x + x * SetupBendStopMargin,
-                                               current.y + y * SetupBendStopMargin);
-        return projectedBend <= limit || projectedBend < bend;
+    Pose boundedJog(Pose current, double x, double y, double rollDelta, double bendStep) const {
+        const auto poseAt = [&](double fraction) {
+            return nextJog(current, x, y, current.roll + fraction * rollDelta, fraction * bendStep);
+        };
+        const Pose target = poseAt(1.0);
+        if (withinTravel(target, reference_)) return target;
+        double lower = 0.0, upper = 1.0;
+        for (int i = 0; i < 20; ++i) {
+            const double mid = (lower + upper) / 2.0;
+            if (withinTravel(poseAt(mid), reference_)) lower = mid;
+            else upper = mid;
+        }
+        return poseAt(lower);
     }
 
     void serviceSetupJog(const Command& cmd) {
@@ -916,13 +1002,6 @@ private:
         }
         const auto [x, y, roll] = intent;
         const Axes& profile = motion_.profile();
-        if ((x || y) && plannedZero_ && (!canBendJog(readPose(profile, reference_), x, y, bendLimit_) ||
-                                        !canBendJog(readPose(profile, travelReference_), x, y, MaxBendLimit))) {
-            halt();
-            status_.result = Limit;
-            blockedSequence_ = cmd.sequence;
-            return;
-        }
         const bool verifyFeedback = !usesPlannedFeedback();
         if (verifyFeedback && !motion_.moving() && !setupFeedbackMatches()) {
             halt();
@@ -938,11 +1017,10 @@ private:
         }
         if (motion_.moving()) return;
         const double current = profile[4];
-        const double travel = std::floor(SetupRollLimit * RollPulsesPerDegree);
+        const double travel = std::floor(RollLimit * RollPulsesPerDegree);
         const double lower = std::min(current, std::ceil(setupReference_[4] - travel));
         const double upper = std::max(current, std::floor(setupReference_[4] + travel));
-        const double target = std::clamp(std::round(current + roll * JogRollStep * RollPulsesPerDegree),
-                                         lower, upper);
+        const double target = roll > 0 ? upper : lower;
         if (std::abs(target - current) < 1.0) {
             halt();
             status_.result = Limit;
@@ -962,27 +1040,27 @@ private:
         return true;
     }
 
-    bool withinTravel(Pose next, const Axes& reference, double roll) const {
-        if (!within(next, bendLimit_, roll)) return false;
+    bool withinTravel(Pose next, const Axes& reference) const {
+        if (!within(next, bendLimit_, RollLimit)) return false;
         if (!calibrated_ && !plannedZero_) return true;
         const Pose zero = readPose(reference, travelReference_);
         const double zeroRoll = usesPlannedFeedback() ? readPose(reference, setupReference_).roll : zero.roll;
-        return within({next.x + zero.x, next.y + zero.y, next.roll + zeroRoll}, MaxBendLimit, roll);
+        return within({next.x + zero.x, next.y + zero.y, next.roll + zeroRoll}, MaxBendLimit, RollLimit);
     }
 
-    void move(Pose next, const Axes& reference, double roll, double speedScale = 1.0) {
-        if (!withinTravel(next, reference, roll)) {
+    void move(Pose next, const Axes& reference, double speedScale = 1.0) {
+        if (!withinTravel(next, reference)) {
             motion_.stop();
             status_.result = Limit;
             status_.action = Idle;
             blockedSequence_ = status_.sequence;
-        } else if (!motion_.position(next, reference, plannedFull_, speedScale)) {
+        } else if (!motion_.position(next, reference, usesPlannedFeedback(), speedScale)) {
             halt();
         }
     }
 
     Motion motion_;
-    bool simulated_, calibrated_ = false, appLive_ = false;
+    bool simulated_, calibrated_ = false;
     bool manualBench_;
     bool plannedFull_;
     bool plannedZero_ = false;
@@ -990,7 +1068,9 @@ private:
     bool positionStarted_ = false;
     bool managedSession_ = false;
     uint64_t startedAt_ = 0;
+    uint64_t lastCommandAt_ = 0;
     std::array<int, 3> setupIntent_{};
+    std::array<double, 3> manualIntent_{};
     bool waitForNeutral_ = false;
     uint64_t blockedSequence_ = 0;
     uint64_t recheckApp_ = 0;

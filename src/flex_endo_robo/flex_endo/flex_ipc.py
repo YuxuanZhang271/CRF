@@ -1,6 +1,7 @@
 """Windows shared memory for the native Flex motor driver."""
 
 import ctypes as ct
+import logging
 import math
 import secrets
 import struct
@@ -8,16 +9,16 @@ import time
 from dataclasses import dataclass
 
 
-PREFIX = r"Local\CRFFlexV3"
+PREFIX = r"Local\CRFFlexV4"
 APPLICATION_MUTEX = r"Local\CRFFlexV1Application"
-MAGIC, VERSION = 0x58454C46, 3
+MAGIC, VERSION = 0x58454C46, 4
 COMMAND = struct.Struct("<4I6Q2I3d")
-STATUS = struct.Struct("<4I5Q4IiI8d")
+STATUS = struct.Struct("<4I5Q4IiI9d")
 VISION = struct.Struct("<4I4Q4I2diI")
-assert (COMMAND.size, STATUS.size, VISION.size) == (96, 144, 88)
+assert (COMMAND.size, STATUS.size, VISION.size) == (96, 152, 88)
 
 (IDLE, STOP, CALIBRATE, HORIZON, JOG, POSITION, TRACK, RETURN_ZERO,
- RECHECK_STARTUP, ROLL_JOG, SET_BEND_LIMIT) = range(11)
+ RECHECK_STARTUP, ROLL_JOG, SET_BEND_LIMIT, SET_SPEED_LIMIT) = range(12)
 CALIBRATED, MOVING, SIMULATED, SETUP_ENCODER_MISMATCH = (1, 4, 8, 32)
 MANUAL_BENCH = 64
 PLANNED_ZERO = 128
@@ -28,9 +29,11 @@ BEND_LIMIT_SUPPORTED = 2048
 TRACK_HORIZON_SUPPORTED = 4096
 WIDE_BEND_RANGE = 8192
 AT_SAVED_ZERO = 16384
+COUPLED_ROLL_SUPPORTED = 32768
+COMBINED_LIMITS_SUPPORTED = 65536
 NO_RESULT, ACCEPTED, DONE, REFUSED, CANCELED, LIMIT = range(6)
 ACTIONS = ("idle", "stop", "calibrate", "horizon", "jog", "position", "track", "return to zero",
-           "recheck startup", "roll jog", "set bend limit")
+           "recheck startup", "roll jog", "set bend limit", "set speed limit")
 RESULTS = ("", "in progress", "complete", "refused", "canceled", "limit reached")
 AXIS_FAULT_BITS = (
     (0x02, "drive alarm"),
@@ -42,6 +45,9 @@ AXIS_FAULT_BITS = (
 )
 FEEDBACK_TIMEOUT_MS = 250
 VISION_TIMEOUT_S = 0.5
+DEFAULT_SPEED_DEG_S = 10.
+SPEED_PRESETS_DEG_S = tuple(DEFAULT_SPEED_DEG_S * factor for factor in (0.5, 1., 2., 5.))
+MIN_SPEED_DEG_S = 0.1
 
 
 def _header(layout):
@@ -65,6 +71,7 @@ class FlexStatus:
     bend_limit: float
     tendons: tuple
     fault_axis_status: int = 0
+    speed_limit: float = DEFAULT_SPEED_DEG_S
 
     @property
     def fault_detail(self):
@@ -115,6 +122,10 @@ class _Windows:
         return function
 
 
+class _MappingBusy(OSError):
+    pass
+
+
 class _Mapping:
     def __init__(self, api, name, size, writable):
         self.api, self.size = api, size
@@ -134,8 +145,10 @@ class _Mapping:
         if acquired == 0x80:  # WAIT_ABANDONED
             self.api.release(self.mutex)
             raise OSError("Flex mapping lock was abandoned")
+        if acquired == 0x102:  # WAIT_TIMEOUT
+            raise _MappingBusy("Flex mapping lock timed out")
         if acquired != 0:
-            raise OSError("Flex mapping lock timed out")
+            raise ct.WinError(ct.get_last_error())
         try:
             if data is None:
                 return ct.string_at(self.view, self.size)
@@ -198,22 +211,29 @@ class FlexClient:
             if not self._maps:
                 for name, layout in (("Command", COMMAND), ("Status", STATUS), ("Vision", VISION)):
                     self._maps[name] = _Mapping(self._api, PREFIX + name, layout.size, name != "Status")
-            fields = STATUS.unpack(self._maps["Status"].copy())
+            try:
+                fields = STATUS.unpack(self._maps["Status"].copy())
+            except _MappingBusy:
+                if self.status and 0 <= self._api.now() - self.status.stamp <= FEEDBACK_TIMEOUT_MS:
+                    return self.status
+                raise
             if fields[:4] != _header(STATUS):
                 raise OSError("Invalid Flex status layout")
             driver, stamp, app, seq, req, action, reserved, flags, result, fault, axis_status, *pose = fields[4:]
             if (not driver or not stamp or not 0 <= self._api.now() - stamp <= FEEDBACK_TIMEOUT_MS
                     or action >= len(ACTIONS) or reserved or result >= len(RESULTS)
-                    or not all(map(math.isfinite, pose)) or pose[3] < 0
+                    or not all(map(math.isfinite, pose)) or pose[3] < 0 or pose[8] < MIN_SPEED_DEG_S
                     or (pose[3] == 0 and flags & (CALIBRATED | PLANNED_ZERO))):
                 raise OSError("Invalid or stale Flex status")
             if self.status is None or driver != self.status.driver or (self.ready and app != self.app):
                 self._vision_frame = 0
                 self.command(IDLE)
             self.status = FlexStatus(driver, stamp, app, seq, req, action, flags, result, fault,
-                                     *pose[:4], tuple(pose[4:]), axis_status)
+                                     *pose[:4], tuple(pose[4:8]), axis_status, pose[8])
             return self.status
-        except OSError:
+        except OSError as error:
+            if self.status is not None:
+                logging.getLogger(__name__).warning("Flex status unavailable: %s", error)
             self._detach()
             return None
 
@@ -243,12 +263,20 @@ class FlexClient:
                                    observation.dx, observation.dy,
                                    observation.category if observation.category is not None else -1,
                                    observation.revision)
-                self._maps["Vision"].copy(data)
-                self._vision_frame = observation.frame
+                try:
+                    self._maps["Vision"].copy(data)
+                except _MappingBusy:
+                    # Retry the observation later and send the command heartbeat now.
+                    pass
+                else:
+                    self._vision_frame = observation.frame
             data = COMMAND.pack(*_header(COMMAND), self.status.driver, self.app, self.sequence,
                                 tick, request, frame, action, 0, x, y, roll)
             self._maps["Command"].copy(data)
             return True
-        except OSError:
+        except _MappingBusy:
+            return False
+        except OSError as error:
+            logging.getLogger(__name__).warning("Flex shared memory unavailable: %s", error)
             self._detach()
             return False
