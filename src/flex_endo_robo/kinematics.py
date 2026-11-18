@@ -18,17 +18,13 @@ Provides:
           2) tube_axis(q) == axis_target
           3) shoulder_lift + elbow + wrist_1 == -270 deg
         eliminating post-IK wrist_1 override drift.
-      * Position-only IK (ik_position_only)
-      * RCM-constrained IK (ik_with_rcm)
-  - Hybrid RCM tracking kinematics (control space, no arm IK):
-      * camera_pose_on_shaft()  (flex-base from shaft geometry + arc FK)
-      * hybrid_rcm_jacobian()   (3x5 central-difference task Jacobian)
-      * rotate_shaft_frame()    (incremental world tilt/yaw about the RCM)
   - Tube-axis geometry (two points on the endoscope mesh)
   - Auto-solve of wrist_1 so the wrist joint points out from the base
 """
 
+import logging
 import math
+
 import numpy as np
 
 try:
@@ -38,19 +34,16 @@ try:
     except ImportError:
         from kdl_parser_py.urdf import treeFromString
     HAS_KDL = True
-except Exception as _e:  # noqa
-    print("KDL imports failed:", _e)
+except ImportError as error:
+    logging.getLogger(__name__).warning("KDL imports failed: %s", error)
     HAS_KDL = False
-
 
 JOINT_NAMES = [
     "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
     "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
 ]
 
-# Default GUI pose (degrees); nothing is sent to the robot on startup.
-
-# Fallback transform from endoscope_link to flex_base_link (from ur5_endo_flex.urdf.xacro)
+# Fallback transform from endoscope_link to flex_base_link (from ur5_endo_flex.urdf)
 # origin xyz="0 0 -0.398" rpy="3.141593 0 0.616096"
 ENDO_TO_FLEX_XYZ = np.array([0.0, 0.0, -0.398], dtype=float)
 ENDO_TO_FLEX_RPY = (3.141593, 0.0, 0.616096)
@@ -61,9 +54,6 @@ ENDO_TO_FLEX_RPY = (3.141593, 0.0, 0.616096)
 FLEX_STRAIGHT_LEN_TO_END_CYL = 0.0665
 # end_cylinder_to_camera_joint in the URDF.
 END_CYLINDER_TO_CAMERA_M = 0.003
-END_CYLINDER_IN_ENDO_LINK = np.array(
-    [0.0, 0.0, -0.398 - FLEX_STRAIGHT_LEN_TO_END_CYL], dtype=float
-)
 
 
 def _rot_x(a: float) -> np.ndarray:
@@ -142,17 +132,15 @@ class EndoscopeKinematics:
 
         self.flex_base_chain = None
         self.flex_base_fk_solver = None
-        # base_link origin in the `world` frame (refined in setup_from_urdf).
-        self.base_in_world_xyz = np.zeros(3, dtype=float)
         self._R_endo_to_flex = _rpy_to_mat(*ENDO_TO_FLEX_RPY)
 
         xy_gap = self.tip_local[:2] - self.rcm_point_local[:2]
         if np.linalg.norm(xy_gap) > 1e-4 and logger is not None:
-            logger.warn(
+            logger.warning(
                 'rcm_point_in_tip_frame and endoscope_tip_in_link_frame '
                 'do NOT share x,y in the link frame. The tube axis derived '
                 'from them will NOT be parallel to the URDF collision '
-                'cylinder. Check endoscope.xacro / launch parameters.')
+                'cylinder. Check URDF geometry / app parameters.')
 
     # ------------------------------------------------------------------
     @property
@@ -162,7 +150,7 @@ class EndoscopeKinematics:
     def setup_from_urdf(self, urdf_str):
         if not HAS_KDL:
             if self.logger:
-                self.logger.warn('KDL not available; Cartesian/RCM disabled.')
+                self.logger.warning('KDL not available; Cartesian/RCM disabled.')
             return False
         try:
             ok, tree = treeFromString(urdf_str)
@@ -195,19 +183,6 @@ class EndoscopeKinematics:
             except Exception:
                 self.flex_base_chain = None
                 self.flex_base_fk_solver = None
-
-            # base_link origin in the `world` frame (fixed supporter joints).
-            # Used to convert base-frame points to Gazebo world coordinates.
-            try:
-                w2b = tree.getChain('world', self.base_link)
-                if w2b.getNrOfJoints() == 0:
-                    fw = PyKDL.Frame()
-                    PyKDL.ChainFkSolverPos_recursive(w2b).JntToCart(
-                        PyKDL.JntArray(0), fw)
-                    self.base_in_world_xyz = np.array(
-                        [fw.p.x(), fw.p.y(), fw.p.z()], dtype=float)
-            except Exception:
-                pass  # keep default (origin)
 
             if self.logger:
                 self.logger.info(
@@ -294,13 +269,6 @@ class EndoscopeKinematics:
         p_flex = p_endo + R_endo @ ENDO_TO_FLEX_XYZ
         return R_flex, p_flex
 
-    def point_in_base(self, q, p_local):
-        f = self.fk(q)
-        p = f * PyKDL.Vector(float(p_local[0]),
-                             float(p_local[1]),
-                             float(p_local[2]))
-        return np.array([p.x(), p.y(), p.z()])
-
     def end_cylinder_in_base(self, q):
         """Return 3D position of end_cylinder in base_link frame when endo_flex is straight."""
         R_flex, p_flex = self.flex_base_frame_in_base(q)
@@ -318,188 +286,9 @@ class EndoscopeKinematics:
         return (rotation @ _rot_z(math.radians(roll_deg) + plane)
                 @ _rot_y(bend) @ _rot_z(-plane))
 
-    def flex_fk_from_base_frame(self, R_0, p_0, curvature=0.0, steer_yaw=0.0,
-                                arc_len=0.050):
-        """
-        Constant-curvature arc FK of the distal endo_flex camera given the
-        flex-base frame (R_0, p_0) in the base_link frame.
-
-        This is the reusable core of `flex_fk_in_base()`: it performs the
-        horizon-leveled steering-plane twist, the arc integration and the
-        distal-frame roll compensation, with no dependency on the UR5 joint
-        vector (the caller supplies the flex-base frame directly).
-
-        Returns (R_end, p_end, (base_yaw, ext_yaw)).
-        """
-        R_0 = np.asarray(R_0, dtype=float)
-        p_0 = np.asarray(p_0, dtype=float).reshape(3)
-
-        kappa = float(curvature)
-        L = float(arc_len)
-        theta = kappa * L  # total bend angle over the arc (rad)
-
-        base_yaw, ext_yaw = self.solve_horizon_flex_yaw_from_R0(
-            R_0, steer_yaw=float(steer_yaw),
-            theta_total=theta)
-
-        # Steering-plane twist. rot_z() is 2*pi-periodic, so this recovers
-        # alpha = psi_h + steer_yaw from the solved joint pair.
-        alpha = base_yaw + ext_yaw
-        R_a = R_0 @ _rot_z(alpha)
-
-        if abs(theta) < 1e-9 or abs(kappa) < 1e-12:
-            p_local = np.array([0.0, 0.0, L], dtype=float)
-        else:
-            # Constant-curvature arc chord in the steered (x=down, z=fwd) plane.
-            p_local = np.array(
-                [(1.0 - math.cos(theta)) / kappa, 0.0,
-                 math.sin(theta) / kappa], dtype=float)
-
-        p_end = p_0 + R_a @ p_local
-        R_end = R_a @ _rot_y(theta) @ _rot_z(-ext_yaw)
-        return R_end, p_end, (base_yaw, ext_yaw)
-
-    def flex_fk_in_base(self, q, curvature=0.0, steer_yaw=0.0,
-                        arc_len=0.050):
-        """
-        Forward kinematics of the distal endoscope camera (end_cylinder) in
-        the base_link frame for a given endo_flex configuration.
-
-        The flex section is modelled as a constant-curvature arc of length
-        `arc_len` (m) and curvature `curvature` (1/m) in the steering plane.
-        The yaw coordination from `solve_horizon_flex_yaw()` keeps the
-        distal y-axis horizontal. The distal camera frame
-        convention is: +x down, +y horizontal, +z forward along the tube.
-
-        Returns (R_end, p_end, (base_yaw, ext_yaw)).
-        """
-        R_0, p_0 = self.flex_base_frame_in_base(q)
-        return self.flex_fk_from_base_frame(
-            R_0, p_0, curvature=curvature, steer_yaw=steer_yaw,
-            arc_len=arc_len)
-
     # ------------------------------------------------------------------
-    # Hybrid RCM tracking kinematics (control-space FK / Jacobian)
+    # Tube-axis geometry
     # ------------------------------------------------------------------
-    def camera_pose_on_shaft(self, p_rcm, R_shaft, d_ins, kappa, steer_yaw,
-                             arc_len=0.050,
-                             tip_to_flex_base=0.59995):
-        """
-        Control-space FK used by the hybrid RCM tracking servo (no arm IK).
-
-        The rigid shaft is parameterised by the captured RCM point `p_rcm`,
-        the endoscope_link orientation `R_shaft` and the insertion depth
-        `d_ins = |p_tip - p_rcm|` measured to the endoscope tip.  The shaft
-        unit direction is `u = R_shaft[:, 2]` (endoscope +z = RCM -> tip).
-
-        The flex-base frame follows from the derived shaft geometry:
-            p_0 = p_rcm + (d_ins - tip_to_flex_base) * u
-            R_0 = R_shaft @ R_endo_to_flex
-        and the distal camera pose from the constant-curvature arc FK.
-
-        Note the camera views along `R_end[:, 2]`, which is -u while the
-        flex is straight (the flex base +z points away from the tip).
-
-        Returns (p_cam, v_hat) with `v_hat = R_end[:, 2]`.
-        """
-        p_rcm = np.asarray(p_rcm, dtype=float).reshape(3)
-        R_shaft = np.asarray(R_shaft, dtype=float)
-        u = R_shaft[:, 2]
-        p_0 = p_rcm + (float(d_ins) - float(tip_to_flex_base)) * u
-        R_0 = R_shaft @ self._R_endo_to_flex
-        R_end, p_end, _ = self.flex_fk_from_base_frame(
-            R_0, p_0, curvature=kappa, steer_yaw=steer_yaw,
-            arc_len=arc_len)
-        return p_end, R_end[:, 2].copy()
-
-    def rotate_shaft_frame(self, R_shaft, d_tilt=0.0, d_yaw=0.0):
-        """
-        Incremental world-frame rotation of the rigid shaft about the RCM.
-
-        For modeled tracking, `d_tilt` pitches about the horizontal axis
-        perpendicular to the shaft's horizontal projection, then
-        `d_yaw` rotates about world +z. The world rotations are
-        left-multiplied onto the full endoscope_link orientation.
-        """
-        R_new = np.array(R_shaft, dtype=float)
-        z_world = np.array([0.0, 0.0, 1.0])
-
-        if abs(float(d_tilt)) > 1e-15:
-            u = R_new[:, 2]
-            a_h = np.array([u[0], u[1], 0.0], dtype=float)
-            n = float(np.linalg.norm(a_h))
-            if n < 1e-6:
-                pitch_axis = np.array([1.0, 0.0, 0.0])
-            else:
-                pitch_axis = np.cross(a_h / n, z_world)
-                pitch_axis /= max(float(np.linalg.norm(pitch_axis)), 1e-9)
-            R_new = self._rodrigues_matrix(
-                pitch_axis, -float(d_tilt)) @ R_new
-
-        if abs(float(d_yaw)) > 1e-15:
-            R_new = self._rodrigues_matrix(
-                z_world, -float(d_yaw)) @ R_new
-        return R_new
-
-    def hybrid_rcm_jacobian(self, p_rcm, R_shaft, d_ins, kappa, steer_yaw,
-                            standoff, arc_len=0.050,
-                            tip_to_flex_base=0.59995, eps=None):
-        """
-        3x5 task Jacobian of the virtual aim point
-
-            p_aim = p_cam + standoff * v_hat
-
-        with respect to u = (kappa_x, kappa_y, theta_tilt, theta_yaw, d_ins),
-        by central finite differences via `camera_pose_on_shaft()`.
-
-        (kappa_x, kappa_y) is the Cartesian curvature, converted internally
-        to polar (kappa, psi); psi is the flex steering yaw.
-        """
-        p_rcm = np.asarray(p_rcm, dtype=float).reshape(3)
-        R_shaft = np.asarray(R_shaft, dtype=float)
-        standoff = float(standoff)
-        kappa = float(kappa)
-        psi = float(steer_yaw)
-        if eps is None:
-            eps = (0.2, 0.2, 1e-3, 1e-3, 2e-4)
-
-        kx0 = kappa * math.cos(psi)
-        ky0 = kappa * math.sin(psi)
-
-        def aim(kx, ky, R_s, d_i):
-            k = float(math.hypot(kx, ky))
-            p = (math.atan2(ky, kx) if k > 1e-12 else psi)
-            p_cam, v_hat = self.camera_pose_on_shaft(
-                p_rcm, R_s, d_i, k, p,
-                arc_len=arc_len,
-                tip_to_flex_base=tip_to_flex_base)
-            return p_cam + standoff * v_hat
-
-        J = np.zeros((3, 5), dtype=float)
-
-        ex = float(eps[0])
-        J[:, 0] = (aim(kx0 + ex, ky0, R_shaft, d_ins)
-                   - aim(kx0 - ex, ky0, R_shaft, d_ins)) / (2.0 * ex)
-        ey = float(eps[1])
-        J[:, 1] = (aim(kx0, ky0 + ey, R_shaft, d_ins)
-                   - aim(kx0, ky0 - ey, R_shaft, d_ins)) / (2.0 * ey)
-
-        et = float(eps[2])
-        R_tp = self.rotate_shaft_frame(R_shaft, d_tilt=+et)
-        R_tm = self.rotate_shaft_frame(R_shaft, d_tilt=-et)
-        J[:, 2] = (aim(kx0, ky0, R_tp, d_ins)
-                   - aim(kx0, ky0, R_tm, d_ins)) / (2.0 * et)
-
-        eyaw = float(eps[3])
-        R_yp = self.rotate_shaft_frame(R_shaft, d_yaw=+eyaw)
-        R_ym = self.rotate_shaft_frame(R_shaft, d_yaw=-eyaw)
-        J[:, 3] = (aim(kx0, ky0, R_yp, d_ins)
-                   - aim(kx0, ky0, R_ym, d_ins)) / (2.0 * eyaw)
-
-        ed = float(eps[4])
-        J[:, 4] = (aim(kx0, ky0, R_shaft, d_ins + ed)
-                   - aim(kx0, ky0, R_shaft, d_ins - ed)) / (2.0 * ed)
-        return J
 
     def tool_axis_in_base(self, q):
         f = self.fk(q)
@@ -552,9 +341,8 @@ class EndoscopeKinematics:
         """
         Horizon-keeping (base_yaw, ext_yaw) solver from the flex-base frame.
 
-        Identical math to `solve_horizon_flex_yaw(q, ...)`, but takes the
-        flex-base rotation matrix directly so that the control-space arc FK
-        (`flex_fk_from_base_frame`) can reuse it without a UR5 joint vector.
+        Takes the flex-base rotation matrix directly, without a UR5 joint
+        vector. Returns the modeled base and distal yaw angles in radians.
         """
         steer_yaw = float(steer_yaw)
         theta_total = float(theta_total)
@@ -612,21 +400,6 @@ class EndoscopeKinematics:
         return (v * np.cos(theta)
                 + np.cross(k, v) * np.sin(theta)
                 + k * np.dot(k, v) * (1.0 - np.cos(theta)))
-
-    @classmethod
-    def _rodrigues_matrix(cls, axis, angle):
-        """3x3 rotation matrix about a (possibly non-unit) axis by angle (rad)."""
-        k = np.asarray(axis, dtype=float).reshape(-1)
-        n = float(np.linalg.norm(k))
-        if n < 1e-12:
-            return np.eye(3, dtype=float)
-        k = k / n
-        c, s = math.cos(float(angle)), math.sin(float(angle))
-        Kx = np.array([[   0.0, -k[2],  k[1]],
-                       [ k[2],   0.0, -k[0]],
-                       [-k[1],   k[0],   0.0]], dtype=float)
-        return (c * np.eye(3, dtype=float) + s * Kx
-                + (1.0 - c) * np.outer(k, k))
 
     # ------------------------------------------------------------------
     # Solve wrist_1 so shoulder_lift + elbow + wrist_1 = -270 deg.
@@ -760,23 +533,3 @@ class EndoscopeKinematics:
         if self.ik_solver.CartToJnt(q_init, f_target, q_out) < 0:
             return None
         return np.array([q_out[i] for i in range(n)])
-
-    # ------------------------------------------------------------------
-    # IK (Position-only and RCM-constrained, both using 5-DOF exact solver)
-    # ------------------------------------------------------------------
-    def ik_position_only(self, p_tip_target, q_seed, axis_target=None):
-        """Translate p_tip to p_tip_target while keeping the tube axis parallel
-        and satisfying shoulder_lift + elbow + wrist_1 = -270 deg."""
-        if axis_target is None:
-            axis_target, _, _ = self.tube_axis_in_base(q_seed)
-        return self.ik_along_axis(p_tip_target, axis_target, q_seed)
-
-    def ik_with_rcm(self, p_tip_target, rcm_world, q_seed):
-        """Move p_tip to p_tip_target with the shaft passing strictly through
-        rcm_world and satisfying shoulder_lift + elbow + wrist_1 = -270 deg."""
-        v = np.asarray(p_tip_target, dtype=float) - np.asarray(rcm_world, dtype=float)
-        d = float(np.linalg.norm(v))
-        if d < 1e-6:
-            return None
-        axis_new = v / d
-        return self.ik_along_axis(p_tip_target, axis_new, q_seed)

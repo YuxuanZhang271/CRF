@@ -18,6 +18,7 @@ TRACK_ARM_SPEED_RAD_S = math.radians(3)
 PULL_OUT_ALIGN_SPEED_RAD_S = math.radians(4)
 PULL_OUT_ALIGN_TOLERANCE_RAD = math.radians(0.35)
 PULL_OUT_RETRACT_SPEED_M_S = 0.050
+PULL_OUT_BEHIND_RCM_M = 0.100  # Preserve the existing withdrawal endpoint.
 # Match the manual segment and tracking increments in the native driver.
 TRACK_SPEED_MULTIPLIER = 3.0
 HORIZON_ROLL_STEP_DEG = 0.80
@@ -39,10 +40,9 @@ DRIVER_DISCONNECTED = "Flex driver disconnected or restarted."
 
 
 class FlexControl:
-    def __init__(self, client, camera, pull_out_clearance=None, *, camera_roll_offset_deg=0.):
+    def __init__(self, client, camera, *, camera_roll_offset_deg=0.):
         self.client = client
         self.camera = camera
-        self.pull_out_clearance = pull_out_clearance
         self.camera_roll_offset_deg = camera_roll_offset_deg
         angle = math.radians(camera_roll_offset_deg)
         c, s = math.cos(angle), math.sin(angle)
@@ -282,8 +282,6 @@ class FlexControl:
         obs = self.camera.observation()
         if obs is None or obs.category is None or not self._fresh(obs):
             raise ValueError("Select one YOLO category and wait for a fresh camera frame.")
-        with node._lock:
-            node._clear_track_state_unlocked()
         self.tracking = (obs.revision, obs.category)
         self.resume_horizon()
         self.tracking_state = "Waiting for target"
@@ -565,8 +563,6 @@ class FlexControl:
         return True
 
     def pull_out(self, node):
-        if self.pull_out_clearance is None:
-            raise ValueError("Configure the bench-verified pull-out clearance before enabling Pull Out.")
         if not self._rcm_ready(node) or not self.ready():
             raise ValueError("Pull Out requires active RCM and calibrated Flex feedback.")
         if any(node._key_state.values()) or node._arm_moving is not False or node._teleop_servo_active:
@@ -598,12 +594,12 @@ class FlexControl:
         align_rate = min(PULL_OUT_ALIGN_SPEED_RAD_S, node.arm_linear_speed_m_s / max(depth, 1e-6))
         self.procedure = {
             "stage": "prepare", "depth": depth, "offset": axial_offset, "flex_zero": flex_at_zero,
-            "end": sign * self.pull_out_clearance, "sign": sign,
+            "end": sign * PULL_OUT_BEHIND_RCM_M, "sign": sign,
             "deadline": max(
                 self.pending[2] if self.pending else 0.,
                 time.monotonic() + POSITION_TIMEOUT_S + 2 * node.rcm_cone_half_angle / align_rate,
             ),
-            "retract_distance": abs(axial_offset + sign * self.pull_out_clearance - depth),
+            "retract_distance": abs(axial_offset + sign * PULL_OUT_BEHIND_RCM_M - depth),
             "retract_speed": min(PULL_OUT_RETRACT_SPEED_M_S, node.arm_linear_speed_m_s),
         }
         self.message = "Pull Out · preparing RCM and Flex"
@@ -721,8 +717,10 @@ class FlexControl:
         old = self._driver
         s = self.client.poll()
         self._driver = s.driver if s is not None and self.client.ready else None
+        # A standalone return to zero owns Flex only. Coordinated procedures
+        # and Bird-eye positioning retain exclusive arm control.
         exclusive = bool(self.tracking or self.procedure or
-                         (self.pending and self.pending[1] in (ipc.POSITION, ipc.RETURN_ZERO)))
+                         (self.pending and self.pending[1] == ipc.POSITION))
         if old is not None and old != self._driver:
             issue = DRIVER_DISCONNECTED
             if s is not None and s.driver == old:
@@ -887,6 +885,5 @@ class FlexControl:
             "tracking": self.tracking is not None,
             "tracking_horizon_supported": bool(s and s.flags & ipc.TRACK_HORIZON_SUPPORTED),
             "tracking_state": self.tracking_state,
-            "pull_out_enabled": self.pull_out_clearance is not None,
             "pull_out_confirm": bool(self.procedure and self.procedure["stage"] == "confirm"),
         }

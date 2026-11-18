@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRF Control</title>
+<link rel="stylesheet" href="/static/dashboard.css"></head><body>
+<main class="workspace">
+<section class="panel robot-panel" aria-labelledby="control-heading">
+<h1 id="control-heading">FlexEndoRobot ControlPanel</h1>
+<div class="panel-scroll" tabindex="0" aria-label="Robot controls">
+  <div class="card primary-actions">
+    <div class="actions">
+      <button onclick="post('/api/cmd/bird_eye')">BIRD-EYE</button>
+      <button id="pull-out" disabled>PULL OUT</button>
+    </div>
+    <div class="actions stop-actions">
+      <button id="interrupt" class="interrupt" onclick="interruptMotion()" title="Cancel motion and keep the session open">INTERRUPT</button>
+      <button id="stop" class="estop" onclick="stopSession()" title="Stop motion and shut down the app">STOP</button>
+    </div>
+    <button id="confirm-pull-out" onclick="confirmPullOut()" hidden>Confirm straight and retract</button>
+  </div>
+
+    <div class="card"><h3>UR5</h3>
+      <dl class="grid" id="arm-state"></dl>
+      <div class="actions control-settings">
+        <form class="limit-editor device-limits" id="arm-limit-form" novalidate>
+          <label for="arm-limit">Tip limit (°)</label>
+          <input id="arm-limit" type="number" min="10" step="1" required disabled>
+          <label for="arm-linear-speed">Speed limit</label>
+          <select id="arm-linear-speed" required disabled>
+            <option value="12.5">0.5x</option>
+            <option value="25" selected>1x</option>
+            <option value="50">2x</option>
+            <option value="125">5x</option>
+          </select>
+          <button type="submit" disabled>APPLY</button>
+        </form>
+        <div class="actions device-actions">
+          <button id="arm-reset" onclick="post('/api/cmd/reset')" aria-label="Reset arm">RESET</button>
+        </div>
+      </div>
+      <h3 class="control-title">Arm controls</h3>
+      <div class="command-grid">
+        <button id="arm-mode" class="control-mode" onclick="post('/api/mode/arm')" aria-label="Toggle arm mode" aria-pressed="false">Toggle mode</button>
+        <button class="direction control-left" data-key="arm_left" aria-label="Arm left">←</button>
+        <button class="direction control-up" data-key="arm_up" aria-label="Arm up">↑</button>
+        <button class="direction control-down" data-key="arm_down" aria-label="Arm down">↓</button>
+        <button class="direction control-right" data-key="arm_right" aria-label="Arm right">→</button>
+        <button class="control-forward" data-key="arm_fwd" aria-label="Arm forward">FWD</button>
+        <button class="control-backward" data-key="arm_bwd" aria-label="Arm backward">BWD</button>
+      </div>
+    </div>
+
+    <div class="card"><h3>FlexEndo</h3>
+      <div class="flex-readings">
+        <div>
+          <p class="reading-label" id="angle-label">Angle</p>
+          <dl class="grid" id="flex-state" aria-labelledby="angle-label"></dl>
+        </div>
+        <div class="tendon-readings">
+          <p class="reading-label" id="tendon-label">Tendons (mm)</p>
+          <dl class="grid" id="tendons" aria-labelledby="tendon-label"></dl>
+        </div>
+      </div>
+      <div class="actions control-settings">
+        <form class="limit-editor device-limits" id="flex-limit-form" novalidate>
+          <label for="flex-limit">Bend limit (°)</label>
+          <input id="flex-limit" type="number" min="30" step="1" required disabled>
+          <label for="flex-speed">Speed limit</label>
+          <select id="flex-speed" required disabled>
+            <option value="5">0.5x</option>
+            <option value="10" selected>1x</option>
+            <option value="20">2x</option>
+            <option value="50">5x</option>
+          </select>
+          <button type="submit" disabled>APPLY</button>
+        </form>
+        <div class="actions device-actions" id="flex-calibration" hidden>
+          <button id="calibrate" onclick="calibrateFlex()">CALIBRATE</button>
+          <button id="flex-return-zero" onclick="post('/api/flex/return_zero')" aria-label="Reset Flex to saved zero" disabled>RESET</button>
+          <button id="flex-recheck" onclick="post('/api/flex/recheck_startup')" hidden>Recheck Flex inputs</button>
+        </div>
+      </div>
+      <h3 class="control-title">Flex controls</h3>
+      <div class="command-grid" id="flex-model-controls">
+        <button class="direction control-left" data-key="flex_a">A</button>
+        <button class="direction control-up" data-key="flex_w">W</button>
+        <button class="direction control-down" data-key="flex_s">S</button>
+        <button class="direction control-right" data-key="flex_d">D</button>
+        <button class="control-forward" data-key="flex_r">R (arc+)</button>
+        <button class="control-backward" data-key="flex_f">F (arc−)</button>
+      </div>
+      <div class="command-grid" id="flex-hardware-controls" hidden>
+        <button class="direction control-left" data-key="flex_left" aria-label="Bend left">←</button>
+        <button class="direction control-up" data-key="flex_up" aria-label="Bend up">↑</button>
+        <button class="direction control-down" data-key="flex_down" aria-label="Bend down">↓</button>
+        <button class="direction control-right" data-key="flex_right" aria-label="Bend right">→</button>
+        <button class="control-forward" data-key="flex_roll_plus" aria-label="Jog positive Flex roll" disabled>roll+</button>
+        <button class="control-backward" data-key="flex_roll_minus" aria-label="Jog negative Flex roll" disabled>roll-</button>
+      </div>
+    </div>
+
+    <div class="motion-plots">
+      <figure class="motion-plot" id="rcm-plot" data-available="false">
+        <figcaption>UR5 RCM tip</figcaption>
+        <div class="plot-field" aria-hidden="true">
+          <div class="plot-ring"></div><div class="plot-tip" hidden></div>
+        </div>
+        <div class="status plot-reading">Tilt —</div>
+        <div class="status" id="rcm-insertion">Insertion —</div>
+      </figure>
+      <figure class="motion-plot" id="flex-plot" data-available="false">
+        <figcaption>FlexEndo</figcaption>
+        <div class="plot-field" aria-hidden="true">
+          <div class="plot-ring"></div><div class="plot-roll" hidden></div><div class="plot-tip" hidden></div>
+        </div>
+        <div class="status plot-reading">Bend —</div>
+        <div class="status plot-roll-reading roll-label">Roll —</div>
+      </figure>
+    </div>
+    <section class="card console" aria-labelledby="console-heading">
+      <h3 id="console-heading">Console</h3>
+      <div class="console-output" id="console-output" role="log" aria-labelledby="console-heading" tabindex="0"></div>
+    </section>
+  </div>
+</section>
+
+<section class="panel camera-panel" aria-labelledby="camera-heading">
+  <h2 id="camera-heading">SCOPE Camera</h2>
+  <div class="camera-stage">
+    <div class="camera">
+      <img id="camera-feed" alt="Live SCOPE camera with detection boxes">
+    </div>
+  </div>
+  <dl class="status-bar" aria-label="Robot status">
+    <div class="status-chip" id="arm-status"><dt>ARM</dt><dd>Disconnected</dd></div>
+    <div class="status-chip" id="flex-connection"><dt>FLEX</dt><dd>Disconnected</dd></div>
+    <div class="status-chip" id="motion-status"><dt>MOTION</dt><dd>Unavailable</dd></div>
+  </dl>
+</section>
+
+<aside class="panel category-panel" aria-labelledby="categories-heading">
+  <h2 id="categories-heading">YOLO Categories</h2>
+  <div class="panel-scroll">
+    <div class="card">
+      <button id="tracking" type="button" aria-pressed="false" disabled>Tracking</button>
+      <div class="category-options" id="category-options"></div>
+    </div>
+  </div>
+</aside>
+</main>
+
+<script src="/static/dashboard.js"></script></body></html>

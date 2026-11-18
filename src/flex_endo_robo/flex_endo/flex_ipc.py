@@ -5,6 +5,7 @@ import logging
 import math
 import secrets
 import struct
+import threading
 import time
 from dataclasses import dataclass
 
@@ -82,7 +83,12 @@ class FlexStatus:
             if self.fault_axis_status:
                 detail += f" (0x{self.fault_axis_status:X})"
             return f"GTS axis {axis}: {detail}"
-        return ""
+        return {
+            -111: "Flex driver: target exceeds the controller position range",
+            -112: "Flex driver: planned motion did not settle at its target; see terminal details",
+            -113: "Flex driver: encoder did not follow commanded travel; see terminal details",
+            -114: "Flex driver: drive enable was not confirmed",
+        }.get(self.fault, "")
 
     @property
     def calibrated(self):
@@ -165,7 +171,11 @@ class _Mapping:
 
 
 class FlexClient:
-    """Called under the control node's control lock."""
+    """Keep native I/O on one worker; publish intent from the coordinator.
+
+    The worker repeats the coordinator's timestamp, so stalled control work
+    cannot keep an old movement alive past the native command watchdog.
+    """
 
     def __init__(self):
         self._api = _Windows()
@@ -176,107 +186,166 @@ class FlexClient:
         if error == 183:  # ERROR_ALREADY_EXISTS
             self._api.close(self._owner)
             raise RuntimeError("A Flex control application is already running in this session.")
+        self._lock = threading.RLock()
+        self._wake = threading.Event()
+        self._shutdown = threading.Event()
+        self._worker = None
         self._maps = {}
         self._retry_at = 0.0
         self.app = secrets.randbits(64) or 1
-        self.status = None
+        self.status = None  # Immutable feedback latched by poll() for a control tick.
+        self._feedback = None
         self.sequence = 0
         self._request_counter = 0
         self._intent = (IDLE, 0, 0, 0., 0., 0.)
+        self._published = (0, self._intent, 0.)
+        self._observation = None
         self._vision_frame = 0
 
     @property
     def ready(self):
         return self.status is not None and self.status.app == self.app
 
+    def start(self):
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._run, name="flex-ipc")
+            self._worker.start()
+
     def close(self):
+        self._shutdown.set()
+        self._wake.set()
+        if self._worker is not None:
+            self._worker.join()
         self._detach()
+        self.status = None
         if self._owner:
             self._api.close(self._owner)
             self._owner = None
 
     def _detach(self):
+        # Only the I/O worker touches mappings until it has joined.
         for mapping in self._maps.values():
             mapping.close()
         self._maps.clear()
-        self.status = None
         self._retry_at = time.monotonic() + 0.3
         self._vision_frame = 0
-        self.command(IDLE)
+        with self._lock:
+            self._feedback = None
+            self.command(IDLE)
+            self._published = (self.sequence, self._intent, 0.)
+            self._observation = None
 
     def poll(self):
+        """Latch a complete snapshot without waiting for a Windows mutex."""
+        with self._lock:
+            status = self._feedback
+        self.status = (status if status is not None
+                       and 0 <= self._api.now() - status.stamp <= FEEDBACK_TIMEOUT_MS else None)
+        return self.status
+
+    def _read_status(self):
         if not self._maps and time.monotonic() < self._retry_at:
             return None
+        if not self._maps:
+            for name, layout in (("Command", COMMAND), ("Status", STATUS), ("Vision", VISION)):
+                self._maps[name] = _Mapping(self._api, PREFIX + name, layout.size, name != "Status")
         try:
-            if not self._maps:
-                for name, layout in (("Command", COMMAND), ("Status", STATUS), ("Vision", VISION)):
-                    self._maps[name] = _Mapping(self._api, PREFIX + name, layout.size, name != "Status")
-            try:
-                fields = STATUS.unpack(self._maps["Status"].copy())
-            except _MappingBusy:
-                if self.status and 0 <= self._api.now() - self.status.stamp <= FEEDBACK_TIMEOUT_MS:
-                    return self.status
-                raise
-            if fields[:4] != _header(STATUS):
-                raise OSError("Invalid Flex status layout")
-            driver, stamp, app, seq, req, action, reserved, flags, result, fault, axis_status, *pose = fields[4:]
-            if (not driver or not stamp or not 0 <= self._api.now() - stamp <= FEEDBACK_TIMEOUT_MS
-                    or action >= len(ACTIONS) or reserved or result >= len(RESULTS)
-                    or not all(map(math.isfinite, pose)) or pose[3] < 0 or pose[8] < MIN_SPEED_DEG_S
-                    or (pose[3] == 0 and flags & (CALIBRATED | PLANNED_ZERO))):
-                raise OSError("Invalid or stale Flex status")
-            if self.status is None or driver != self.status.driver or (self.ready and app != self.app):
-                self._vision_frame = 0
-                self.command(IDLE)
-            self.status = FlexStatus(driver, stamp, app, seq, req, action, flags, result, fault,
-                                     *pose[:4], tuple(pose[4:8]), axis_status, pose[8])
-            return self.status
-        except OSError as error:
-            if self.status is not None:
-                logging.getLogger(__name__).warning("Flex status unavailable: %s", error)
-            self._detach()
-            return None
+            fields = STATUS.unpack(self._maps["Status"].copy())
+        except _MappingBusy:
+            status = self._feedback
+            if status and 0 <= self._api.now() - status.stamp <= FEEDBACK_TIMEOUT_MS:
+                return status
+            raise
+        if fields[:4] != _header(STATUS):
+            raise OSError("Invalid Flex status layout")
+        driver, stamp, app, seq, req, action, reserved, flags, result, fault, axis_status, *pose = fields[4:]
+        if (not driver or not stamp or not 0 <= self._api.now() - stamp <= FEEDBACK_TIMEOUT_MS
+                or action >= len(ACTIONS) or reserved or result >= len(RESULTS)
+                or not all(map(math.isfinite, pose)) or pose[3] < 0 or pose[8] < MIN_SPEED_DEG_S
+                or (pose[3] == 0 and flags & (CALIBRATED | PLANNED_ZERO))):
+            raise OSError("Invalid or stale Flex status")
+        return FlexStatus(driver, stamp, app, seq, req, action, flags, result, fault,
+                          *pose[:4], tuple(pose[4:8]), axis_status, pose[8])
 
     def command(self, action, *, request=0, frame=0, x=0., y=0., roll=0.):
-        intent = (action, request, frame, x, y, roll)
-        if intent != self._intent or not self.sequence:
-            self.sequence += 1
-            self._intent = intent
+        with self._lock:
+            intent = (action, request, frame, x, y, roll)
+            if intent != self._intent or not self.sequence:
+                self.sequence += 1
+                self._intent = intent
 
     def request(self, action, **parameters):
-        self._request_counter += 1
-        self.command(action, request=self._request_counter, **parameters)
-        return self._request_counter
+        with self._lock:
+            self._request_counter += 1
+            self.command(action, request=self._request_counter, **parameters)
+            return self._request_counter
 
     def send(self, observation=None):
-        if self.status is None:
-            return False
+        """Publish the latest intent; native status confirms actual completion."""
+        with self._lock:
+            self._published = (self.sequence, self._intent, time.monotonic())
+            self._observation = observation
+            available = self._feedback is not None
+        self._wake.set()
+        return available
+
+    def _write(self, status):
+        with self._lock:
+            sequence, intent, published_at = self._published
+            observation = self._observation
+        if not published_at:
+            return
         tick = self._api.now()
-        action, request, frame, x, y, roll = self._intent
+        now = time.monotonic()
+        # Repeating a heartbeat never renews intent that the coordinator stopped publishing.
+        stamp = max(0, tick - round(max(0., now - published_at) * 1000))
+        action, request, frame, x, y, roll = intent
+        if observation is not None and observation.frame != self._vision_frame:
+            capture = max(0, tick - round(max(0., now - observation.captured_at) * 1000))
+            data = VISION.pack(*_header(VISION), status.driver, self.app,
+                               observation.frame, capture, int(observation.valid),
+                               observation.width, observation.height, int(observation.centered),
+                               observation.dx, observation.dy,
+                               observation.category if observation.category is not None else -1,
+                               observation.revision)
+            try:
+                self._maps["Vision"].copy(data)
+            except _MappingBusy:
+                pass  # Retry vision without delaying the command heartbeat.
+            else:
+                self._vision_frame = observation.frame
+        data = COMMAND.pack(*_header(COMMAND), status.driver, self.app, sequence,
+                            stamp, request, frame, action, 0, x, y, roll)
+        self._maps["Command"].copy(data)
+
+    def _run(self):
         try:
-            if observation is not None and observation.frame != self._vision_frame:
-                age = max(0., time.monotonic() - observation.captured_at)
-                capture = max(0, tick - round(age * 1000))
-                data = VISION.pack(*_header(VISION), self.status.driver, self.app,
-                                   observation.frame, capture, int(observation.valid),
-                                   observation.width, observation.height, int(observation.centered),
-                                   observation.dx, observation.dy,
-                                   observation.category if observation.category is not None else -1,
-                                   observation.revision)
+            while not self._shutdown.is_set():
+                self._wake.clear()
                 try:
-                    self._maps["Vision"].copy(data)
+                    status = self._read_status()
+                    if status is not None:
+                        with self._lock:
+                            old = self._feedback
+                            if (old is None or status.driver != old.driver
+                                    or (old.app == self.app and status.app != self.app)):
+                                self._vision_frame = 0
+                                self.command(IDLE)
+                                self._published = (self.sequence, self._intent, 0.)
+                                self._observation = None
+                            self._feedback = status
+                        self._write(status)
                 except _MappingBusy:
-                    # Retry the observation later and send the command heartbeat now.
-                    pass
-                else:
-                    self._vision_frame = observation.frame
-            data = COMMAND.pack(*_header(COMMAND), self.status.driver, self.app, self.sequence,
-                                tick, request, frame, action, 0, x, y, roll)
-            self._maps["Command"].copy(data)
-            return True
-        except _MappingBusy:
-            return False
-        except OSError as error:
-            logging.getLogger(__name__).warning("Flex shared memory unavailable: %s", error)
-            self._detach()
-            return False
+                    pass  # A single busy copy is not a lost connection.
+                except OSError as error:
+                    if self._feedback is not None:
+                        logging.getLogger(__name__).warning("Flex shared memory unavailable: %s", error)
+                    self._detach()
+                self._wake.wait(0.01)
+        finally:
+            # Let the last queued STOP reach the driver before closing the maps.
+            if self._feedback is not None and self._published[1][0] == STOP:
+                try:
+                    self._write(self._feedback)
+                except OSError:
+                    pass  # Native heartbeat expiry remains the fallback stop.

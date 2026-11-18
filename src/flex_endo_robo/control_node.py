@@ -11,43 +11,25 @@ from concurrent.futures import Future
 
 import numpy as np
 
-if __package__:
-    from .kinematics import EndoscopeKinematics, rcm_tip_angles
-    from .flex_endo.flex_control import FLEX_KEYS, PULL_OUT_RETRACT_SPEED_M_S
-    from .flex_endo.flex_ipc import DEFAULT_SPEED_DEG_S, MIN_SPEED_DEG_S
-    from .ur5_rtde_server import DEFAULT_LINEAR_SPEED_MM_S, SERVO_RESYNC_RAD, limit_servo_target
-else:
-    from kinematics import EndoscopeKinematics, rcm_tip_angles
-    from flex_endo.flex_control import FLEX_KEYS, PULL_OUT_RETRACT_SPEED_M_S
-    from flex_endo.flex_ipc import DEFAULT_SPEED_DEG_S, MIN_SPEED_DEG_S
-    from ur5_rtde_server import DEFAULT_LINEAR_SPEED_MM_S, SERVO_RESYNC_RAD, limit_servo_target
+from .flex_endo.flex_control import FLEX_KEYS, PULL_OUT_BEHIND_RCM_M, PULL_OUT_RETRACT_SPEED_M_S
+from .flex_endo.flex_ipc import DEFAULT_SPEED_DEG_S, MIN_SPEED_DEG_S
+from .kinematics import EndoscopeKinematics, rcm_tip_angles
+from .ur5_rtde_server import DEFAULT_LINEAR_SPEED_MM_S, SERVO_RESYNC_RAD, limit_servo_target
 
-# ---------- copy of flex constants ----------
-FLEX_N          = 8
-FLEX_SEG_LEN    = 0.008
-FLEX_ARC_MIN    = 0.030
-FLEX_ARC_MAX    = 0.050
-FLEX_MAX_BEND   = math.pi / 2.0
+# Modeled Flex geometry; physical motor limits live in the native driver.
+FLEX_N = 8
+FLEX_SEG_LEN = 0.008
+FLEX_ARC_MIN = 0.030
+FLEX_ARC_MAX = 0.050
+FLEX_MAX_BEND = math.pi / 2.0
 MIN_RCM_CONE_DEG = 10
 MAX_RCM_CONE_DEG = 30
-FLEX_TENDON_R   = 0.004
-FLEX_TENDONS    = [(0,'R'), (90,'G'), (180,'B'), (270,'Y')]
+FLEX_TENDON_R = 0.004
+FLEX_TENDONS = [(0,'R'), (90,'G'), (180,'B'), (270,'Y')]
 FLEX_STRAIGHT_KAPPA_TOL = 1e-3
 BIRD_EYE_HORIZON_DEG = 30.0
-PULL_OUT_BEHIND_RCM_M = 0.10
 
-TRACK_L_EFF            = FLEX_ARC_MAX - FLEX_SEG_LEN
-TRACK_TIP_TO_FLEX_BASE = 0.59995
-TRACK_W_SCALE          = 1e-6
-TRACK_RECOVER_BEND_DEG = 55.0
-TRACK_RECOVER_DONE_DEG = 50.0
-
-TRACK_TARGETS = [
-    ('LN_No3',  'LN3 Red', (1.00, 0.15, 0.15, 0.96)),
-    ('LN_No4d', 'LN4d Grn', (0.12, 0.92, 0.25, 0.96)),
-    ('LN_No6',  'LN6 Blu', (0.15, 0.48, 1.00, 0.96)),
-    ('LGA_No7', 'LGA7 Dyn', (1.00, 0.86, 0.05, 0.98)),
-]
+FLEX_MAX_EFFECTIVE_LENGTH = FLEX_ARC_MAX - FLEX_SEG_LEN
 
 log = logging.getLogger("ControlNode")
 STATE_TIMEOUT_S = 0.3
@@ -56,23 +38,21 @@ MAX_LINE_BYTES = 4096
 DEFAULT_JOG_SPEED_SCALE = 10
 JOG_SPEED_SCALES = (3, 5, DEFAULT_JOG_SPEED_SCALE, 15)
 
-class ControlNode:
-    """Non-ROS port of Ur5EndoFlexNode."""
 
-    STEP_TICK_HZ        = 125.0          # ★ 与 servo_thread 同步
-    ARM_AXIS_VEL        = 0.025
-    ARM_TILT_VEL_DEG_S  = 4.0
-    FLEX_YAW_VEL        = 1.0
-    FLEX_CURV_VEL       = 10.0
-    FLEX_ARC_VEL        = 0.020
+class ControlNode:
+    """Coordinate arm jogging, RCM procedures, and hardware or modeled Flex."""
+
+    STEP_TICK_HZ = 125.0          # Match the RTDE servo frequency.
+    ARM_TILT_VEL_DEG_S = 4.0
+    FLEX_YAW_VEL = 1.0
+    FLEX_CURV_VEL = 10.0
+    FLEX_ARC_VEL = 0.020
     RCM_CONE_HALF_ANGLE = math.radians(MIN_RCM_CONE_DEG)
-    TELEOP_RESYNC_RAD   = SERVO_RESYNC_RAD
+    TELEOP_RESYNC_RAD = SERVO_RESYNC_RAD
 
     def __init__(self, relay_host, relay_port, urdf_path,
                  rcm_point_local=(0,0,-0.30),
                  tip_local=(0,0,0.20195),
-                 standoff_m=0.105,
-                 flex_state_callback=None,
                  jog_speed_scale=DEFAULT_JOG_SPEED_SCALE, flex=None):
         if jog_speed_scale not in JOG_SPEED_SCALES:
             choices = ", ".join(map(str, JOG_SPEED_SCALES))
@@ -80,10 +60,8 @@ class ControlNode:
         self.dt = 1.0 / self.STEP_TICK_HZ
         self.jog_speed_scale = jog_speed_scale
         self.arm_linear_speed_m_s = DEFAULT_LINEAR_SPEED_MM_S / 1000.
-        self.relay_host  = relay_host
-        self.relay_port  = relay_port
-        self.standoff    = standoff_m
-        self.flex_state_callback = flex_state_callback
+        self.relay_host = relay_host
+        self.relay_port = relay_port
         self.flex = flex
         self.flex_stop_delivered = False
 
@@ -105,46 +83,35 @@ class ControlNode:
         self.control_lock = threading.RLock()
         self._lock = threading.RLock()
         self.joint_positions = np.zeros(6)
-        self.joint_received  = False
+        self.joint_received = False
         self._last_joint_at = float("-inf")
         self._motion_fault = None
         self._arm_moving = None
 
-        self.rcm_enabled      = False
-        self.rcm_world_point  = None
-        self.rcm_ref_axis     = None
-        self.rcm_ref_depth    = None
-        self.arm_mode         = 'linear'
+        self.rcm_enabled = False
+        self.rcm_world_point = None
+        self.rcm_ref_axis = None
+        self.rcm_ref_depth = None
+        self.arm_mode = 'linear'
         self.rcm_cone_half_angle = self.RCM_CONE_HALF_ANGLE
 
-        self._q_cmd       = None
-        self._teleop_servo_active = False       # ★ 位置伺服活跃标记
+        self._q_cmd = None
+        self._teleop_servo_active = False       # Whether servo targets are being sent.
         self._servo_sent_this_tick = False
 
         self.flex_steer_yaw = 0.0
-        self.flex_base_yaw  = 0.0
-        self.flex_ext_yaw   = 0.0
-        self.flex_arc_len   = FLEX_ARC_MAX
+        self.flex_base_yaw = 0.0
+        self.flex_ext_yaw = 0.0
+        self.flex_arc_len = FLEX_ARC_MAX
         self.flex_curvature = 0.0
         self.flex_max_bend = FLEX_MAX_BEND
         self.flex_model_speed_deg_s = DEFAULT_SPEED_DEG_S
         self._model_bend = np.zeros(2)
         self._last_model_update = time.monotonic()
 
-        self._pull_out_state  = None
-        self._modeled_pull_out_clearance = PULL_OUT_BEHIND_RCM_M
+        self._pull_out_state = None
         self._flex_slew_target = None
         self._model_horizon_paused = False
-
-        self._track_target      = None
-        self._targets_state     = {}
-        self._track_warned      = False
-        self._track_locked      = False
-        self._track_dist_m      = None
-        self._track_aim_deg     = None
-        self._track_zone        = None
-        self._track_recover     = False
-        self._track_status_msg  = None
 
         self._key_state = {
             'arm_up':False,'arm_down':False,'arm_left':False,'arm_right':False,
@@ -155,14 +122,17 @@ class ControlNode:
         self._key_updated = {}
 
         # --- TCP ---
-        self._sock         = None
-        self._send_lock    = threading.Lock()
-        self._recv_thread  = None
+        self._sock = None
+        self._send_lock = threading.Lock()
+        self._recv_thread = None
         self._interrupt_id = 0
         self._interrupt_result = None
-        self._tick_thread  = None
-        self._running      = threading.Event()
-        self._shutdown     = threading.Event()
+        self._tick_thread = None
+        self._running = threading.Event()
+        self._shutdown = threading.Event()
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_at = time.monotonic()
+        self._snapshot = self.get_state_dict()
 
     # ---------------- TCP plumbing ----------------
     def _connect(self):
@@ -275,6 +245,8 @@ class ControlNode:
         if self._running.is_set():
             return
         self._shutdown.clear()
+        if self.flex is not None:
+            self.flex.client.start()
         self._running.set()
         self._recv_thread = threading.Thread(target=self._connect, daemon=True,
                                              name="tcp-recv")
@@ -307,11 +279,8 @@ class ControlNode:
         while self._running.is_set():
             now = time.monotonic()
             if now < next_t:
-                sleep_t = next_t - now
-                if sleep_t > 0.002:
-                    time.sleep(sleep_t - 0.001)
-                while time.monotonic() < next_t:
-                    pass
+                if self._shutdown.wait(next_t - now):
+                    break
             next_t += self.dt
             if next_t < time.monotonic():
                 next_t = time.monotonic()
@@ -319,6 +288,11 @@ class ControlNode:
                 with self.control_lock:
                     if self._running.is_set():
                         self._tick()
+                        if time.monotonic() - self._snapshot_at >= 0.05:
+                            snapshot = self.get_state_dict()
+                            with self._snapshot_lock:
+                                self._snapshot = snapshot
+                                self._snapshot_at = time.monotonic()
             except Exception as e:
                 log.exception(f"tick error: {e}")
                 with self.control_lock:
@@ -332,8 +306,7 @@ class ControlNode:
         with self._lock:
             fault = self._motion_fault
         if fault and (self._teleop_servo_active or self._pull_out_state is not None
-                      or self._track_target is not None or
-                      (self.flex is not None and (self.flex.procedure or self.flex.tracking))):
+                      or (self.flex is not None and (self.flex.procedure or self.flex.tracking))):
             self.cmd_stop()
         now = time.monotonic()
         for key, updated_at in list(self._key_updated.items()):
@@ -346,38 +319,33 @@ class ControlNode:
         with self._lock:
             pull_out_active = self._pull_out_state is not None
             if pull_out_active and any_manual_key:
-                self._pull_out_state = None; self._flex_slew_target = None
+                self._pull_out_state = None
+                self._flex_slew_target = None
                 pull_out_active = False
                 log.info("PULL OUT cancelled by manual key input.")
-            tracking_active = self._track_target is not None
-            if tracking_active and any_manual_key:
-                self._clear_track_state_unlocked(); self._flex_slew_target = None
-                tracking_active = False
-                log.info("TRACKING cancelled by manual key input.")
             if any_manual_key and self._flex_slew_target is not None:
                 self._flex_slew_target = None
                 log.info("FLEX slew cancelled by manual key input.")
-            if tracking_active and self._flex_slew_target is not None:
-                self._flex_slew_target = None
 
         servo_was_active = self._teleop_servo_active
         self._servo_sent_this_tick = False
         try:
             if self.flex is None or not self.flex.tick(self):
-                self._step_controls(ks, pull_out_active, tracking_active)
+                self._step_controls(ks, pull_out_active)
         finally:
             if servo_was_active and not self._servo_sent_this_tick:
                 self._send_servo_stop()
 
-    def _step_controls(self, ks, pull_out_active, tracking_active):
+    def _step_controls(self, ks, pull_out_active):
         self._step_flex_slew()
 
         if pull_out_active:
-            self._step_pull_out(); self._update_flex_state(); return
-        if tracking_active:
-            self._step_hybrid_rcm_tracking(); self._update_flex_state(); return
+            self._step_pull_out()
+            self._update_flex_state()
+            return
 
-        with self._lock: mode = self.arm_mode
+        with self._lock:
+            mode = self.arm_mode
 
         vertical = ks['arm_up'] - ks['arm_down']
         horizontal = ks['arm_right'] - ks['arm_left']
@@ -437,7 +405,8 @@ class ControlNode:
     def _step_flex_slew(self):
         with self._lock:
             tgt = self._flex_slew_target
-            if tgt is None: return
+            if tgt is None:
+                return
             a = self.flex_arc_len
             a_t = min(max(FLEX_ARC_MIN, tgt['arc_len']), FLEX_ARC_MAX)
             step_a = self.FLEX_ARC_VEL*self.dt
@@ -469,7 +438,9 @@ class ControlNode:
                 by, ey = self.kin.solve_horizon_flex_yaw(
                     q=self.joint_positions, steer_yaw=self.flex_steer_yaw,
                     theta_total=theta_total)
-                self.flex_base_yaw = float(by); self.flex_ext_yaw = float(ey); return
+                self.flex_base_yaw = float(by)
+                self.flex_ext_yaw = float(ey)
+                return
             except Exception as e:
                 log.warning(f"auto horizon twist failed: {e}")
         self.flex_base_yaw = float(self.flex_steer_yaw)
@@ -483,19 +454,6 @@ class ControlNode:
                 theta_total = self._limit_model_flex_step(theta_total, eff)
             else:
                 self._update_auto_horizon_twist_unlocked(theta_total)
-            flex_snapshot = {
-                'base_yaw':  float(self.flex_base_yaw),
-                'ext_yaw':   float(self.flex_ext_yaw),
-                'arc_len':   float(self.flex_arc_len),
-                'curvature': float(self.flex_curvature),
-                'theta_total': float(theta_total),
-                'theta_seg':   float(theta_total / (FLEX_N - 1)),
-                'd_seg':       float(eff / (FLEX_N - 1)),
-                'steer_yaw':   float(self.flex_steer_yaw),
-            }
-        if self.flex_state_callback is not None:
-            try: self.flex_state_callback(flex_snapshot)
-            except Exception as e: log.warning(f"flex_state_callback raised: {e}")
 
     def _limit_model_flex_step(self, theta, length):
         now = time.monotonic()
@@ -531,7 +489,7 @@ class ControlNode:
     def set_model_flex_speed(self, speed):
         if type(speed) not in (int, float) or not math.isfinite(speed) or speed < MIN_SPEED_DEG_S:
             raise ValueError("Enter a Flex speed of at least 0.1°/s.")
-        if self._flex_slew_target or self._track_target or self._pull_out_state or any(self._key_state.values()):
+        if self._flex_slew_target or self._pull_out_state or any(self._key_state.values()):
             raise ValueError("Wait for modeled Flex motion to stop before changing speed.")
         self.flex_model_speed_deg_s = speed
         return True
@@ -541,7 +499,7 @@ class ControlNode:
         angle = math.radians(degrees)
         with self._lock:
             if (not self._arm_ready() or self._arm_moving is not False or self._teleop_servo_active
-                    or any(self._key_state.values()) or self._track_target or self._pull_out_state
+                    or any(self._key_state.values()) or self._pull_out_state
                     or (self.flex and (self.flex.tracking or self.flex.procedure))):
                 raise ValueError("Wait for the arm to be stationary and release the controls before changing its limit.")
             if self.rcm_enabled:
@@ -556,10 +514,10 @@ class ControlNode:
     def set_model_bend_limit(self, degrees, *, speed=None):
         angle = math.radians(degrees)
         with self._lock:
-            if (any(self._key_state.values()) or self._track_target or self._pull_out_state
+            if (any(self._key_state.values()) or self._pull_out_state
                     or self._flex_slew_target is not None):
                 raise ValueError("Wait for modeled Flex motion to stop before changing its limit.")
-            bend = self.flex_curvature * max(self.flex_arc_len - FLEX_SEG_LEN, TRACK_L_EFF)
+            bend = self.flex_curvature * max(self.flex_arc_len - FLEX_SEG_LEN, FLEX_MAX_EFFECTIVE_LENGTH)
             if bend > angle + 1e-10:
                 raise ValueError("Bring Flex inside the requested bend limit first.")
             if speed is not None:
@@ -578,7 +536,6 @@ class ControlNode:
             self._pull_out_state = None
             self._flex_slew_target = None
             self._q_cmd = None
-            tracking_was = self._track_target is not None
             if self.arm_mode == 'linear':
                 self.arm_mode = 'rcm'
                 self._capture_rcm_unlocked()
@@ -590,9 +547,6 @@ class ControlNode:
                 self.rcm_ref_axis = None
                 self.rcm_ref_depth = None
                 log.info("Arm mode -> linear")
-                if tracking_was:
-                    self._clear_track_state_unlocked()
-                    log.warning("TRACKING auto-cancelled (RCM off)")
         return True
 
     def stop_camera_tracking(self):
@@ -603,7 +557,8 @@ class ControlNode:
 
     def _capture_rcm_unlocked(self):
         if not (self.kin.ready and self.joint_received):
-            self.rcm_enabled = False; return
+            self.rcm_enabled = False
+            return
         q = self.joint_positions.copy()
         axis, p_rcm, p_tip = self.kin.tube_axis_in_base(q)
         self.rcm_world_point = p_rcm
@@ -617,7 +572,8 @@ class ControlNode:
             raise ValueError("RESET requires fresh UR5 joint feedback and a ready arm.")
         target = np.deg2rad([0., -120., -120., -30., 90., 45.])
         with self._lock:
-            self._cancel_motion()
+            coordinated = self.flex is not None and (self.flex.tracking or self.flex.procedure)
+            self._cancel_motion(include_flex=bool(coordinated))
             self.arm_mode = 'linear'
             self.rcm_enabled = False
             self.rcm_world_point = None
@@ -647,21 +603,8 @@ class ControlNode:
         return True
 
     @property
-    def pull_out_clearance_m(self):
-        return self._modeled_pull_out_clearance if self.flex is None else self.flex.pull_out_clearance
-
-    @property
     def pull_out_active(self):
         return self._pull_out_state is not None or (self.flex is not None and self.flex.procedure is not None)
-
-    def set_pull_out_clearance(self, clearance_m):
-        if self.pull_out_active:
-            raise ValueError("Wait for Pull Out to finish before adjusting the clearance.")
-        if self.flex is None:
-            self._modeled_pull_out_clearance = clearance_m
-        else:
-            self.flex.pull_out_clearance = clearance_m
-        return True
 
     def cmd_pull_out(self):
         if self.flex is not None:
@@ -669,11 +612,10 @@ class ControlNode:
         if not self._arm_ready():
             return False
         with self._lock:
-            rcm_on   = (self.arm_mode == 'rcm' and self.rcm_enabled)
-            rcm_pt   = None if self.rcm_world_point is None else self.rcm_world_point.copy()
+            rcm_on = (self.arm_mode == 'rcm' and self.rcm_enabled)
+            rcm_pt = None if self.rcm_world_point is None else self.rcm_world_point.copy()
             ref_axis = None if self.rcm_ref_axis is None else self.rcm_ref_axis.copy()
-            q_now    = self.joint_positions.copy()
-            self._clear_track_state_unlocked()
+            q_now = self.joint_positions.copy()
         if not (rcm_on and rcm_pt is not None and ref_axis is not None):
             log.warning("PULL OUT requires RCM mode")
             return False
@@ -684,28 +626,33 @@ class ControlNode:
             log.warning(f"PULL OUT FK failed: {e}")
             return False
         d_tip = float(np.linalg.norm(p_tip_cur - rcm_pt))
-        if d_tip < 0.05: d_tip = float(self.kin.tube_length)
+        if d_tip < 0.05:
+            d_tip = float(self.kin.tube_length)
         tip_from_end = float(np.linalg.norm(p_tip_cur - p_end_cur))
         with self._lock:
             self._set_flex_slew_target(curvature=0., steer_yaw=0.)
             self._pull_out_state = {
                 'stage':'align','axis_cmd': axis_cur.copy(),
                 'd_tip_align': d_tip,'tip_from_end': tip_from_end,
-                'end': self.pull_out_clearance_m,
+                'end': PULL_OUT_BEHIND_RCM_M,
                 's_end_cmd': None,'waiting_logged': False}
         self._update_flex_state()
         log.info("PULL OUT started (align stage)")
         return True
 
     def _step_pull_out(self):
-        if not self._arm_ready(): return
+        if not self._arm_ready():
+            return
         with self._lock:
             st = self._pull_out_state
-            if st is None: return
+            if st is None:
+                return
             if not (self.arm_mode == 'rcm' and self.rcm_enabled
                     and self.rcm_world_point is not None
                     and self.rcm_ref_axis is not None):
-                self._pull_out_state = None; self._flex_slew_target = None; return
+                self._pull_out_state = None
+                self._flex_slew_target = None
+                return
             rcm_pt = self.rcm_world_point.copy()
             ref_axis = self.rcm_ref_axis.copy()
             q_now = self.joint_positions.copy()
@@ -715,7 +662,9 @@ class ControlNode:
             p_end_cur = self.kin.end_cylinder_in_base(q_now)
         except Exception as e:
             log.warning(f"PULL OUT FK: {e}")
-            with self._lock: self._pull_out_state = None; self._flex_slew_target = None
+            with self._lock:
+                self._pull_out_state = None
+                self._flex_slew_target = None
             return
 
         if st['stage'] == 'align':
@@ -726,7 +675,8 @@ class ControlNode:
             if err_cmd <= step or err_cmd < 1e-3:
                 axis_next = ref_axis.copy()
             else:
-                rk = np.cross(axis_cmd, ref_axis); kn = float(np.linalg.norm(rk))
+                rk = np.cross(axis_cmd, ref_axis)
+                kn = float(np.linalg.norm(rk))
                 axis_next = (ref_axis.copy() if kn < 1e-9
                              else self.kin.rotate_about(axis_cmd, rk/kn, step))
                 axis_next /= max(float(np.linalg.norm(axis_next)), 1e-9)
@@ -739,7 +689,8 @@ class ControlNode:
 
             err_actual = math.degrees(math.acos(float(np.clip(np.dot(axis_cur, ref_axis), -1., 1.))))
             aligned = (np.allclose(axis_next, ref_axis, atol=1e-3) and err_actual < 1.0)
-            if not aligned: return
+            if not aligned:
+                return
             if not self._flex_is_straight():
                 if not st.get('waiting_logged', False):
                     log.info("PULL OUT aligned; waiting for flex straight")
@@ -747,7 +698,8 @@ class ControlNode:
                 return
             st['waiting_logged'] = False
             s_end_cur = float(np.dot(p_end_cur - rcm_pt, ref_axis))
-            st['stage'] = 'retract'; st['s_end_cmd'] = s_end_cur
+            st['stage'] = 'retract'
+            st['s_end_cmd'] = s_end_cur
             log.info(f"PULL OUT align done (err={err_actual:.2f}°); retracting")
             return
 
@@ -755,7 +707,8 @@ class ControlNode:
             s_end_cur = float(np.dot(p_end_cur - rcm_pt, ref_axis))
             if s_end_cur >= st['end'] - 0.003:
                 with self._lock:
-                    self._pull_out_state = None; self._flex_slew_target = None
+                    self._pull_out_state = None
+                    self._flex_slew_target = None
                 log.info(f"PULL OUT complete ({s_end_cur*100:.1f} cm behind RCM)")
                 return
             if st['s_end_cmd'] is None: st['s_end_cmd'] = s_end_cur
@@ -768,15 +721,16 @@ class ControlNode:
                 q_t = self._auto_solve_wrist1(q_t)
                 self._send_servo(q_t, q_now, self.dt, validate=self._rcm_pose_is_valid)
 
-    def _cancel_motion(self):
-        if self.flex is not None:
+    def _cancel_motion(self, *, include_flex=True):
+        if include_flex and self.flex is not None:
             self.flex_stop_delivered = self.flex.stop()
-        self._key_updated.clear()
         for key in self._key_state:
-            self._key_state[key] = False
+            if include_flex or key.startswith('arm_'):
+                self._key_state[key] = False
+                self._key_updated.pop(key, None)
         self._pull_out_state = None
-        self._flex_slew_target = None
-        self._clear_track_state_unlocked()
+        if include_flex:
+            self._flex_slew_target = None
         self._teleop_servo_active = False
         self._q_cmd = None
 
@@ -807,215 +761,6 @@ class ControlNode:
     def cancel_motion(self):
         with self._lock:
             self._cancel_motion()
-
-    # ---------- tracking ----------
-    def _clear_track_state_unlocked(self):
-        self._track_target = None; self._track_zone = None; self._track_warned = False
-        self._track_locked = False; self._track_recover = False
-        self._track_dist_m = None;  self._track_aim_deg = None
-        self._track_status_msg = None
-
-    def set_targets(self, targets_dict):
-        valid_keys = {key for key, _, _ in TRACK_TARGETS}
-        targets = {}
-        for key, value in targets_dict.items():
-            if key not in valid_keys:
-                raise ValueError(f"Unknown tracking target {key}")
-            if not isinstance(value, list) or len(value) != 3:
-                raise ValueError(f"{key} needs three coordinates")
-            try:
-                valid = all(type(v) in (int, float) and math.isfinite(v) for v in value)
-            except OverflowError:
-                valid = False
-            if not valid:
-                raise ValueError(f"{key} coordinates must be finite numbers")
-            targets[key] = np.array(value, float)
-        with self._lock:
-            self._targets_state.update(targets)
-
-    def start_tracking(self, key):
-        if self.flex is not None:
-            return False
-        if not isinstance(key, str) or key not in {k for k, _, _ in TRACK_TARGETS}:
-            return False
-        if not self._arm_ready():
-            return False
-        refusal = None; recovering = False; start_theta = 0.0
-        with self._lock:
-            rcm_ok = (self.arm_mode == 'rcm' and self.rcm_enabled
-                      and self.rcm_world_point is not None)
-            if not rcm_ok:
-                refusal = 'requires RCM mode'
-                self._track_status_msg = refusal
-            else:
-                self._pull_out_state = None; self._flex_slew_target = None
-                self._clear_track_state_unlocked()
-                self._track_target = key
-                self._model_horizon_paused = False
-                start_theta = math.degrees(min(self.flex_max_bend, TRACK_L_EFF*self.flex_curvature))
-                self._track_recover = start_theta > TRACK_RECOVER_BEND_DEG
-                recovering = self._track_recover
-        if refusal:
-            log.warning(f"TRACKING refused for {key}: {refusal}")
-            return False
-        if recovering:
-            log.info(f"TRACKING recovery: bend {start_theta:.1f}° > "
-                     f"{TRACK_RECOVER_BEND_DEG:.0f}°")
-        log.info(f"TRACKING started: {key}")
-        return True
-
-    def stop_tracking(self):
-        with self._lock:
-            if self._track_target is None: return
-            self._clear_track_state_unlocked()
-        log.info("TRACKING stopped")
-
-    @staticmethod
-    def _wdls_solve(J, e, w_rel):
-        W = TRACK_W_SCALE * np.diag(np.asarray(w_rel, float))
-        A = J.T@J + W
-        try: return np.linalg.solve(A, J.T@e)
-        except Exception: return None
-
-    def _step_hybrid_rcm_tracking(self):
-        if not self._arm_ready(): return
-        with self._lock:
-            key = self._track_target
-            if key is None: return
-            p_target = None if key not in self._targets_state else self._targets_state[key].copy()
-            arm_mode = self.arm_mode; rcm_on = self.rcm_enabled
-            rcm_pt = None if self.rcm_world_point is None else self.rcm_world_point.copy()
-            ref_axis = None if self.rcm_ref_axis is None else self.rcm_ref_axis.copy()
-            q_now = self.joint_positions.copy()
-            kappa = float(self.flex_curvature)
-            steer_yaw = float(self.flex_steer_yaw)
-            arc_len = float(self.flex_arc_len)
-            standoff = float(self.standoff)
-            already_warned = self._track_warned
-            recovering = bool(self._track_recover)
-            if p_target is None and not already_warned: self._track_warned = True
-        if not (arm_mode == 'rcm' and rcm_on and rcm_pt is not None and ref_axis is not None):
-            with self._lock: self._clear_track_state_unlocked()
-            log.warning("TRACKING auto-cancelled (RCM gone)"); return
-        if p_target is None:
-            if not already_warned: log.warning(f"TRACKING waiting for target '{key}'")
-            return
-
-        try:
-            R_shaft, _ = self.kin.fk_matrix(q_now)
-            _, _, p_tip = self.kin.tube_axis_in_base(q_now)
-            d_ins = float(np.linalg.norm(p_tip - rcm_pt))
-            p_cam, v_hat = self.kin.camera_pose_on_shaft(
-                rcm_pt, R_shaft, d_ins, kappa, steer_yaw,
-                arc_len=arc_len,
-                tip_to_flex_base=TRACK_TIP_TO_FLEX_BASE)
-        except Exception as e:
-            log.warning(f"TRACKING FK: {e}"); return
-
-        p_aim = p_cam + standoff*v_hat
-        e_vec = p_target - p_aim
-        err_norm = float(np.linalg.norm(e_vec))
-        aim_vec = p_target - p_cam
-        aim_norm = float(np.linalg.norm(aim_vec))
-        aim_deg = (math.degrees(math.acos(float(np.clip(
-            np.dot(v_hat, aim_vec/aim_norm), -1., 1.)))) if aim_norm > 1e-9 else 0.0)
-        dist_m = float(np.linalg.norm(p_cam - p_target))
-
-        theta_total = min(self.flex_max_bend, TRACK_L_EFF*kappa)
-        theta_deg = math.degrees(theta_total)
-        if recovering and theta_deg <= TRACK_RECOVER_DONE_DEG:
-            with self._lock: self._track_recover = False
-            recovering = False
-            log.info(f"TRACKING recovery done at {theta_deg:.1f}°")
-        if theta_deg <= 50.0:
-            zone = 1; w_rel = np.array([1.,1.,1e6,1e6,1.])
-        elif theta_deg < 80.0:
-            zone = 2; s = (theta_deg-50.0)/30.0
-            wf = 1.0 + 20.0*s*s; wt = 1.0 + (1e6-1.0)*(1.0-s)**2
-            w_rel = np.array([wf,wf,wt,wt,1.])
-        else:
-            zone = 3; w_rel = np.array([1.,1.,1.,1.,1.])
-
-        max_dk = self.FLEX_CURV_VEL*self.dt
-        max_dpsi = self.FLEX_YAW_VEL*self.dt
-        max_dtilt = min(math.radians(self.ARM_TILT_VEL_DEG_S),
-                       self.arm_linear_speed_m_s / max(d_ins, 1e-6)) * self.dt
-        max_dins = min(self.ARM_AXIS_VEL, self.arm_linear_speed_m_s) * self.dt
-
-        if recovering:
-            d_kappa = -max_dk; d_psi = 0.; d_tilt = 0.; d_yaw = 0.; d_ins_step = 0.
-        else:
-            if err_norm < 1e-12:
-                du = np.zeros(5)
-            else:
-                try:
-                    J = self.kin.hybrid_rcm_jacobian(
-                        rcm_pt, R_shaft, d_ins, kappa, steer_yaw, standoff,
-                        arc_len=arc_len,
-                        tip_to_flex_base=TRACK_TIP_TO_FLEX_BASE)
-                except Exception as e:
-                    log.warning(f"TRACKING jacobian: {e}"); return
-                du = self._wdls_solve(J, e_vec, w_rel)
-                if du is None:
-                    log.warning("TRACKING singular"); return
-                if zone == 3:
-                    kx0 = kappa*math.cos(steer_yaw); ky0 = kappa*math.sin(steer_yaw)
-                    if math.hypot(kx0+du[0], ky0+du[1]) > kappa + 1e-12:
-                        w_lock = w_rel.copy(); w_lock[0]=1e4; w_lock[1]=1e4
-                        du_lock = self._wdls_solve(J, e_vec, w_lock)
-                        if du_lock is not None: du = du_lock
-                if theta_total > math.radians(55.0) and kappa > 1e-9:
-                    Jp = np.linalg.pinv(J); Nn = np.eye(5) - Jp@J
-                    g = np.zeros(5)
-                    gf = -TRACK_L_EFF*(theta_total - math.radians(45.0))
-                    g[0] = gf*math.cos(steer_yaw); g[1] = gf*math.sin(steer_yaw)
-                    du = du - 0.1*(Nn@g)
-
-            kx0 = kappa*math.cos(steer_yaw); ky0 = kappa*math.sin(steer_yaw)
-            ku = math.hypot(kx0+du[0], ky0+du[1])
-            psi_u = (math.atan2(ky0+du[1], kx0+du[0]) if ku > 1e-12 else steer_yaw)
-            d_kappa = float(np.clip(ku-kappa, -max_dk, max_dk))
-            d_psi = float(np.clip(((psi_u-steer_yaw+math.pi) % (2*math.pi))-math.pi,
-                                  -max_dpsi, max_dpsi))
-            d_tilt = float(np.clip(du[2], -max_dtilt, max_dtilt))
-            d_yaw  = float(np.clip(du[3], -max_dtilt, max_dtilt))
-            d_ins_step = float(np.clip(du[4], -max_dins, max_dins))
-
-        kappa_new = float(np.clip(kappa+d_kappa, 0., self.flex_max_bend/TRACK_L_EFF))
-        psi_new = (steer_yaw if kappa_new < 1e-6
-                   else ((steer_yaw+d_psi+math.pi) % (2*math.pi))-math.pi)
-
-        R_shaft_new = self.kin.rotate_shaft_frame(R_shaft, d_tilt=d_tilt, d_yaw=d_yaw)
-        u_new = R_shaft_new[:,2]
-        cone_deg = math.degrees(math.acos(float(np.clip(np.dot(u_new, ref_axis), -1., 1.))))
-        if cone_deg > math.degrees(self.rcm_cone_half_angle):
-            if abs(d_tilt)+abs(d_yaw) > 1e-12:
-                log.warning(f"TRACKING RCM cone {cone_deg:.1f}°; arm frozen")
-            d_tilt = 0.; d_yaw = 0.; u_new = R_shaft[:,2].copy()
-
-        with self._lock:
-            self.flex_curvature = kappa_new
-            if kappa_new >= 1e-6: self.flex_steer_yaw = float(psi_new)
-
-        if abs(d_tilt)+abs(d_yaw)+abs(d_ins_step) > 1e-9:
-            d_new = d_ins + d_ins_step
-            p_tip_t = rcm_pt + d_new*u_new
-            q_t = self.kin.ik_with_rcm(p_tip_t, rcm_pt, q_now)
-            if q_t is not None:
-                q_t = self._auto_solve_wrist1(q_t)
-                self._send_servo(q_t, q_now, self.dt, validate=self._rcm_pose_is_valid)
-            else:
-                log.warning("TRACKING IK failed; flex only this tick")
-
-        locked = (not recovering and aim_deg < 0.5
-                  and abs(dist_m - standoff) < 0.0015)
-        with self._lock:
-            self._track_dist_m = dist_m; self._track_aim_deg = aim_deg
-            self._track_zone = zone
-            newly = locked and not self._track_locked
-            if locked: self._track_locked = True
-        if newly:
-            log.info(f"TRACKING locked on {key}: d={dist_m*100:.1f}cm aim={aim_deg:.2f}°")
 
     # ---------- transport ----------
     def _rcm_constraint(self):
@@ -1118,6 +863,13 @@ class ControlNode:
                 self._key_updated[key] = now
 
     # ---------- state snapshot ----------
+    def get_state_snapshot(self):
+        """HTTP readers never wait for motion planning or device communication."""
+        with self._snapshot_lock:
+            if self._running.is_set() and time.monotonic() - self._snapshot_at > STATE_TIMEOUT_S:
+                raise TimeoutError("Control state is stale; waiting for the coordinator.")
+            return dict(self._snapshot)
+
     def get_state_dict(self):
         with self._lock:
             fresh = self._joint_state_fresh()
@@ -1142,7 +894,6 @@ class ControlNode:
                 'rcm_tip_angles': tip_angles,
                 'rcm_outside_cone': rcm_outside,
                 'rcm_insertion_m': rcm_insertion_m,
-                'pull_out_clearance_m': self.pull_out_clearance_m,
                 'pull_out_active': self.pull_out_active,
                 'joints_deg': (np.rad2deg(q).tolist() if q is not None else None),
                 'flex_base_yaw': math.degrees(self.flex_base_yaw),
@@ -1154,13 +905,6 @@ class ControlNode:
                 'flex_model_bend_limit': round(math.degrees(self.flex_max_bend)),
                 'flex_model_bend_max_deg': round(math.degrees(FLEX_MAX_BEND)),
                 'flex_model_speed_deg_s': self.flex_model_speed_deg_s,
-                'tracking': self._track_target,
-                'tracking_dist_m':  self._track_dist_m,
-                'tracking_aim_deg': self._track_aim_deg,
-                'tracking_zone':    self._track_zone,
-                'tracking_recovering': self._track_recover,
-                'tracking_locked':     self._track_locked,
-                'tracking_refusal':    self._track_status_msg,
                 'relay_connected':     self._sock is not None,
                 'joints_received':     fresh,
                 'arm_moving':          self._arm_moving if fresh else None,

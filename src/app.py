@@ -7,9 +7,9 @@ Usage:
     python src/app.py --robot-ip 192.168.1.10
 """
 import argparse
-import math
 import json
 import logging
+import math
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -36,6 +36,12 @@ log = logging.getLogger("WindowsApp")
 DASHBOARD_CONFIRM_TIMEOUT_S = 10.0
 FLEX_STOP_CONFIRM_TIMEOUT_S = 1.0
 ARM_INTERRUPT_CONFIRM_TIMEOUT_S = 2.0
+STATIC_DIR = Path(__file__).with_name("static")
+STATIC_ROUTES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
+    "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
+}
 
 
 def angle_limit(body, minimum, maximum, name):
@@ -44,17 +50,6 @@ def angle_limit(body, minimum, maximum, name):
         raise ValueError(f'{name} must be a whole number from {minimum}° to {maximum}°.')
     return int(degrees)
 
-
-def parse_pull_out_clearance(body):
-    value = body.get('clearance_mm')
-    if type(value) in (int, float):
-        try:
-            clearance = value / 1000.0
-            if math.isfinite(clearance) and clearance >= 0:
-                return clearance
-        except OverflowError:
-            pass
-    raise ValueError('Pull Out clearance must be a finite nonnegative distance in millimetres.')
 
 
 def parse_flex_speed_limit(body):
@@ -67,866 +62,6 @@ def parse_flex_speed_limit(body):
             pass
     raise ValueError('Enter a finite FlexEndo speed of at least 0.1°/s.')
 
-HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CRF Control</title>
-<style>
-:root{color-scheme:dark;--bg:#11131c;--card:#1d2130;--edge:#30374a;--fg:#f1f2f6;--dim:#a9b4c8;--hi:#ffbe78;--ok:#6fdf9e;--bad:#ff8585}
-*{box-sizing:border-box}
-html,body{margin:0;overflow:hidden}
-body{height:100dvh;padding:14px;font-family:system-ui,Arial,sans-serif;background:var(--bg);color:var(--fg)}
-.workspace{display:grid;height:100%;gap:14px;grid-template-areas:"controls camera categories";
-  grid-template-columns:minmax(0,1fr) minmax(0,2fr) minmax(0,1fr);
-  grid-template-rows:minmax(0,1fr)}
-.panel{min-width:0;min-height:0}
-.robot-panel,.category-panel{display:grid;grid-template-rows:auto minmax(0,1fr)}
-.robot-panel{grid-area:controls}
-.category-panel{grid-area:categories}
-.panel-scroll{overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
-.panel-scroll>.card:last-child{margin-bottom:0}
-.camera-panel{grid-area:camera;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:8px}
-.camera-panel h2{margin-bottom:0}
-h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
-.card{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:12px;margin-bottom:10px}
-.card h3{margin:0 0 8px;font-size:13px;color:var(--hi);font-weight:650}
-.actions{display:flex;gap:6px;flex-wrap:wrap}
-.primary-actions{position:sticky;top:0;z-index:1;display:grid;grid-template-columns:minmax(0,1fr) auto;
-  align-items:start;gap:6px;padding:8px}
-.primary-actions button{padding-inline:6px;white-space:nowrap}
-.stop-actions{justify-content:flex-end;min-width:0}
-#pull-out-distance-form,#confirm-pull-out{grid-column:1/-1;justify-self:start}
-#pull-out-distance-form{flex-wrap:wrap}
-#pull-out-distance{width:85px}
-.control-settings{margin-top:8px;align-items:center}
-.device-actions{margin-inline-start:auto;justify-content:flex-end}
-.limit-editor{display:flex;align-items:center;gap:5px;min-width:0}
-.limit-editor label{color:var(--dim);font-size:11px}
-.limit-editor input,.limit-editor select{padding:6px;border:1px solid var(--edge);border-radius:5px;
-  background:var(--bg);color:var(--fg);font:12px ui-monospace,Consolas,monospace}
-.limit-editor input{width:50px;padding-right:3px}
-.limit-editor select{min-width:0}
-.device-limits{flex:1 1 auto}
-.device-limits input{width:45px}
-.device-limits button{margin-inline-start:auto}
-.limit-editor input:disabled,.limit-editor select:disabled{opacity:.45}
-.limit-editor button{padding-inline:6px}
-[hidden]{display:none!important}
-button{background:#33415d;color:#fff;border:1px solid transparent;border-radius:6px;padding:8px 10px;cursor:pointer;font:600 12px system-ui,sans-serif}
-button:hover{background:#435779}
-button:focus-visible{outline:2px solid var(--hi);outline-offset:2px}
-button:disabled{cursor:default;opacity:.45}
-button.estop{background:#a42c3a}button.estop:hover{background:#c53445}
-button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
-.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 12px;margin:0;font:12px ui-monospace,Consolas,monospace}
-.grid>div{display:flex;justify-content:space-between;gap:4px;min-width:0}
-.grid dt{color:var(--dim)}
-.grid dd{margin:0;text-align:right;white-space:nowrap}
-.flex-readings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
-.flex-readings .grid{grid-template-columns:minmax(0,1fr)}
-.flex-readings .tendon-readings{padding-left:9px;border-left:1px solid var(--edge)}
-.reading-label{margin:0 0 5px;color:var(--dim);font-size:11px}
-.unavailable,.motion-plot[data-available="false"]{color:var(--dim);opacity:.55}
-.control-title{margin-top:12px!important}
-.command-grid{display:grid;gap:5px;grid-template-columns:minmax(45px,1.25fr) repeat(3,minmax(24px,1fr)) minmax(46px,1.25fr);
-  grid-template-areas:"mode left up right forward" "mode left down right backward";
-  grid-template-rows:repeat(2,minmax(32px,auto))}
-.command-grid button{padding:4px;min-width:0}
-#flex-hardware-controls,#flex-model-controls{grid-template-columns:repeat(4,minmax(0,1fr));
-  grid-template-areas:"left up right forward" "left down right backward"}
-.command-grid [data-key]{touch-action:none}
-.command-grid .direction{font-size:15px}
-.control-mode{grid-area:mode}
-.control-left{grid-area:left}.control-up{grid-area:up}.control-down{grid-area:down}.control-right{grid-area:right}
-.control-forward{grid-area:forward}.control-backward{grid-area:backward}
-.status{font:12px/1.45 ui-monospace,Consolas,monospace;color:var(--dim);margin:4px 0;white-space:pre-wrap;overflow-wrap:anywhere}
-.status:empty{display:none}
-.camera-stage{container-type:size;display:grid;justify-items:center;align-items:end;min-height:0}
-.camera{position:relative;display:grid;place-items:center;width:min(100cqw,100cqh);aspect-ratio:1;border:1px solid var(--edge);border-radius:10px;background:#080a10;overflow:hidden}
-.camera img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
-.camera img:not([src]){visibility:hidden}
-.motion-plots{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.motion-plot{display:grid;justify-items:center;align-content:start;min-width:0;
-  margin:0;padding:6px;background:var(--card);border:1px solid var(--edge);border-radius:8px;text-align:center}
-.motion-plot figcaption{font-size:12px;font-weight:650}
-.motion-plot .status{margin:0}
-.plot-field{position:relative;width:min(100%,clamp(64px,14dvh,126px));aspect-ratio:1}
-.plot-ring{position:absolute;inset:10%;border:1px solid var(--dim);border-radius:50%;
-  background:linear-gradient(transparent 49%,var(--edge) 49%,var(--edge) 51%,transparent 51%),
-    linear-gradient(90deg,transparent 49%,var(--edge) 49%,var(--edge) 51%,transparent 51%)}
-.plot-ring::before{position:absolute;content:"";inset:25%;border:1px solid var(--edge);border-radius:50%}
-.plot-field[data-limited="false"] .plot-ring{border-style:dashed;border-color:var(--edge)}
-.plot-tip,.plot-roll{position:absolute;transform:translate(-50%,-50%);border-radius:50%;left:50%;top:50%}
-.plot-tip{width:9px;height:9px;background:var(--ok);box-shadow:0 0 0 2px var(--bg)}
-.plot-field[data-outside="true"] .plot-tip{background:var(--bad)}
-.plot-roll{width:7px;height:7px;border:2px solid var(--hi);background:var(--bg)}
-.roll-label{color:var(--hi)}
-.status-bar{display:flex;justify-content:center;flex-wrap:wrap;gap:5px;margin:0}
-.status-chip{display:flex;align-items:center;gap:5px;padding:4px 7px;border:1px solid var(--edge);
-  border-radius:5px;background:var(--card);font:11px ui-monospace,Consolas,monospace}
-.status-chip dt{color:var(--dim)}.status-chip dd{margin:0;color:var(--dim)}
-.status-chip dd::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor;margin-right:4px}
-.status-chip[data-tone="ok"] dd{color:var(--ok)}
-.status-chip[data-tone="active"] dd{color:var(--hi)}
-.status-chip[data-tone="tracking"] dd{color:#91baff}
-.status-chip[data-tone="error"] dd{color:var(--bad)}
-.console{margin-top:10px}
-.console-output{height:clamp(84px,18dvh,210px);overflow:auto;padding:7px;border-radius:5px;
-  background:#151926;font:11px/1.5 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
-.console-line+.console-line{margin-top:3px}
-.console-source{color:var(--dim);margin-right:6px}
-.console-line[data-level="error"]{color:var(--bad)}
-.console-line[data-level="success"]{color:var(--ok)}
-.category-options{display:grid;gap:7px}
-.category-options button{display:flex;align-items:center;gap:9px;text-align:left;background:#253047;border-color:#37435a;padding:10px}
-.category-options button:hover{background:#354461}
-.category-options button[aria-pressed="true"]{border-color:var(--class-color);background:#33425d}
-.swatch{width:9px;height:9px;flex:none;border-radius:50%;background:var(--class-color)}
-.category-id{margin-left:auto;color:var(--dim);font:11px ui-monospace,Consolas,monospace}
-#category-options{margin-top:8px}
-@media(max-width:920px){
-  body{padding:10px}
-  .workspace{gap:10px;grid-template-columns:minmax(225px,.9fr) minmax(0,1.1fr);
-    grid-template-areas:"controls camera" "controls categories";grid-template-rows:minmax(0,1fr) minmax(0,auto)}
-  .category-panel{max-height:44dvh}
-  .category-options{display:flex;overflow:auto;gap:5px;padding:2px}
-  .category-options button{flex:none}
-}
-@media(max-width:560px){
-  .workspace{grid-template-columns:minmax(0,1fr);grid-template-areas:"camera" "categories" "controls";
-    grid-template-rows:minmax(0,1fr) minmax(0,auto) minmax(0,38%)}
-  .category-panel{max-height:34dvh}
-  .category-panel .card{padding:6px}
-  .category-panel h2,.robot-panel h1{margin-bottom:6px}
-}
-</style></head><body>
-<main class="workspace">
-<section class="panel robot-panel" aria-labelledby="control-heading">
-<h1 id="control-heading">FlexEndoRobot ControlPanel</h1>
-<div class="panel-scroll" tabindex="0" aria-label="Robot controls">
-  <div class="card primary-actions">
-    <div class="actions">
-      <button onclick="post('/api/cmd/bird_eye')">BIRD-EYE</button>
-      <button id="pull-out" disabled>PULL OUT</button>
-    </div>
-    <div class="actions stop-actions">
-      <button id="interrupt" class="interrupt" onclick="interruptMotion()" title="Cancel motion and keep the session open">INTERRUPT</button>
-      <button id="stop" class="estop" onclick="stopSession()" title="Stop motion and shut down the app">STOP</button>
-    </div>
-    <form class="limit-editor" id="pull-out-distance-form" novalidate>
-      <label for="pull-out-distance">Pull Out clearance (mm)</label>
-      <input id="pull-out-distance" type="number" min="0" step="any" required disabled
-        title="Distance from the captured RCM to the final scope tip on the withdrawal side">
-      <button type="submit" disabled>APPLY</button>
-    </form>
-    <button id="confirm-pull-out" onclick="confirmPullOut()" hidden>Confirm straight and retract</button>
-  </div>
-
-    <div class="card"><h3>UR5</h3>
-      <dl class="grid" id="arm-state"></dl>
-      <div class="actions control-settings">
-        <form class="limit-editor device-limits" id="arm-limit-form" novalidate>
-          <label for="arm-limit">Tip limit (°)</label>
-          <input id="arm-limit" type="number" min="10" step="1" required disabled>
-          <label for="arm-linear-speed">Speed limit</label>
-          <select id="arm-linear-speed" required disabled>
-            <option value="12.5">0.5x</option>
-            <option value="25" selected>1x</option>
-            <option value="50">2x</option>
-            <option value="125">5x</option>
-          </select>
-          <button type="submit" disabled>APPLY</button>
-        </form>
-        <div class="actions device-actions">
-          <button id="arm-reset" onclick="post('/api/cmd/reset')" aria-label="Reset arm">RESET</button>
-        </div>
-      </div>
-      <h3 class="control-title">Arm controls</h3>
-      <div class="command-grid">
-        <button id="arm-mode" class="control-mode" onclick="post('/api/mode/arm')" aria-label="Toggle arm mode" aria-pressed="false">Toggle mode</button>
-        <button class="direction control-left" data-key="arm_left" aria-label="Arm left">←</button>
-        <button class="direction control-up" data-key="arm_up" aria-label="Arm up">↑</button>
-        <button class="direction control-down" data-key="arm_down" aria-label="Arm down">↓</button>
-        <button class="direction control-right" data-key="arm_right" aria-label="Arm right">→</button>
-        <button class="control-forward" data-key="arm_fwd" aria-label="Arm forward">FWD</button>
-        <button class="control-backward" data-key="arm_bwd" aria-label="Arm backward">BWD</button>
-      </div>
-    </div>
-
-    <div class="card"><h3>FlexEndo</h3>
-      <div class="flex-readings">
-        <div>
-          <p class="reading-label" id="angle-label">Angle</p>
-          <dl class="grid" id="flex-state" aria-labelledby="angle-label"></dl>
-        </div>
-        <div class="tendon-readings">
-          <p class="reading-label" id="tendon-label">Tendons (mm)</p>
-          <dl class="grid" id="tendons" aria-labelledby="tendon-label"></dl>
-        </div>
-      </div>
-      <div class="actions control-settings">
-        <form class="limit-editor device-limits" id="flex-limit-form" novalidate>
-          <label for="flex-limit">Bend limit (°)</label>
-          <input id="flex-limit" type="number" min="30" step="1" required disabled>
-          <label for="flex-speed">Speed limit</label>
-          <select id="flex-speed" required disabled>
-            <option value="5">0.5x</option>
-            <option value="10" selected>1x</option>
-            <option value="20">2x</option>
-            <option value="50">5x</option>
-          </select>
-          <button type="submit" disabled>APPLY</button>
-        </form>
-        <div class="actions device-actions" id="flex-calibration" hidden>
-          <button id="calibrate" onclick="calibrateFlex()">CALIBRATE</button>
-          <button id="flex-return-zero" onclick="post('/api/flex/return_zero')" aria-label="Reset Flex to saved zero" disabled>RESET</button>
-          <button id="flex-recheck" onclick="post('/api/flex/recheck_startup')" hidden>Recheck Flex inputs</button>
-        </div>
-      </div>
-      <h3 class="control-title">Flex controls</h3>
-      <div class="command-grid" id="flex-model-controls">
-        <button class="direction control-left" data-key="flex_a">A</button>
-        <button class="direction control-up" data-key="flex_w">W</button>
-        <button class="direction control-down" data-key="flex_s">S</button>
-        <button class="direction control-right" data-key="flex_d">D</button>
-        <button class="control-forward" data-key="flex_r">R (arc+)</button>
-        <button class="control-backward" data-key="flex_f">F (arc−)</button>
-      </div>
-      <div class="command-grid" id="flex-hardware-controls" hidden>
-        <button class="direction control-left" data-key="flex_left" aria-label="Bend left">←</button>
-        <button class="direction control-up" data-key="flex_up" aria-label="Bend up">↑</button>
-        <button class="direction control-down" data-key="flex_down" aria-label="Bend down">↓</button>
-        <button class="direction control-right" data-key="flex_right" aria-label="Bend right">→</button>
-        <button class="control-forward" data-key="flex_roll_plus" aria-label="Jog positive Flex roll" disabled>roll+</button>
-        <button class="control-backward" data-key="flex_roll_minus" aria-label="Jog negative Flex roll" disabled>roll-</button>
-      </div>
-    </div>
-
-    <div class="motion-plots">
-      <figure class="motion-plot" id="rcm-plot" data-available="false">
-        <figcaption>UR5 RCM tip</figcaption>
-        <div class="plot-field" aria-hidden="true">
-          <div class="plot-ring"></div><div class="plot-tip" hidden></div>
-        </div>
-        <div class="status plot-reading">Tilt —</div>
-        <div class="status" id="rcm-insertion">Insertion —</div>
-      </figure>
-      <figure class="motion-plot" id="flex-plot" data-available="false">
-        <figcaption>FlexEndo</figcaption>
-        <div class="plot-field" aria-hidden="true">
-          <div class="plot-ring"></div><div class="plot-roll" hidden></div><div class="plot-tip" hidden></div>
-        </div>
-        <div class="status plot-reading">Bend —</div>
-        <div class="status plot-roll-reading roll-label">Roll —</div>
-      </figure>
-    </div>
-    <section class="card console" aria-labelledby="console-heading">
-      <h3 id="console-heading">Console</h3>
-      <div class="console-output" id="console-output" role="log" aria-labelledby="console-heading" tabindex="0"></div>
-    </section>
-  </div>
-</section>
-
-<section class="panel camera-panel" aria-labelledby="camera-heading">
-  <h2 id="camera-heading">SCOPE Camera</h2>
-  <div class="camera-stage">
-    <div class="camera">
-      <img id="camera-feed" alt="Live SCOPE camera with detection boxes">
-    </div>
-  </div>
-  <dl class="status-bar" aria-label="Robot status">
-    <div class="status-chip" id="arm-status"><dt>ARM</dt><dd>Disconnected</dd></div>
-    <div class="status-chip" id="flex-connection"><dt>FLEX</dt><dd>Disconnected</dd></div>
-    <div class="status-chip" id="motion-status"><dt>MOTION</dt><dd>Unavailable</dd></div>
-  </dl>
-</section>
-
-<aside class="panel category-panel" aria-labelledby="categories-heading">
-  <h2 id="categories-heading">YOLO Categories</h2>
-  <div class="panel-scroll">
-    <div class="card">
-      <button id="tracking" type="button" aria-pressed="false" disabled>Tracking</button>
-      <div class="category-options" id="category-options"></div>
-    </div>
-  </div>
-</aside>
-</main>
-
-<script>
-const consoleOutput = document.getElementById('console-output');
-const reportedStatus = new Map();
-
-function writeOutput(source, message, level = 'info') {
-  const atEnd = consoleOutput.scrollHeight - consoleOutput.scrollTop - consoleOutput.clientHeight < 12;
-  const line = document.createElement('div');
-  line.className = 'console-line';
-  line.dataset.level = level;
-  const stamp = document.createElement('span');
-  stamp.className = 'console-source';
-  stamp.textContent = `${new Date().toLocaleTimeString()} ${source}`;
-  line.append(stamp, document.createTextNode(message));
-  consoleOutput.append(line);
-  if (consoleOutput.childElementCount > 120) consoleOutput.firstElementChild.remove();
-  if (atEnd) consoleOutput.scrollTop = consoleOutput.scrollHeight;
-}
-
-function reportStatus(key, source, message, level) {
-  if (reportedStatus.get(key) === message) return;
-  reportedStatus.set(key, message);
-  if (message) writeOutput(source, message, level);
-}
-
-async function post(path, body = {}, quiet = false) {
-  const timeout = path === '/api/cmd/stop' ? 12000 : path === '/api/cmd/interrupt' ? 4000 : 1000;
-  try {
-    const response = await fetch(path, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeout)
-    });
-    const result = await response.json();
-    if (!response.ok || !result.ok) throw new Error(result.error || 'Command refused');
-    return true;
-  } catch (e) {
-    if (!quiet) writeOutput('CMD', e.message, 'error');
-    return false;
-  }
-}
-
-const held = new Map();
-let keyRequest = Promise.resolve();
-let interrupting = false;
-let stopping = false;
-let sessionStopped = false;
-
-function sendKey(key, down, pointerId) {
-  keyRequest = keyRequest.then(() => {
-    if (!down || held.get(key) === pointerId) {
-      return post('/api/key', {key, down}, !down);
-    }
-  });
-}
-
-document.querySelectorAll('button[data-key]').forEach(btn => {
-  const key = btn.dataset.key;
-  btn.addEventListener('pointerdown', e => {
-    if (e.button !== 0 || held.has(key) || interrupting || stopping) return;
-    e.preventDefault();
-    btn.setPointerCapture(e.pointerId);
-    held.set(key, e.pointerId);
-    sendKey(key, true, e.pointerId);
-  });
-  const release = e => {
-    if (held.get(key) !== e.pointerId) return;
-    held.delete(key);
-    sendKey(key, false);
-  };
-  btn.addEventListener('pointerup', release);
-  btn.addEventListener('pointercancel', release);
-  btn.addEventListener('lostpointercapture', release);
-  btn.addEventListener('pointermove', e => {
-    if (e.pointerType !== 'mouse' || held.get(key) !== e.pointerId) return;
-    const rect = btn.getBoundingClientRect();
-    if (e.clientX < rect.left || e.clientX > rect.right ||
-        e.clientY < rect.top || e.clientY > rect.bottom) release(e);
-  });
-});
-
-function releaseKeys() {
-  held.forEach((_, key) => sendKey(key, false));
-  held.clear();
-}
-async function stopSession() {
-  if (stopping) return;
-  stopping = true;
-  document.getElementById('stop').disabled = true;
-  document.getElementById('interrupt').disabled = true;
-  held.clear();
-  writeOutput('APP', 'Stop requested. Ending the control session.');
-  if (await post('/api/cmd/stop')) {
-    sessionStopped = true;
-    setStatusChip('motion-status', 'Stopped', 'ok');
-    writeOutput('APP', 'Control session stopped.', 'success');
-  } else {
-    stopping = false;
-    document.getElementById('stop').disabled = false;
-    document.getElementById('interrupt').disabled = interrupting;
-  }
-}
-async function interruptMotion() {
-  if (interrupting || stopping) return;
-  interrupting = true;
-  const button = document.getElementById('interrupt');
-  button.disabled = true;
-  held.clear();
-  writeOutput('APP', 'Waiting for motion to stop.');
-  if (await post('/api/cmd/interrupt') && !stopping) {
-    writeOutput('APP', 'Motion interrupted. Control session remains open.', 'success');
-  }
-  interrupting = false;
-  button.disabled = stopping;
-}
-async function calibrateFlex() {
-  if (applyingLimits.has('flex')) return;
-  const field = document.getElementById('flex-limit');
-  const degrees = field.disabled ? undefined : limitFromInput(field);
-  if (degrees === null) return;
-  const planned = document.getElementById('calibrate').dataset.planned === 'true';
-  const prompt = planned ?
-    'Is the scope physically straight and the base at its intended zero? This saves the planned position without moving.' :
-    'Release the jog controls. Is the scope straight and the base at its intended zero? The scope will stay still.';
-  if (window.confirm(prompt)) {
-    if (await post('/api/flex/calibrate', {degrees})) delete field.dataset.dirty;
-  }
-}
-function confirmPullOut() {
-  if (window.confirm('Is the scope physically straight and the withdrawal path clear? The UR5 will retract.')) {
-    post('/api/flex/confirm_pull_out');
-  }
-}
-window.addEventListener('blur', releaseKeys);
-window.addEventListener('pagehide', releaseKeys);
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) releaseKeys();
-});
-setInterval(() => {
-  if (held.size) post('/api/key/heartbeat', {held: [...held.keys()]}, true);
-}, 250);
-
-async function pollState() {
-  try {
-    const response = await fetch('/api/state', {signal: AbortSignal.timeout(3000)});
-    if (!response.ok) throw new Error('State unavailable');
-    renderState(await response.json());
-    reportStatus('state-feed', 'APP', '');
-  } catch (e) {
-    renderMeasurements();
-    renderStatusBar({});
-    syncDeviceLimits('arm', null, null, null, false, false);
-    syncDeviceLimits('flex', null, null, null, false, false);
-    syncPullOutDistance(null, false);
-    pullOutButton.disabled = true;
-    if (!stopping) reportStatus('state-feed', 'APP', 'Control state unavailable.', 'error');
-  }
-  setTimeout(pollState, 200);
-}
-
-const speedFieldIds = {arm: 'arm-linear-speed', flex: 'flex-speed'};
-const applyingLimits = new Set();
-
-function syncDeviceLimits(kind, current, maximum, speed, angleEditable, speedEditable, canApplyAngle = angleEditable) {
-  const field = document.getElementById(`${kind}-limit`);
-  const speedField = document.getElementById(speedFieldIds[kind]);
-  const applying = applyingLimits.has(kind);
-  if (Number.isFinite(maximum)) field.max = maximum;
-  if (!field.dataset.dirty) field.value = current ?? '';
-  if (!speedField.dataset.dirty) speedField.value = speed ?? '';
-  field.disabled = !angleEditable || applying;
-  field.dataset.apply = String(canApplyAngle);
-  speedField.disabled = !speedEditable || applying;
-  field.form.querySelector('button').disabled = applying || (!canApplyAngle && !speedEditable);
-}
-
-function limitFromInput(field) {
-  if (!field.validity.valid || !Number.isInteger(field.valueAsNumber)) {
-    writeOutput('CMD', `Enter a whole angle from ${field.min}° to ${field.max}°.`, 'error');
-    return null;
-  }
-  return field.valueAsNumber;
-}
-
-for (const kind of ['arm', 'flex']) {
-  const field = document.getElementById(`${kind}-limit`);
-  const speedField = document.getElementById(speedFieldIds[kind]);
-  const form = field.form;
-  const button = form.querySelector('button');
-  field.addEventListener('input', () => { field.dataset.dirty = 'true'; });
-  speedField.addEventListener('change', () => { speedField.dataset.dirty = 'true'; });
-  form.addEventListener('submit', async event => {
-    event.preventDefault();
-    if (button.disabled || stopping || interrupting) return;
-    const payload = {};
-    if (field.dataset.dirty && !field.disabled && field.dataset.apply === 'true') {
-      const degrees = limitFromInput(field);
-      if (degrees === null) return;
-      payload.degrees = degrees;
-    }
-    if (speedField.dataset.dirty && !speedField.disabled) {
-      if (!speedField.validity.valid) {
-        writeOutput('CMD', 'Choose a speed preset.', 'error');
-        return;
-      }
-      payload.speed = Number(speedField.value);
-    }
-    if (!Object.keys(payload).length) {
-      if (kind === 'flex' && field.dataset.dirty && !field.disabled && field.dataset.apply === 'false') {
-        writeOutput('FLEX', 'Use CALIBRATE to save the first bend limit.');
-      }
-      return;
-    }
-
-    applyingLimits.add(kind);
-    button.disabled = field.disabled = speedField.disabled = true;
-    try {
-      if (await post(`/api/limits/${kind}`, payload)) {
-        if ('degrees' in payload) delete field.dataset.dirty;
-        if ('speed' in payload) delete speedField.dataset.dirty;
-        if (kind === 'arm' || field.dataset.modeled === 'true') {
-          writeOutput(kind === 'arm' ? 'UR5' : 'FLEX', 'Limits applied.', 'success');
-        }
-      }
-    } finally {
-      applyingLimits.delete(kind);
-    }
-  });
-}
-
-const pullOutButton = document.getElementById('pull-out');
-const pullOutDistance = document.getElementById('pull-out-distance');
-const pullOutForm = document.getElementById('pull-out-distance-form');
-let applyingPullOutDistance = false;
-
-function syncPullOutDistance(clearanceM, editable) {
-  if (!pullOutDistance.dataset.dirty) {
-    const millimetres = Number.isFinite(clearanceM) ? clearanceM * 1000 : null;
-    pullOutDistance.value = Number.isFinite(millimetres) ? Number(millimetres.toPrecision(15)) : '';
-  }
-  pullOutDistance.disabled = !editable || applyingPullOutDistance;
-  pullOutForm.querySelector('button').disabled = pullOutDistance.disabled;
-}
-
-pullOutDistance.addEventListener('input', () => {
-  pullOutDistance.dataset.dirty = 'true';
-  pullOutButton.disabled = true;
-});
-pullOutForm.addEventListener('submit', async event => {
-  event.preventDefault();
-  if (pullOutDistance.disabled || applyingPullOutDistance || stopping || interrupting) return;
-  const clearance_mm = pullOutDistance.valueAsNumber;
-  if (!pullOutDistance.validity.valid || !Number.isFinite(clearance_mm)) {
-    writeOutput('CMD', 'Enter a finite nonnegative Pull Out clearance in millimetres.', 'error');
-    return;
-  }
-  applyingPullOutDistance = true;
-  pullOutButton.disabled = true;
-  pullOutDistance.disabled = true;
-  pullOutForm.querySelector('button').disabled = true;
-  if (await post('/api/limits/pull_out', {clearance_mm})) {
-    delete pullOutDistance.dataset.dirty;
-    writeOutput('ARM', `Pull Out clearance set to ${clearance_mm} mm.`, 'success');
-  }
-  applyingPullOutDistance = false;
-});
-pullOutButton.addEventListener('click', () => {
-  if (!pullOutButton.disabled && !stopping && !interrupting) {
-    post('/api/cmd/pull_out', {clearance_mm: pullOutDistance.valueAsNumber});
-  }
-});
-
-function formatReading(value, unit, decimals = 2) {
-  return Number.isFinite(value) ? `${value.toFixed(decimals)}${unit}` : null;
-}
-
-function renderReadings(id, readings) {
-  document.getElementById(id).innerHTML = readings.map(([label, value]) => value === null ?
-    `<div class="unavailable"><dt>${label}</dt><dd aria-label="Unavailable">—</dd></div>` :
-    `<div><dt>${label}</dt><dd>${value}</dd></div>`).join('');
-}
-
-function placeMarker(marker, x, y) {
-  marker.style.left = `${50 + x * 40}%`;
-  marker.style.top = `${50 - y * 40}%`;
-}
-
-function renderMotionPlot(id, point, limit, label, roll = null, outsideCone = null) {
-  const plot = document.getElementById(id);
-  const field = plot.querySelector('.plot-field');
-  const tip = plot.querySelector('.plot-tip');
-  const rollAvailable = Number.isFinite(roll);
-  const limited = limit > 0;
-  const magnitude = point && Math.hypot(...point);
-  const outside = outsideCone ?? (limited && magnitude > limit + 0.01);
-  field.dataset.limited = String(limited);
-  field.dataset.outside = String(outside);
-  plot.dataset.available = String(Boolean(point) || rollAvailable);
-  tip.hidden = !point;
-  if (point) {
-    const scale = Math.max(limited ? limit : Math.max(10, Math.ceil(magnitude / 10) * 10), magnitude / 1.15);
-    placeMarker(tip, point[0] / scale, point[1] / scale);
-  }
-  const boundary = limited ? `${Number(limit.toFixed(1))}° limit` :
-    limit === 0 ? 'No software limit' : 'Limit —';
-  const reading = plot.querySelector('.plot-reading');
-  const detail = outsideCone ? ' · Outside limit. Jog inward.' : '';
-  reading.textContent = `${label} ${formatReading(magnitude, '°', outsideCone ? 2 : 1) ?? '—'} · ${boundary}${detail}`;
-  reading.classList.toggle('unavailable', !point && rollAvailable);
-  const rollMarker = plot.querySelector('.plot-roll');
-  if (rollMarker) {
-    rollMarker.hidden = !rollAvailable;
-    if (rollAvailable) {
-      const heading = roll * Math.PI / 180;
-      placeMarker(rollMarker, -0.88 * Math.sin(heading), -0.88 * Math.cos(heading));
-    }
-    const rollReading = plot.querySelector('.plot-roll-reading');
-    rollReading.textContent = `Roll ${formatReading(roll, '°', 1) ?? '—'}`;
-    rollReading.classList.toggle('unavailable', Boolean(point) && !rollAvailable);
-  }
-}
-
-function renderMeasurements(s = {}) {
-  const names = ['J1 pan', 'J2 lift', 'J3 elbow', 'J4 wr1', 'J5 wr2', 'J6 wr3'];
-  renderReadings('arm-state', names.map((name, index) => {
-    const degrees = s.joints_deg?.[index];
-    const angle = formatReading(degrees, '°', 1);
-    return [name, degrees >= 0 && angle !== null ? `+${angle}` : angle];
-  }));
-  const armMode = document.getElementById('arm-mode');
-  armMode.textContent = !s.arm_mode ? 'Toggle mode' : s.arm_mode === 'rcm' ? 'RCM' : 'Linear';
-  armMode.setAttribute('aria-pressed', String(s.arm_mode === 'rcm'));
-
-  const rcm = s.arm_mode === 'rcm' ? s.rcm_tip_angles : null;
-  renderMotionPlot('rcm-plot', rcm, s.rcm_cone_deg, 'Tilt',
-    null, s.rcm_outside_cone);
-  const insertion = s.arm_mode === 'rcm' && Number.isFinite(s.rcm_insertion_m) ?
-    Math.round(s.rcm_insertion_m * 10000) / 10 : null;
-  const insertionText = formatReading(insertion, ' mm', 1) ?? '—';
-  document.getElementById('rcm-insertion').textContent = `Insertion ${insertion > 0 ? '+' : ''}${insertionText}`;
-
-  const flex = s.flex_hardware;
-  const roll = flex ? flex.roll : s.flex_base_yaw;
-  const bend = flex ? flex.bend : s.flex_theta_total_deg;
-  const limit = flex ? flex.bend_limit : s.flex_model_bend_limit;
-  const point = flex ? flex.bend_point : s.flex_model_bend_point;
-  const planned = point && flex && (!flex.calibrated || flex.planned_feedback);
-  const bendLabel = planned ? 'Planned bend' : point && !flex ? 'Modeled bend' : 'Bend';
-  renderMotionPlot('flex-plot', point ? [-point[0], point[1]] : null, limit, bendLabel, roll);
-
-  const flexState = document.getElementById('flex-state');
-  flexState.title = planned ? `Planned positions relative to ${flex.planned_zero ? 'the saved zero' : 'startup'}` :
-    point && !flex ? 'Modeled FlexEndo positions' : '';
-  renderReadings('flex-state', [
-    ['Roll', formatReading(roll, '°')],
-    ['Bend', formatReading(bend, '°')],
-    ['Limit', limit === 0 ? 'Uncapped' : formatReading(limit, '°')]
-  ]);
-  document.getElementById('tendon-label').textContent = flex ? 'Tendon ΔL (mm)' : 'Tendon length (mm)';
-  renderReadings('tendons', ['R', 'G', 'B', 'Y'].map((name, index) => {
-    const length = flex ? flex.tendons?.[index] : s.tendons?.[name]?.[0];
-    return [flex || !s.tendons ? `T${index + 1}` : name, formatReading(length, '')];
-  }));
-}
-
-function setStatusChip(id, label, tone = '') {
-  const chip = document.getElementById(id);
-  chip.dataset.tone = tone;
-  chip.querySelector('dd').textContent = label;
-}
-
-function renderStatusBar(s) {
-  const flex = s.flex_hardware;
-  const armFault = s.arm_enabled && !s.stopping && (s.motion_fault || s.kinematics_ready === false);
-  const armConnected = s.relay_connected && s.joints_received;
-  const flexFault = flex?.fault || flex?.setup_encoder_mismatch;
-  if (s.arm_enabled === false) setStatusChip('arm-status', 'Disabled');
-  else if (armFault) setStatusChip('arm-status', 'Error', 'error');
-  else if (armConnected) setStatusChip('arm-status', 'Connected', 'ok');
-  else setStatusChip('arm-status', 'Disconnected');
-
-  if (flexFault) setStatusChip('flex-connection', 'Error', 'error');
-  else if (flex?.connected) setStatusChip('flex-connection', 'Connected', 'ok');
-  else if (flex?.driver_online) setStatusChip('flex-connection', 'Connecting', 'active');
-  else if (!flex && s.arm_enabled !== undefined) {
-    setStatusChip('flex-connection', s.arm_enabled ? 'Modeled' : 'Disabled');
-  } else setStatusChip('flex-connection', 'Disconnected');
-
-  const armStill = s.arm_enabled === false || (armConnected && !armFault && s.arm_moving === false);
-  const flexStill = !flex || (flex.connected && !flexFault && flex.moving === false);
-  if (sessionStopped) setStatusChip('motion-status', 'Stopped', 'ok');
-  else if (stopping || s.stopping || interrupting || s.interrupting) setStatusChip('motion-status', 'Stopping', 'active');
-  else if (flex?.tracking || s.tracking) setStatusChip('motion-status', 'Tracking', 'tracking');
-  else if (s.arm_moving === true || flex?.moving === true) setStatusChip('motion-status', 'Moving', 'active');
-  else if ((s.arm_enabled || flex) && armStill && flexStill) setStatusChip('motion-status', 'Standstill', 'ok');
-  else setStatusChip('motion-status', 'Unavailable');
-}
-
-function renderState(s) {
-  renderMeasurements(s);
-  renderStatusBar(s);
-  const flex = s.flex_hardware;
-  const hardware = Boolean(flex);
-  document.getElementById('flex-model-controls').hidden = hardware;
-  document.getElementById('flex-hardware-controls').hidden = !hardware;
-  document.getElementById('flex-calibration').hidden = !hardware;
-  const tracking = document.getElementById('tracking');
-  const flexReady = hardware && flex.connected && flex.positioning_ready && !flex.fault;
-  const armReady = s.relay_connected && s.joints_received && s.kinematics_ready && !s.motion_fault;
-  const rcmReady = armReady && s.arm_mode === 'rcm' && s.rcm_enabled;
-  const limitEditable = !stopping && !interrupting && !s.stopping && !s.interrupting;
-  const armLimitReady = armReady && s.arm_moving === false && limitEditable;
-  const armSpeedEditable = armLimitReady && !s.pull_out_active && !s.tracking && !flex?.tracking;
-  syncDeviceLimits('arm', s.rcm_cone_deg, s.rcm_cone_max_deg, s.arm_linear_speed_mm_s, armSpeedEditable, armSpeedEditable);
-  document.getElementById('arm-reset').disabled = !armReady || !limitEditable;
-  document.getElementById('arm-mode').disabled = (!armReady && s.arm_mode !== 'rcm') || !limitEditable;
-  document.getElementById('flex-limit').dataset.modeled = String(!hardware);
-  reportStatus('arm-fault', 'ARM', s.motion_fault, s.stopping ? 'info' : 'error');
-  reportStatus('arm-kinematics', 'ARM', s.arm_enabled && s.kinematics_ready === false ? 'Kinematics unavailable.' : '', 'error');
-  reportStatus('arm-mode', 'ARM', armReady ? `Arm mode ${s.arm_mode.toUpperCase()}.` : '');
-  tracking.setAttribute('aria-pressed', String(Boolean(flex?.tracking)));
-  tracking.disabled = !flex || (!flex.tracking && (!flexReady ||
-    !flex.tracking_horizon_supported || flex.busy || !rcmReady || selectedCategory === null));
-  reportStatus('tracking', 'TRACKING', flex?.tracking_state);
-  const birdEye = document.querySelector('[onclick*="/api/cmd/bird_eye"]');
-  birdEye.disabled = hardware && (!flexReady || !armReady || flex.busy || flex.tracking);
-  syncPullOutDistance(s.arm_enabled ? s.pull_out_clearance_m : null,
-    s.arm_enabled && limitEditable && !s.pull_out_active);
-  pullOutButton.disabled = !limitEditable || !rcmReady || s.arm_moving !== false || s.pull_out_active ||
-    !Number.isFinite(pullOutDistance.valueAsNumber) || Boolean(pullOutDistance.dataset.dirty) ||
-    applyingPullOutDistance || (hardware && (!flexReady || flex.busy || flex.tracking));
-  const confirmPullOutButton = document.getElementById('confirm-pull-out');
-  confirmPullOutButton.hidden = !flex?.pull_out_confirm;
-  confirmPullOutButton.disabled = !flexReady || !rcmReady;
-  reportStatus('pull-out-setup', 'ARM', s.arm_enabled && s.pull_out_clearance_m == null ?
-    'Enter the bench-verified Pull Out clearance in the control panel and click APPLY.' : '');
-
-  if (flex) {
-    const ready = flex.connected && !flex.fault;
-    const flexSpeedEditable = limitEditable && ready && !flex.busy && !flex.tracking;
-    const calibrate = document.getElementById('calibrate');
-    calibrate.disabled = !ready || flex.busy || flex.tracking || flex.setup_encoder_mismatch;
-    calibrate.dataset.planned = String(flex.planned_feedback);
-    const editable = limitEditable && !calibrate.disabled && flex.bend_limit_supported;
-    syncDeviceLimits('flex', flex.bend_limit || flex.bend_limit_default, flex.bend_limit_max,
-      flex.speed_limit_deg_s, editable, flexSpeedEditable, editable && flex.bend_limit > 0);
-    const recheck = document.getElementById('flex-recheck');
-    recheck.hidden = !flex.startup_recheck && !flex.recheck_pending;
-    recheck.disabled = flex.recheck_pending;
-    document.getElementById('flex-return-zero').disabled =
-      !ready || flex.busy || flex.tracking || !(flex.calibrated || flex.planned_zero);
-    document.querySelectorAll('#flex-hardware-controls button').forEach(button => {
-      const needsRollSupport = button.dataset.key.startsWith('flex_roll_') && !flex.roll_jog_supported;
-      button.disabled = !ready || flex.setup_encoder_mismatch || needsRollSupport;
-    });
-    reportStatus('flex-fault', 'FLEX', flex.fault ? `GTS fault ${flex.fault}${flex.fault_detail ? ' · ' + flex.fault_detail : ''}` : '', 'error');
-    reportStatus('flex-recovery', 'FLEX', flex.startup_recheck ?
-      'Check Flex drive power, the shared I/O connection, and the alarm and limit inputs. Then recheck Flex inputs.' :
-      flex.fault ? 'Resolve the GTS fault and restart the session.' : '');
-    reportStatus('flex-encoder', 'FLEX', flex.setup_encoder_mismatch ?
-      'Setup blocked. Planned travel and encoder feedback disagree. See the driver console.' : '', 'error');
-    reportStatus('flex-setup', 'FLEX', ready && !flex.calibrated && !flex.planned_zero && !flex.setup_encoder_mismatch ?
-      'Straighten and align Flex before calibrating. CALIBRATE also saves the bend limit.' : '');
-    reportStatus('flex-capability', 'FLEX', ready && (!flex.bend_limit_supported || !flex.roll_jog_supported) ?
-      'Rebuild and restart the Flex driver for adjustable bend limits and coordinated roll jogging.' : '');
-    reportStatus('tracking-capability', 'TRACKING', ready && !flex.tracking_horizon_supported ?
-      'Rebuild and restart the Flex driver for horizon-constrained tracking and the expanded bend range.' : '');
-    reportStatus('flex-message', 'FLEX', flex.message);
-  } else {
-    const editable = Boolean(s.arm_enabled && limitEditable && !s.pull_out_active && !s.tracking);
-    syncDeviceLimits('flex', s.flex_model_bend_limit, s.flex_model_bend_max_deg, s.flex_model_speed_deg_s,
-      editable, editable);
-  }
-}
-
-const cameraImage = document.getElementById('camera-feed');
-const categoryButtons = new Map();
-document.getElementById('tracking').addEventListener('click', event => {
-  post('/api/flex/tracking', {enabled: event.currentTarget.getAttribute('aria-pressed') !== 'true'});
-});
-let selectedCategory = null;
-let viewRevision = -1;
-let categoryRequest = Promise.resolve();
-let categoryPending = 0;
-
-function renderCamera(camera) {
-  if (camera.revision < viewRevision) return;
-  viewRevision = camera.revision;
-  selectedCategory = camera.category;
-  categoryButtons.forEach((button, id) => {
-    button.setAttribute('aria-pressed', String(id === selectedCategory));
-  });
-  reportStatus('category', 'YOLO', selectedCategory === null ? 'Showing all categories.' :
-    `Showing ${categoryButtons.get(selectedCategory).dataset.label.toLowerCase()}.`);
-
-  const url = `/api/camera/stream?revision=${viewRevision}`;
-  if (camera.ready) {
-    reportStatus('camera-state', 'CAMERA', '');
-    if (cameraImage.getAttribute('src') !== url) cameraImage.src = url;
-  } else {
-    cameraImage.removeAttribute('src');
-    reportStatus('camera-state', 'CAMERA', camera.error || 'Waiting for a camera frame…', camera.error ? 'error' : 'info');
-  }
-}
-
-cameraImage.addEventListener('error', () => {
-  cameraImage.removeAttribute('src');
-  if (!stopping) reportStatus('camera-stream', 'CAMERA', 'Camera stream interrupted.', 'error');
-});
-cameraImage.addEventListener('load', () => reportStatus('camera-stream', 'CAMERA', ''));
-
-function changeCategory(id) {
-  categoryPending++;
-  categoryRequest = categoryRequest.then(async () => {
-    try {
-      const response = await fetch('/api/camera/category', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({category: selectedCategory === id ? null : id}),
-        signal: AbortSignal.timeout(3000)
-      });
-      const camera = await response.json();
-      if (!response.ok) throw new Error(camera.error || 'Could not change the category');
-      renderCamera(camera);
-    } catch (error) {
-      writeOutput('YOLO', error.message, 'error');
-    } finally {
-      categoryPending--;
-    }
-  });
-}
-
-async function pollCamera() {
-  try {
-    const response = await fetch('/api/camera/state', {signal: AbortSignal.timeout(3000)});
-    if (!response.ok) throw new Error('Camera status unavailable');
-    const camera = await response.json();
-    if (!categoryPending) renderCamera(camera);
-  } catch (error) {
-    if (!stopping) reportStatus('camera-state', 'CAMERA', error.message, 'error');
-  }
-  setTimeout(pollCamera, 400);
-}
-
-function renderCategoryButtons(categories) {
-  const options = document.getElementById('category-options');
-  for (const {id, label, color} of categories) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.dataset.label = label;
-    button.style.setProperty('--class-color', color);
-    button.setAttribute('aria-pressed', 'false');
-    const swatch = document.createElement('span');
-    swatch.className = 'swatch';
-    swatch.setAttribute('aria-hidden', 'true');
-    const number = document.createElement('span');
-    number.className = 'category-id';
-    number.textContent = id;
-    button.append(swatch, label, number);
-    button.addEventListener('click', () => changeCategory(id));
-    categoryButtons.set(id, button);
-    options.appendChild(button);
-  }
-}
-
-async function init() {
-  const cfg = await (await fetch('/api/config')).json();
-  renderCategoryButtons(cfg.categories);
-  pollState();
-  pollCamera();
-}
-renderMeasurements();
-init().catch(error => {
-  writeOutput('APP', `Could not load the control panel. ${error.message}`, 'error');
-});
-</script></body></html>
-"""
 
 class _Handler(BaseHTTPRequestHandler):
     timeout = 2.0
@@ -944,13 +79,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
-        if url.path == '/':
-            self._send(200, 'text/html; charset=utf-8', HTML_PAGE.encode('utf-8'))
+        asset = STATIC_ROUTES.get(url.path)
+        if asset is not None:
+            filename, content_type = asset
+            self._send(200, content_type, (STATIC_DIR / filename).read_bytes())
         elif url.path == '/api/state':
-            with self.server.node.control_lock:
-                state = self.server.node.get_state_dict()
-                state['stopping'] = self.server.stopping
-                state['interrupting'] = self.server.interrupting
+            try:
+                state = self.server.node.get_state_snapshot()
+            except TimeoutError as error:
+                return self._json({'error': str(error)}, 503)
+            state['stopping'] = self.server.stopping
+            state['interrupting'] = self.server.interrupting
             state['arm_enabled'] = self.server.relay is not None
             if self.server.relay is not None:
                 state['motion_fault'] = self.server.relay.motion_fault()
@@ -1133,7 +272,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if 'speed' in body and body['speed'] is None:
                     raise ValueError('Choose a UR5 speed preset.')
                 return node.set_rcm_cone_limit(degrees, speed=body.get('speed'), relay=self.server.relay)
-            if (any(node._key_state.values()) or node.pull_out_active or node._track_target
+            if (any(node._key_state.values()) or node.pull_out_active
                     or (flex and flex.tracking)):
                 raise ValueError('Finish the current motion and release the controls before changing speed.')
             return self.server.relay.set_speed_limit(body.get('speed'))
@@ -1149,10 +288,6 @@ class _Handler(BaseHTTPRequestHandler):
             maximum = MAX_FLEX_BEND_DEG if flex else round(math.degrees(FLEX_MAX_BEND))
             degrees = angle_limit(body, MIN_FLEX_BEND_DEG, maximum, 'Flex bend limit')
             return flex.set_bend_limit(degrees, speed=speed) if flex else node.set_model_bend_limit(degrees, speed=speed)
-        if self.path == '/api/limits/pull_out':
-            if self.server.relay is None:
-                raise ValueError('Pull Out requires an enabled arm.')
-            return node.set_pull_out_clearance(parse_pull_out_clearance(body))
         if flex is not None and (
                 self.path in ('/api/cmd/bird_eye', '/api/cmd/pull_out', '/api/flex/calibrate',
                               '/api/flex/return_zero', '/api/flex/confirm_pull_out')
@@ -1196,11 +331,6 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a list of held keys")
             return node.refresh_keys(held)
         if self.path == '/api/cmd/pull_out':
-            if 'clearance_mm' in body:
-                expected = parse_pull_out_clearance(body)
-                clearance = node.pull_out_clearance_m
-                if clearance is None or not math.isclose(clearance, expected, abs_tol=1e-12):
-                    raise ValueError('Pull Out clearance changed. Review the current setting and try again.')
             return node.cmd_pull_out()
         commands = {
             '/api/mode/arm': node.toggle_arm_mode,
@@ -1226,7 +356,6 @@ def main():
     ap.add_argument('--host-web', default='127.0.0.1')
     ap.add_argument('--rcm-local', nargs=3, type=float, default=[0.0, 0.0, -0.30])
     ap.add_argument('--tip-local', nargs=3, type=float, default=[0.0, 0.0, 0.20195])
-    ap.add_argument('--standoff', type=float, default=0.105)
     ap.add_argument('--jog-speed-scale', type=float, default=DEFAULT_JOG_SPEED_SCALE,
                     choices=JOG_SPEED_SCALES,
                     help='Manual arm speed factor relative to the speed limits (10 uses the full limit)')
@@ -1238,14 +367,9 @@ def main():
     run_mode.add_argument('--camera-only', action='store_true', help='Passive camera preview')
     run_mode.add_argument('--flex-only', action='store_true', help='Connect Flex hardware without opening RTDE')
     run_mode.add_argument('--arm-only', action='store_true', help='Use RTDE and modeled Flex without a motor driver')
-    ap.add_argument('--pull-out-clearance-m', type=float,
-                    help='Bench-verified distance behind the RCM along the physical camera axis')
     args = ap.parse_args()
     if not -180.0 <= args.camera_roll_offset_deg <= 180.0:
         ap.error('--camera-roll-offset-deg must be between -180 and 180')
-    if args.pull_out_clearance_m is not None and (
-            not math.isfinite(args.pull_out_clearance_m) or args.pull_out_clearance_m < 0):
-        ap.error('--pull-out-clearance-m must be finite and nonnegative')
 
     try:
         with ExitStack() as resources:
@@ -1261,7 +385,7 @@ def main():
                 relay_port = relay_server.getsockname()[1]
             srv.camera = resources.enter_context(CameraFeed(args.camera_index, args.model))
             flex = (None if args.camera_only or args.arm_only else
-                    FlexControl(FlexClient(), srv.camera, args.pull_out_clearance_m,
+                    FlexControl(FlexClient(), srv.camera,
                                 camera_roll_offset_deg=args.camera_roll_offset_deg))
             srv.node = ControlNode(
                 relay_host=TCP_HOST,
@@ -1269,7 +393,6 @@ def main():
                 urdf_path=args.urdf,
                 rcm_point_local=args.rcm_local,
                 tip_local=args.tip_local,
-                standoff_m=args.standoff,
                 jog_speed_scale=args.jog_speed_scale,
                 flex=flex,
             )

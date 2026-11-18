@@ -1,5 +1,5 @@
-﻿#define NOMINMAX
-#include "stdafx.h"
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <conio.h>
 
@@ -36,6 +36,14 @@ constexpr uint64_t DriveEnableSettleMs = 200;
 constexpr uint64_t StepTimeoutMs = 600;
 constexpr uint64_t SetupReportSettleMs = 100;
 constexpr double EncoderTolerancePulses = 25.0;
+// Allow a small settled profile residual: 8 pulses are <0.01 deg on roll
+// and <0.002 deg on a bend axis, below the 0.15 deg pose tolerance.
+constexpr double ProfileTolerancePulses = 8.0;
+// Do not let unequal axis travel collapse a short roll/tendon ramp toward zero.
+constexpr double MinTrapAcceleration = 0.01; // pulses/ms^2
+constexpr double TrapSmoothTimeMs = 1.0;
+constexpr double MaxProfileCorrectionPulses = 64.0;
+constexpr unsigned MaxProfileCorrections = 2;
 constexpr double BendPositionSpeed = 40.0, RollPositionSpeed = 15.0; // pulses/ms
 constexpr double HorizonSpeedScale = 1.25;
 constexpr double TrackSpeedScale = HorizonSpeedScale * TrackSpeedMultiplier;
@@ -217,19 +225,32 @@ public:
             bool waiting = moving_;
             for (size_t i = 0; i < encoder_.size(); ++i) {
                 if (!(stepMask_ & (1L << i))) continue;
-                const bool profileReached = std::abs(profile_[i] - stepTarget_[i]) <= 1.0;
+                const double profileError = profile_[i] - stepTarget_[i];
+                const bool profileReached = std::abs(profileError) <= ProfileTolerancePulses;
                 const double error = std::abs((encoder_[i] - stepEncoder_[i]) -
                                               (stepTarget_[i] - stepProfile_[i]));
                 if (profileReached && (!verifyEncoder_ || error <= EncoderTolerancePulses)) continue;
                 waiting = true;
-                if (GetTickCount64() >= stepDeadline_) {
+                if (now >= stepDeadline_) {
+                    if (correctPlannedResidual()) return true;
+                    if (fault_) return false;
                     fault_ = profileReached ? -113 : -112;
                     std::fprintf(stderr,
-                                 "GTS axis %zu: %s. Target %.0f, profile %.0f, encoder %.0f (was %.0f).\n",
+                                 "GTS axis %zu: %s. Target %.0f, profile %.0f "
+                                 "(error %+.3f pulses, tolerance %.0f), encoder %.0f (was %.0f), "
+                                 "feedback %s, status 0x%lX.\n",
                                  i + 1, profileReached ? "encoder did not follow" : "profile did not reach target",
-                                 stepTarget_[i], profile_[i], encoder_[i], stepEncoder_[i]);
+                                 stepTarget_[i], profile_[i], profileError, ProfileTolerancePulses,
+                                 encoder_[i], stepEncoder_[i], verifyEncoder_ ? "encoder" : "planned",
+                                 static_cast<unsigned long>(sts[i]));
                     return false;
                 }
+            }
+            if (waiting && now >= stepDeadline_) {
+                // Being near the target must not bypass the motion timeout.
+                fault_ = -112;
+                std::fputs("GTS profile motion remained active past its completion deadline.\n", stderr);
+                return false;
             }
             if (!waiting) stepMask_ = 0;
         }
@@ -240,6 +261,7 @@ public:
 
     bool stop() {
         stepMask_ = 0;
+        stepCorrections_ = 0;
         simulatedStepMs_ = 0.0;
         setupJogMask_ = 0;
         jogActive_ = false;
@@ -290,7 +312,9 @@ private:
         return fault_ >= -104 && fault_ <= -100 && (faultAxisStatus_ & AxisFaultBits);
     }
 
-    bool positionAxes(const Axes& target, bool verifyEncoder, bool exact, double speedScale = 1.0) {
+    bool positionAxes(const Axes& target, bool verifyEncoder, bool exact, double speedScale = 1.0,
+                      bool correction = false) {
+        if (!correction) stepCorrections_ = 0;
         const Axes& positionFeedback = verifyEncoder ? encoder_ : profile_;
         Axes command{};
         double durationMs = MinPositionDurationMs;
@@ -307,6 +331,7 @@ private:
             maxDistance = std::max(maxDistance, distance);
             durationMs = std::max(durationMs, distance / speed);
         }
+        if (maxDistance < 0.5) return true;
         const double dx = std::max(std::abs(command[0] - profile_[0]), std::abs(command[2] - profile_[2]))
                           / BendPulsesPerDegree;
         const double dy = std::max(std::abs(command[1] - profile_[1]), std::abs(command[3] - profile_[3]))
@@ -323,6 +348,17 @@ private:
             return true;
         }
         const double acceleration = 0.5 * std::max(1.0, speedScale / HorizonSpeedScale);
+        Axes rampAcceleration{};
+        double rampAllowanceMs = 0.0;
+        for (size_t i = 0; i < target.size(); ++i) {
+            const double distance = std::abs(command[i] - profile_[i]);
+            if (distance < 0.5) continue;
+            rampAcceleration[i] = std::max(MinTrapAcceleration, acceleration * distance / maxDistance);
+            rampAllowanceMs = std::max(rampAllowanceMs, distance / (durationMs * rampAcceleration[i]));
+        }
+        // durationMs above bounds cruise speed. Include acceleration/deceleration
+        // and smoothing, then solve each trapezoid for the same completion time.
+        durationMs += rampAllowanceMs + 2 * TrapSmoothTimeMs;
         if (!trapMode_) {
             for (short axis = 1; axis <= 5; ++axis) {
                 if (!check(GT_PrfTrap(axis), "GT_PrfTrap", axis)) return false;
@@ -334,12 +370,22 @@ private:
             const size_t i = axis - 1;
             const double profileDistance = std::abs(command[i] - profile_[i]);
             if (profileDistance < 0.5) continue;
-            // Equal ramp times keep the tendon lengths in step with base roll.
-            const double axisAcceleration = acceleration * profileDistance / maxDistance;
+            const double axisAcceleration = rampAcceleration[i];
+            const double travelTime = durationMs - 2 * TrapSmoothTimeMs;
+            const double discriminant = std::max(0.0, travelTime * travelTime -
+                                                 4 * profileDistance / axisAcceleration);
+            const double velocity = 2 * profileDistance / (travelTime + std::sqrt(discriminant));
             TTrapPrm parameters{axisAcceleration, axisAcceleration, 0.0, 1};
-            if (!check(GT_SetTrapPrm(axis, &parameters), "GT_SetTrapPrm", axis) ||
+            const short result = GT_SetTrapPrm(axis, &parameters);
+            if (result) {
+                std::fprintf(stderr, "GTS axis %d trap rejected: target %.0f, start %.3f, "
+                             "distance %.3f, acc %.9g, dec %.9g, velocity %.9g, duration %.3f ms.\n",
+                             axis, command[i], profile_[i], profileDistance,
+                             parameters.acc, parameters.dec, velocity, durationMs);
+            }
+            if (!check(result, "GT_SetTrapPrm", axis) ||
                 !check(GT_SetPos(axis, static_cast<long>(command[i])), "GT_SetPos", axis) ||
-                !check(GT_SetVel(axis, profileDistance / durationMs), "GT_SetVel", axis)) return false;
+                !check(GT_SetVel(axis, velocity), "GT_SetVel", axis)) return false;
             stepTarget_[i] = command[i];
             mask |= 1L << i;
         }
@@ -349,8 +395,33 @@ private:
         stepProfile_ = profile_;
         stepEncoder_ = encoder_;
         verifyEncoder_ = verifyEncoder;
+        stepSpeedScale_ = speedScale;
         stepDeadline_ = GetTickCount64() + static_cast<uint64_t>(std::ceil(durationMs)) + StepTimeoutMs;
         return true;
+    }
+
+    bool correctPlannedResidual() {
+        if (verifyEncoder_ || moving_ || stepCorrections_ >= MaxProfileCorrections) return false;
+        Axes target = profile_;
+        bool needed = false;
+        for (size_t i = 0; i < target.size(); ++i) {
+            if (!(stepMask_ & (1L << i))) continue;
+            const double error = std::abs(stepTarget_[i] - profile_[i]);
+            if (error > MaxProfileCorrectionPulses) return false;
+            if (error > ProfileTolerancePulses) {
+                target[i] = stepTarget_[i];
+                needed = true;
+            }
+        }
+        if (!needed) return false;
+        ++stepCorrections_;
+        for (size_t i = 0; i < target.size(); ++i) {
+            if (target[i] == profile_[i]) continue;
+            std::fprintf(stderr, "GTS axis %zu: correcting stopped planned residual %+.3f pulses "
+                         "toward %.0f (attempt %u/%u).\n", i + 1, target[i] - profile_[i],
+                         target[i], stepCorrections_, MaxProfileCorrections);
+        }
+        return positionAxes(target, false, true, std::min(1.0, stepSpeedScale_), true);
     }
 
 public:
@@ -492,6 +563,8 @@ private:
     uint64_t simulatedJogAt_ = 0;
     Axes simulatedJogVelocity_{};
     bool verifyEncoder_ = false, setupFeedbackMismatch_ = false;
+    unsigned stepCorrections_ = 0;
+    double stepSpeedScale_ = 1.0;
     uint64_t stepDeadline_ = 0;
     uint64_t enableReadyAt_ = 0;
     uint64_t setupReportAt_ = 0;
@@ -839,7 +912,7 @@ private:
     bool atSavedZero() const {
         if ((!calibrated_ && !plannedZero_) || motion_.moving()) return false;
         const Axes& values = plannedZero_ ? motion_.profile() : motion_.encoder();
-        const double tolerance = plannedZero_ ? 1.0 : EncoderTolerancePulses;
+        const double tolerance = plannedZero_ ? ProfileTolerancePulses : EncoderTolerancePulses;
         for (size_t i = 0; i < values.size(); ++i) {
             const double target = plannedZero_ ? std::round(reference_[i]) : reference_[i];
             if (std::abs(values[i] - target) > tolerance) return false;

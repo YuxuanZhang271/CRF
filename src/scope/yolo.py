@@ -77,6 +77,16 @@ class Detector:
         ]
 
 
+def select_target(detections, category, shape):
+    """Select the strongest in-frame detection for the requested category."""
+    if category is None:
+        return None
+    height, width = shape[:2]
+    return max((item for item in detections if item.class_id == category
+                  and 0 <= item.center[0] < width and 0 <= item.center[1] < height),
+                 key=lambda item: item.confidence, default=None)
+
+
 def draw_detections(frame, detections, category):
     """Draw all visible detections and return the strongest selected target."""
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -93,9 +103,7 @@ def draw_detections(frame, detections, category):
     if category is None:
         return None
     height, width = frame.shape[:2]
-    target = max((item for item in detections if item.class_id == category
-                  and 0 <= item.center[0] < width and 0 <= item.center[1] < height),
-                 key=lambda item: item.confidence, default=None)
+    target = select_target(detections, category, frame.shape)
     center = width // 2, height // 2
     x, y = center
     color = (95, 95, 255)

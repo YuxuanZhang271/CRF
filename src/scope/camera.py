@@ -7,7 +7,7 @@ from contextlib import ExitStack
 
 import cv2
 
-from .yolo import CATEGORIES, MODEL_PATH, Detector, Observation, draw_detections, target_error
+from .yolo import CATEGORIES, MODEL_PATH, Detector, Observation, draw_detections, select_target, target_error
 
 
 CAMERA_INDEX = 0
@@ -15,6 +15,7 @@ TARGET_WIDTH = 1504
 TARGET_HEIGHT = 1504
 TARGET_FPS = 30
 FOURCC = "MJPG"
+DETECTION_MAX_AGE_S = 0.5
 
 log = logging.getLogger("ScopeCamera")
 
@@ -39,16 +40,21 @@ class CameraFeed:
         self.index = index
         self.model_path = model_path
         self._condition = threading.Condition()
-        self._worker = threading.Thread(target=self._run, name="scope-camera")
+        self._capture_worker = threading.Thread(target=self._run_capture, name="scope-capture")
+        self._worker = threading.Thread(target=self._run_detection, name="scope-detection")
         self._closed = False
         self._error = None
+        self._detection_error = None
         self._category = None
         self._revision = 0
         self._frame_id = 0
         self._latest = None
         self._observation = None
+        self._raw = None  # One latest frame; inference never accumulates a backlog.
+        self._detections = None
 
     def __enter__(self):
+        self._capture_worker.start()
         self._worker.start()
         return self
 
@@ -57,6 +63,7 @@ class CameraFeed:
             self._closed = True
             self._observation = None
             self._condition.notify_all()
+        self._capture_worker.join()
         self._worker.join()
 
     def select_category(self, category):
@@ -68,6 +75,7 @@ class CameraFeed:
                 self._revision += 1
                 self._latest = None
                 self._observation = None
+                self._raw = self._detections = None
                 self._condition.notify_all()
             return self._status()
 
@@ -81,7 +89,8 @@ class CameraFeed:
 
     def _status(self):
         return {"category": self._category, "revision": self._revision,
-                "ready": self._latest is not None, "error": self._error}
+                "ready": self._latest is not None, "error": self._error,
+                "detection_error": self._detection_error}
 
     def frames(self, revision):
         previous_id = 0
@@ -96,22 +105,21 @@ class CameraFeed:
                 jpeg = self._latest
             yield jpeg
 
-    def _run(self):
+    def _run_capture(self):
         try:
             with ExitStack() as resources:
-                detector = Detector(self.model_path)
                 capture = open_camera(self.index)
                 resources.callback(capture.release)
-                self._capture(capture, detector)
+                self._capture(capture)
         except Exception as error:
-            log.exception("SCOPE camera stopped")
+            log.exception("SCOPE capture stopped")
             with self._condition:
                 self._error = str(error) or type(error).__name__
-                self._latest = None
-                self._observation = None
+                self._latest = self._raw = self._observation = self._detections = None
                 self._condition.notify_all()
 
-    def _capture(self, capture, detector):
+    def _capture(self, capture):
+        frame_id = 0
         while True:
             with self._condition:
                 if self._closed:
@@ -121,19 +129,54 @@ class CameraFeed:
             captured_at = time.monotonic()
             if not ok:
                 raise RuntimeError(f"Camera {self.index} stopped returning frames")
-            detections = detector.detect(frame, category)
-            target = draw_detections(frame, detections, category)
-            height, width = frame.shape[:2]
-            dx, dy, centered = target_error(target, frame.shape)
-            ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            with self._condition:
+                if self._closed or revision != self._revision:
+                    continue
+                frame_id += 1
+                self._raw = (frame_id, captured_at, revision, category, frame)
+                cached = self._detections
+                self._condition.notify_all()
+            detections = (cached[2] if cached and cached[0] == revision
+                          and captured_at - cached[1] <= DETECTION_MAX_AGE_S else [])
+            preview = frame.copy()  # Inference retains the unmodified capture frame.
+            draw_detections(preview, detections, category)
+            ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ok:
                 raise RuntimeError("Could not encode the camera frame as JPEG")
             with self._condition:
                 if self._closed or revision != self._revision:
                     continue
-                self._frame_id += 1
-                self._observation = Observation(
-                    self._frame_id, captured_at, revision, category, width, height,
-                    target is not None, centered, dx, dy)
+                self._frame_id = frame_id
                 self._latest = encoded.tobytes()
                 self._condition.notify_all()
+
+    def _run_detection(self):
+        try:
+            detector = Detector(self.model_path)
+            previous_id = 0
+            while True:
+                with self._condition:
+                    self._condition.wait_for(lambda: self._closed or self._error or
+                                             (self._raw is not None and self._raw[0] != previous_id))
+                    if self._closed or self._error:
+                        return
+                    frame_id, captured_at, revision, category, frame = self._raw
+                previous_id = frame_id
+                detections = detector.detect(frame, category)
+                target = select_target(detections, category, frame.shape)
+                dx, dy, centered = target_error(target, frame.shape)
+                height, width = frame.shape[:2]
+                with self._condition:
+                    if self._closed or self._error or revision != self._revision:
+                        continue
+                    # Keep the capture timestamp; a late result must remain stale.
+                    self._observation = Observation(
+                        frame_id, captured_at, revision, category, width, height,
+                        target is not None, centered, dx, dy)
+                    self._detections = (revision, captured_at, detections)
+                    self._condition.notify_all()
+        except Exception as error:
+            log.exception("SCOPE detection stopped; camera preview remains available")
+            with self._condition:
+                self._detection_error = str(error) or type(error).__name__
+                self._observation = self._detections = None
