@@ -3,6 +3,7 @@
 import io
 import json
 import sys
+import tempfile
 import threading
 import unittest
 from http.client import HTTPResponse
@@ -13,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app import _Handler
 from flex_endo_robo.control_node import ControlNode
+from status import Recorder, Status
+from keyboard_listener import KeyboardListener
 
 
 class DashboardTests(unittest.TestCase):
@@ -27,6 +30,16 @@ class DashboardTests(unittest.TestCase):
         cls.server.camera = SimpleNamespace(status=lambda: {
             "category": None, "revision": 0, "ready": False, "error": None,
         })
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='recording-test-',
+                                                 dir=Path(__file__).resolve().parents[1])
+        self.server.recorder = Recorder(Status(self.server, {'camera_only': True}), self.temp.name)
+        self.server.keyboard = KeyboardListener()
+
+    def tearDown(self):
+        self.server.recorder.close()
+        self.temp.cleanup()
 
     def request(self, method, path, body=None):
         payload = body.encode() if body is not None else b""
@@ -76,6 +89,52 @@ class DashboardTests(unittest.TestCase):
     def test_preview_rejects_motion_and_bad_json(self):
         self.assertEqual(self.request("POST", "/api/cmd/reset", "{}")[0], 503)
         self.assertEqual(self.request("POST", "/api/key", "[]")[0], 400)
+
+    def test_keyboard_bridge_in_preview(self):
+        self.assertEqual(self.request('POST', '/api/keyboard', '{}')[0], 400)
+        body = '{"client":"test-dashboard","enabled":true}'
+        self.assertEqual(self.request('POST', '/api/keyboard', body)[0], 200)
+        self.assertTrue(self.server.keyboard.key(ord('R'), True, True, True))
+        state = json.loads(self.request('POST', '/api/keyboard', body)[2])
+        self.assertEqual(state['commands'], ['record'])
+
+    def test_recording_in_preview_requires_confirmation_and_audits_rejections(self):
+        self.assertEqual(self.request('POST', '/api/recording/start', '{}')[0], 200)
+        state = json.loads(self.request('GET', '/api/recording')[2])
+        self.assertTrue(state['active'])
+        self.assertEqual(self.request('POST', '/api/cmd/bird_eye', '{}')[0], 503)
+        self.assertEqual(self.request('POST', '/api/recording/console',
+                                      json.dumps({'source': 'APP', 'message': 'Ready', 'level': 'info'}))[0], 200)
+        self.assertEqual(self.request('POST', '/api/recording/console',
+                                      json.dumps({'source': 'APP', 'message': '✓' * 2000,
+                                                  'level': 'info'}, ensure_ascii=False))[0], 200)
+        self.assertEqual(self.request('POST', '/api/recording/stop', '{}')[0], 400)
+        self.assertTrue(self.server.recorder.status()['active'])
+        self.assertEqual(self.request('POST', '/api/recording/stop', '{"confirmed":true}')[0], 200)
+        rows = [json.loads(line) for path in Path(state['session']).glob('*/events.jsonl')
+                for line in path.read_text(encoding='utf-8').splitlines()]
+        command = next(row['data'] for row in rows if row['type'] == 'command')
+        result = next(row['data'] for row in rows if row['type'] == 'command_result')
+        self.assertEqual(command['command'], 'BIRD-EYE')
+        self.assertEqual(command['id'], result['id'])
+        self.assertEqual(result['http_status'], 503)
+        self.assertTrue(any(row['type'] == 'console' and row['data']['message'] == 'Ready' for row in rows))
+        config = rows[0]['data']['config']
+        self.assertIn('module_defaults', config)
+        self.assertIn('rcm_cone_deg', config['control'])
+
+    def test_recording_status_survives_stale_control_feedback(self):
+        node = self.server.node
+        original = node._snapshot_at
+        node._snapshot_at = 0.
+        node._running.set()
+        try:
+            self.assertEqual(self.request('POST', '/api/recording/start', '{}')[0], 200)
+            self.assertEqual(self.request('GET', '/api/recording')[0], 200)
+            self.assertEqual(self.request('GET', '/api/state')[0], 503)
+        finally:
+            node._running.clear()
+            node._snapshot_at = original
 
     def test_state_does_not_wait_for_the_motion_lock(self):
         completed = threading.Event()

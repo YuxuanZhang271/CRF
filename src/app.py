@@ -12,6 +12,7 @@ import logging
 import math
 import threading
 import time
+import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,8 @@ from flex_endo_robo.flex_endo.flex_ipc import MIN_SPEED_DEG_S, SPEED_PRESETS_DEG
 from flex_endo_robo.ur5_rtde_server import TCP_HOST, TCP_PORT, UR5_IP, open_relay, serve_relay
 from scope.camera import CAMERA_INDEX, CameraFeed
 from scope.yolo import CATEGORIES, COLORS, MODEL_PATH
+from status import COMMAND_NAMES, RECORDINGS_DIR, Recorder, Status, app_state
+from keyboard_listener import KeyboardListener
 
 log = logging.getLogger("WindowsApp")
 DASHBOARD_CONFIRM_TIMEOUT_S = 10.0
@@ -41,6 +44,7 @@ STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
+    "/static/keyboard.js": ("keyboard.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -75,6 +79,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, obj, code=200):
+        if getattr(self, '_audit', None) is not None:
+            self.server.recorder.event('command_result', {
+                **self._audit, 'http_status': code, 'response': obj,
+            })
         self._send(code, 'application/json', json.dumps(obj).encode('utf-8'))
 
     def do_GET(self):
@@ -85,15 +93,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, content_type, (STATIC_DIR / filename).read_bytes())
         elif url.path == '/api/state':
             try:
-                state = self.server.node.get_state_snapshot()
+                state = app_state(self.server)
             except TimeoutError as error:
                 return self._json({'error': str(error)}, 503)
-            state['stopping'] = self.server.stopping
-            state['interrupting'] = self.server.interrupting
-            state['arm_enabled'] = self.server.relay is not None
-            if self.server.relay is not None:
-                state['motion_fault'] = self.server.relay.motion_fault()
             self._json(state)
+        elif url.path == '/api/recording':
+            self._json(self.server.recorder.status())
         elif url.path == '/api/config':
             self._json({
                 'categories': [
@@ -130,7 +135,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             n = int(self.headers.get('Content-Length') or 0)
-            if not 0 <= n <= 4096:
+            maximum = 16384 if self.path == '/api/recording/console' else 4096
+            if not 0 <= n <= maximum:
                 raise ValueError("Invalid Content-Length")
             if n and self.headers.get_content_type() != 'application/json':
                 raise ValueError("Expected application/json")
@@ -143,6 +149,43 @@ class _Handler(BaseHTTPRequestHandler):
         origin = self.headers.get('Origin')
         if origin is not None and origin != f"http://{self.headers.get('Host')}":
             return self._json({'error': 'Request must come from the control panel'}, 403)
+
+        if self.path == '/api/recording/start':
+            if self.server.stopping:
+                return self._json({'error': 'Control session is stopping.'}, 409)
+            try:
+                return self._json({'ok': True, **self.server.recorder.start()})
+            except (OSError, RuntimeError, ValueError) as error:
+                return self._json({'error': str(error)}, 503)
+        if self.path == '/api/keyboard':
+            if (not isinstance(body.get('client'), str) or not 1 <= len(body['client']) <= 100
+                    or type(body.get('enabled')) is not bool):
+                return self._json({'error': 'Expected keyboard client and enabled flag.'}, 400)
+            return self._json(self.server.keyboard.poll(body['client'], body['enabled']))
+        if self.path == '/api/recording/stop':
+            if body.get('confirmed') is not True:
+                return self._json({'error': 'Confirm before stopping the recording.'}, 400)
+            try:
+                state = self.server.recorder.stop()
+                return self._json({'ok': state['error'] is None, **state})
+            except RuntimeError as error:
+                return self._json({'error': str(error)}, 503)
+        if self.path == '/api/recording/console':
+            if (not all(isinstance(body.get(key), str) for key in ('source', 'message', 'level'))
+                    or len(body['message']) > 3000):
+                return self._json({'error': 'Expected a console source, message and level.'}, 400)
+            self.server.recorder.event('console', {**body, 'origin': 'dashboard'})
+            return self._json({'ok': True})
+
+        if getattr(self.server, 'recorder', None) is not None:
+            self._audit = {'id': uuid.uuid4().hex, 'path': self.path,
+                           'command': COMMAND_NAMES.get(self.path, self.path), 'body': body}
+            if self.path == '/api/flex/calibrate':
+                try:
+                    self._audit['pose_at_request'] = app_state(self.server)
+                except TimeoutError as error:
+                    self._audit['pose_at_request'] = {'error': str(error)}
+            self.server.recorder.event('command', self._audit)
 
         if self.path == '/api/camera/category':
             if 'category' not in body:
@@ -363,6 +406,8 @@ def main():
     ap.add_argument('--camera-roll-offset-deg', type=float, default=0.0,
                     help='Measured optical roll relative to the modeled Flex camera, about its forward axis')
     ap.add_argument('--model', type=Path, default=MODEL_PATH, help='Path to YOLO weights')
+    ap.add_argument('--recordings-dir', type=Path, default=RECORDINGS_DIR,
+                    help='Session recording output directory (default: recordings in repository root)')
     run_mode = ap.add_mutually_exclusive_group()
     run_mode.add_argument('--camera-only', action='store_true', help='Passive camera preview')
     run_mode.add_argument('--flex-only', action='store_true', help='Connect Flex hardware without opening RTDE')
@@ -396,6 +441,11 @@ def main():
                 jog_speed_scale=args.jog_speed_scale,
                 flex=flex,
             )
+            srv.recorder = Recorder(Status(srv, vars(args)), args.recordings_dir)
+            srv.keyboard = KeyboardListener().start()
+            resources.callback(srv.keyboard.close)
+            srv.camera.recorder = srv.recorder
+            resources.callback(srv.recorder.close)
             if srv.relay is not None:
                 relay_shutdown = threading.Event()
                 relay_thread = threading.Thread(

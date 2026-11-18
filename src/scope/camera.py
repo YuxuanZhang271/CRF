@@ -52,6 +52,7 @@ class CameraFeed:
         self._observation = None
         self._raw = None  # One latest frame; inference never accumulates a backlog.
         self._detections = None
+        self.recorder = None
 
     def __enter__(self):
         self._capture_worker.start()
@@ -148,7 +149,15 @@ class CameraFeed:
                     continue
                 self._frame_id = frame_id
                 self._latest = encoded.tobytes()
+                jpeg = self._latest
                 self._condition.notify_all()
+            if self.recorder is not None:
+                self.recorder.event('camera_frame', {
+                    'frame': frame_id, 'captured_at': captured_at,
+                    'revision': revision, 'category': category,
+                    'width': frame.shape[1], 'height': frame.shape[0],
+                    'overlay_captured_at': cached[1] if detections else None,
+                }, jpeg=jpeg)
 
     def _run_detection(self):
         try:
@@ -173,8 +182,12 @@ class CameraFeed:
                     self._observation = Observation(
                         frame_id, captured_at, revision, category, width, height,
                         target is not None, centered, dx, dy)
+                    observation = self._observation
                     self._detections = (revision, captured_at, detections)
                     self._condition.notify_all()
+                if self.recorder is not None:
+                    self.recorder.event('yolo', {'observation': observation,
+                                                 'detections': detections, 'target': target})
         except Exception as error:
             log.exception("SCOPE detection stopped; camera preview remains available")
             with self._condition:

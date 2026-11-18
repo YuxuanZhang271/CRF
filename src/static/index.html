@@ -8,14 +8,14 @@
 <div class="panel-scroll" tabindex="0" aria-label="Robot controls">
   <div class="card primary-actions">
     <div class="actions">
-      <button onclick="post('/api/cmd/bird_eye')">BIRD-EYE</button>
-      <button id="pull-out" disabled>PULL OUT</button>
+      <button id="bird-eye" onclick="post('/api/cmd/bird_eye')" title="Bird-eye view · Ctrl+B" aria-keyshortcuts="Control+b">BIRD-EYE</button>
+      <button id="pull-out" title="Prepare zero pose, then press again to withdraw · Ctrl+P" aria-keyshortcuts="Control+p" disabled>PULL OUT</button>
     </div>
     <div class="actions stop-actions">
       <button id="interrupt" class="interrupt" onclick="interruptMotion()" title="Cancel motion and keep the session open">INTERRUPT</button>
       <button id="stop" class="estop" onclick="stopSession()" title="Stop motion and shut down the app">STOP</button>
     </div>
-    <button id="confirm-pull-out" onclick="confirmPullOut()" hidden>Confirm straight and retract</button>
+    <p id="procedure-status" class="status" role="status"></p>
   </div>
 
     <div class="card"><h3>UR5</h3>
@@ -85,8 +85,8 @@
         <button class="direction control-up" data-key="flex_w">W</button>
         <button class="direction control-down" data-key="flex_s">S</button>
         <button class="direction control-right" data-key="flex_d">D</button>
-        <button class="control-forward" data-key="flex_r">R (arc+)</button>
-        <button class="control-backward" data-key="flex_f">F (arc−)</button>
+        <button class="control-forward" data-key="flex_r">arc+</button>
+        <button class="control-backward" data-key="flex_f">arc−</button>
       </div>
       <div class="command-grid" id="flex-hardware-controls" hidden>
         <button class="direction control-left" data-key="flex_left" aria-label="Bend left">←</button>
@@ -117,7 +117,11 @@
       </figure>
     </div>
     <section class="card console" aria-labelledby="console-heading">
-      <h3 id="console-heading">Console</h3>
+      <div class="console-heading">
+        <h3 id="console-heading">Console</h3>
+        <button id="record" type="button" aria-pressed="false" title="Record · Ctrl+R" aria-keyshortcuts="Control+r" disabled>RECORD</button>
+      </div>
+      <div id="recording-status" class="status" role="status">Checking recording status…</div>
       <div class="console-output" id="console-output" role="log" aria-labelledby="console-heading" tabindex="0"></div>
     </section>
   </div>
@@ -141,11 +145,12 @@
   <h2 id="categories-heading">YOLO Categories</h2>
   <div class="panel-scroll">
     <div class="card">
-      <button id="tracking" type="button" aria-pressed="false" disabled>Tracking</button>
+      <button id="tracking" type="button" aria-pressed="false" title="Toggle tracking · Ctrl+T" aria-keyshortcuts="Control+t" disabled>TRACK</button>
       <div class="category-options" id="category-options"></div>
     </div>
   </div>
 </aside>
 </main>
 
-<script src="/static/dashboard.js"></script></body></html>
+<script src="/static/dashboard.js"></script>
+<script src="/static/keyboard.js"></script></body></html>

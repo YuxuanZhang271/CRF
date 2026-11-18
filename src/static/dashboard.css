@@ -21,7 +21,12 @@ h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
   align-items:start;gap:6px;padding:8px}
 .primary-actions button{padding-inline:6px;white-space:nowrap}
 .stop-actions{justify-content:flex-end;min-width:0}
-#confirm-pull-out{grid-column:1/-1;justify-self:start}
+#procedure-status{grid-column:1/-1;margin:0}
+button[data-activity="moving"],button[data-activity="limited"]{background:#e7bc4d;color:#171c29}
+button[data-activity="ready"],button[data-activity="waiting"]{background:#83d5f2;color:#171c29}
+button[data-activity="complete"],button[data-activity="at_position"],button[data-activity="active"]{background:#6fdf9e;color:#142b21}
+button[data-activity]:disabled{opacity:.85}
+button[data-key][data-held="true"]{outline:2px solid var(--hi);background:#435779}
 .control-settings{margin-top:8px;align-items:center}
 .device-actions{margin-inline-start:auto;justify-content:flex-end}
 .limit-editor{display:flex;align-items:center;gap:5px;min-width:0}
@@ -95,6 +100,10 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
 .status-chip[data-tone="tracking"] dd{color:#91baff}
 .status-chip[data-tone="error"] dd{color:var(--bad)}
 .console{margin-top:10px}
+.console-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.console-heading h3{margin:0}
+#record[aria-pressed="true"]{background:#6fdf9e;color:#142b21;border-color:#9af4c2}
+#recording-status{font-size:10px}
 .console-output{height:clamp(84px,18dvh,210px);overflow:auto;padding:7px;border-radius:5px;
   background:#151926;font:11px/1.5 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
 .console-line+.console-line{margin-top:3px}

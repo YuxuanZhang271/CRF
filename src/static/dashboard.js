@@ -1,7 +1,13 @@
 const consoleOutput = document.getElementById('console-output');
 const reportedStatus = new Map();
+let recordingActive = false;
+let recordingPending = false;
+const consoleRequests = new Set();
+let consoleForwardFailed = false;
+let stateFeedReady = false;
+let recordingClock = null;
 
-function writeOutput(source, message, level = 'info') {
+function writeOutput(source, message, level = 'info', record = true) {
   const atEnd = consoleOutput.scrollHeight - consoleOutput.scrollTop - consoleOutput.clientHeight < 12;
   const line = document.createElement('div');
   line.className = 'console-line';
@@ -13,6 +19,103 @@ function writeOutput(source, message, level = 'info') {
   consoleOutput.append(line);
   if (consoleOutput.childElementCount > 120) consoleOutput.firstElementChild.remove();
   if (atEnd) consoleOutput.scrollTop = consoleOutput.scrollHeight;
+  if (recordingActive && record) {
+    const request = fetch('/api/recording/console', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({source, message: message.slice(0, 3000), level,
+                            client_timestamp: new Date().toISOString()}),
+      signal: AbortSignal.timeout(2000)
+    }).then(response => {
+      if (!response.ok) throw new Error('Console forwarding failed.');
+      consoleForwardFailed = false;
+    }).catch(() => {
+      if (!consoleForwardFailed) {
+        consoleForwardFailed = true;
+        writeOutput('RECORD', 'A dashboard console message could not be recorded.', 'error', false);
+      }
+    });
+    consoleRequests.add(request);
+    request.finally(() => consoleRequests.delete(request));
+  }
+}
+
+const recordButton = document.getElementById('record');
+function renderRecording(state) {
+  recordingActive = state.active;
+  recordButton.setAttribute('aria-pressed', String(recordingActive));
+  recordButton.textContent = recordingActive ? 'RECORD ●' : 'RECORD';
+  recordButton.title = recordingActive ? 'Stop recording' : 'Start recording';
+  recordButton.disabled = recordingPending || stopping || sessionStopped;
+  const label = document.getElementById('recording-status');
+  recordingClock = {at: performance.now(), state};
+  const dropped = Object.values(state.dropped || {}).reduce((a, b) => a + b, 0);
+  label.textContent = state.error ? `Recording error: ${state.error}` :
+    `${recordingActive ? 'Recording' : state.session ? 'Saved' : 'Ready to record'}${dropped ? ` · ${dropped} dropped records` : ''}`;
+  label.title = state.session || '';
+  updateRecordingClock();
+  reportStatus('recording-error', 'RECORD', state.error || '', 'error');
+  reportStatus('recording-drops', 'RECORD', dropped ? `${dropped} records dropped; disk writer could not keep up.` : '', 'error');
+}
+
+function updateRecordingClock() {
+  if (!recordingClock) return;
+  const {state, at} = recordingClock;
+  if (state.error || !state.session) return;
+  const elapsed = (state.elapsed_s || 0) + (state.active ? (performance.now() - at) / 1000 : 0);
+  const duration = state.segment_seconds || 300;
+  const slice = Math.floor(elapsed / duration);
+  const seconds = Math.floor(elapsed % duration);
+  const timer = `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
+  const drops = Object.values(state.dropped || {}).reduce((a, b) => a + b, 0);
+  document.getElementById('recording-status').textContent =
+    `${state.active ? 'Recording' : 'Saved'} · Slice ${String(slice).padStart(5, '0')} · ${timer}${drops ? ` · ${drops} dropped records` : ''}`;
+}
+setInterval(updateRecordingClock, 200);
+
+recordButton.addEventListener('click', async () => {
+  if (recordingPending || stopping || sessionStopped) return;
+  recordingPending = true;
+  recordButton.disabled = true;
+  try {
+    const current = await fetch('/api/recording', {signal: AbortSignal.timeout(3000)});
+    if (!current.ok) throw new Error('Recording status unavailable.');
+    const state = await current.json();
+    renderRecording(state);
+    if (state.active) {
+      releaseKeys();
+      if (!window.confirm('Stop recording and save the session?')) return;
+      await Promise.allSettled([...consoleRequests]);
+    }
+    const response = await fetch(`/api/recording/${state.active ? 'stop' : 'start'}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(state.active ? {confirmed: true} : {}),
+      signal: AbortSignal.timeout(8000)
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || 'Recording request failed.');
+    renderRecording(result);
+    writeOutput('RECORD', `${result.active ? 'Recording started' : 'Recording saved'}: ${result.session}`, 'success');
+  } catch (error) {
+    writeOutput('RECORD', error.message, 'error');
+  } finally {
+    recordingPending = false;
+    recordButton.disabled = stopping || sessionStopped;
+  }
+});
+
+async function pollRecording() {
+  try {
+    const response = await fetch('/api/recording', {signal: AbortSignal.timeout(3000)});
+    if (!response.ok) throw new Error('Recording status unavailable.');
+    const state = await response.json();
+    if (!recordingPending) renderRecording(state);
+  } catch (error) {
+    if (!stopping && !sessionStopped) {
+      document.getElementById('recording-status').textContent = error.message;
+      recordButton.disabled = true;
+    }
+  }
+  if (!sessionStopped) setTimeout(pollRecording, 1000);
 }
 
 function reportStatus(key, source, message, level) {
@@ -56,7 +159,7 @@ function sendKey(key, down, pointerId) {
 document.querySelectorAll('button[data-key]').forEach(btn => {
   const key = btn.dataset.key;
   btn.addEventListener('pointerdown', e => {
-    if (e.button !== 0 || held.has(key) || interrupting || stopping) return;
+    if (e.button !== 0 || btn.disabled || !stateFeedReady || held.has(key) || interrupting || stopping) return;
     e.preventDefault();
     btn.setPointerCapture(e.pointerId);
     held.set(key, e.pointerId);
@@ -81,6 +184,7 @@ document.querySelectorAll('button[data-key]').forEach(btn => {
 function releaseKeys() {
   held.forEach((_, key) => sendKey(key, false));
   held.clear();
+  document.querySelectorAll('[data-held]').forEach(button => delete button.dataset.held);
 }
 async function stopSession() {
   if (stopping) return;
@@ -91,6 +195,12 @@ async function stopSession() {
   writeOutput('APP', 'Stop requested. Ending the control session.');
   if (await post('/api/cmd/stop')) {
     sessionStopped = true;
+    recordingActive = false;
+    recordingClock = null;
+    recordButton.disabled = true;
+    recordButton.setAttribute('aria-pressed', 'false');
+    recordButton.textContent = 'RECORD';
+    document.getElementById('recording-status').textContent = 'Session ended; recording is closing.';
     setStatusChip('motion-status', 'Stopped', 'ok');
     writeOutput('APP', 'Control session stopped.', 'success');
   } else {
@@ -125,11 +235,6 @@ async function calibrateFlex() {
     if (await post('/api/flex/calibrate', {degrees})) delete field.dataset.dirty;
   }
 }
-function confirmPullOut() {
-  if (window.confirm('Is the scope physically straight and the withdrawal path clear? The UR5 will retract.')) {
-    post('/api/flex/confirm_pull_out');
-  }
-}
 window.addEventListener('blur', releaseKeys);
 window.addEventListener('pagehide', releaseKeys);
 document.addEventListener('visibilitychange', () => {
@@ -146,11 +251,18 @@ async function pollState() {
     renderState(await response.json());
     reportStatus('state-feed', 'APP', '');
   } catch (e) {
+    stateFeedReady = false;
     renderMeasurements();
     renderStatusBar({});
     syncDeviceLimits('arm', null, null, null, false, false);
     syncDeviceLimits('flex', null, null, null, false, false);
     pullOutButton.disabled = true;
+    ['bird-eye', 'pull-out', 'tracking'].forEach(id => {
+      document.getElementById(id).disabled = true;
+      delete document.getElementById(id).dataset.activity;
+    });
+    releaseKeys();
+    document.querySelectorAll('button[data-key]').forEach(button => { button.disabled = true; });
     if (!stopping) reportStatus('state-feed', 'APP', 'Control state unavailable.', 'error');
   }
   setTimeout(pollState, 200);
@@ -227,9 +339,13 @@ for (const kind of ['arm', 'flex']) {
 }
 
 const pullOutButton = document.getElementById('pull-out');
-pullOutButton.addEventListener('click', () => {
-  if (!pullOutButton.disabled && !stopping && !interrupting) {
-    post('/api/cmd/pull_out');
+let pullOutPending = false;
+pullOutButton.addEventListener('click', async () => {
+  if (!pullOutButton.disabled && !pullOutPending && !stopping && !interrupting) {
+    pullOutPending = true;
+    pullOutButton.disabled = true;
+    try { await post('/api/cmd/pull_out'); }
+    finally { pullOutPending = false; }
   }
 });
 
@@ -360,6 +476,7 @@ function renderStatusBar(s) {
 }
 
 function renderState(s) {
+  stateFeedReady = true;
   renderMeasurements(s);
   renderStatusBar(s);
   const flex = s.flex_hardware;
@@ -372,6 +489,12 @@ function renderState(s) {
   const armReady = s.relay_connected && s.joints_received && s.kinematics_ready && !s.motion_fault;
   const rcmReady = armReady && s.arm_mode === 'rcm' && s.rcm_enabled;
   const limitEditable = !stopping && !interrupting && !s.stopping && !s.interrupting;
+  document.querySelectorAll('button[data-key^="arm_"]').forEach(button => {
+    button.disabled = !armReady || !limitEditable;
+  });
+  document.querySelectorAll('#flex-model-controls button').forEach(button => {
+    button.disabled = !s.arm_enabled || !armReady || !limitEditable;
+  });
   const armLimitReady = armReady && s.arm_moving === false && limitEditable;
   const armSpeedEditable = armLimitReady && !s.pull_out_active && !s.tracking && !flex?.tracking;
   syncDeviceLimits('arm', s.rcm_cone_deg, s.rcm_cone_max_deg, s.arm_linear_speed_mm_s, armSpeedEditable, armSpeedEditable);
@@ -382,16 +505,22 @@ function renderState(s) {
   reportStatus('arm-kinematics', 'ARM', s.arm_enabled && s.kinematics_ready === false ? 'Kinematics unavailable.' : '', 'error');
   reportStatus('arm-mode', 'ARM', armReady ? `Arm mode ${s.arm_mode.toUpperCase()}.` : '');
   tracking.setAttribute('aria-pressed', String(Boolean(flex?.tracking)));
-  tracking.disabled = !flex || (!flex.tracking && (!flexReady ||
+  tracking.disabled = !limitEditable || !flex || (!flex.tracking && (!flexReady ||
     !flex.tracking_horizon_supported || flex.busy || !rcmReady || selectedCategory === null));
   reportStatus('tracking', 'TRACKING', flex?.tracking_state);
-  const birdEye = document.querySelector('[onclick*="/api/cmd/bird_eye"]');
-  birdEye.disabled = hardware && (!flexReady || !armReady || flex.busy || flex.tracking);
-  pullOutButton.disabled = !limitEditable || !rcmReady || s.arm_moving !== false || s.pull_out_active ||
-    (hardware && (!flexReady || flex.busy || flex.tracking));
-  const confirmPullOutButton = document.getElementById('confirm-pull-out');
-  confirmPullOutButton.hidden = !flex?.pull_out_confirm;
-  confirmPullOutButton.disabled = !flexReady || !rcmReady;
+  const birdEye = document.getElementById('bird-eye');
+  birdEye.disabled = !limitEditable || !armReady || (hardware && (!flexReady || flex.busy || flex.tracking));
+  const readyToWithdraw = s.pull_out_state === 'ready';
+  pullOutButton.disabled = pullOutPending || !limitEditable || !rcmReady || s.arm_moving !== false ||
+    (s.pull_out_active && !readyToWithdraw) ||
+    (hardware && (!flexReady || (flex.busy && !readyToWithdraw) || flex.tracking));
+  setActivity(birdEye, s.bird_eye_state);
+  setActivity(pullOutButton, {preparing: 'moving', retracting: 'moving'}[s.pull_out_state] || s.pull_out_state);
+  setActivity(tracking, flex?.tracking_indicator);
+  const instruction = {preparing: 'Pull Out: moving to zero.',
+    ready: 'At zero. Verify straightness and a clear path; press PULL OUT or Ctrl+P again to withdraw.',
+    retracting: 'Pull Out: withdrawing.', complete: 'Pull Out complete.'}[s.pull_out_state] || '';
+  document.getElementById('procedure-status').textContent = instruction;
 
 
   if (flex) {
@@ -410,7 +539,7 @@ function renderState(s) {
       !ready || flex.busy || flex.tracking || !(flex.calibrated || flex.planned_zero);
     document.querySelectorAll('#flex-hardware-controls button').forEach(button => {
       const needsRollSupport = button.dataset.key.startsWith('flex_roll_') && !flex.roll_jog_supported;
-      button.disabled = !ready || flex.setup_encoder_mismatch || needsRollSupport;
+      button.disabled = !limitEditable || !ready || flex.setup_encoder_mismatch || needsRollSupport;
     });
     reportStatus('flex-fault', 'FLEX', flex.fault ? `GTS fault ${flex.fault}${flex.fault_detail ? ' · ' + flex.fault_detail : ''}` : '', 'error');
     reportStatus('flex-recovery', 'FLEX', flex.startup_recheck ?
@@ -430,6 +559,11 @@ function renderState(s) {
     syncDeviceLimits('flex', s.flex_model_bend_limit, s.flex_model_bend_max_deg, s.flex_model_speed_deg_s,
       editable, editable);
   }
+}
+
+function setActivity(button, state) {
+  if (!state || state === 'idle' || state === 'unavailable') delete button.dataset.activity;
+  else button.dataset.activity = state;
 }
 
 const cameraImage = document.getElementById('camera-feed');
@@ -523,6 +657,7 @@ function renderCategoryButtons(categories) {
 }
 
 async function init() {
+  pollRecording();
   const cfg = await (await fetch('/api/config')).json();
   renderCategoryButtons(cfg.categories);
   pollState();

@@ -63,6 +63,7 @@ class FlexControl:
         self._horizon_y = None
         self._horizon_near_vertical = False
         self._zero_hold_joints = None
+        self._pull_out_complete_joints = None
 
     @property
     def status(self):
@@ -166,6 +167,7 @@ class FlexControl:
         return False
 
     def stop(self):
+        self._pull_out_complete_joints = None
         self._horizon_paused = True
         self._zero_hold_joints = None
         self.tracking = None
@@ -563,6 +565,10 @@ class FlexControl:
         return True
 
     def pull_out(self, node):
+        if self.procedure is not None:
+            if self.procedure['stage'] == 'confirm':
+                return self.confirm_pull_out(node)
+            raise ValueError('Pull Out is already moving. Wait for the ready indication.')
         if not self._rcm_ready(node) or not self.ready():
             raise ValueError("Pull Out requires active RCM and calibrated Flex feedback.")
         if any(node._key_state.values()) or node._arm_moving is not False or node._teleop_servo_active:
@@ -587,6 +593,7 @@ class FlexControl:
         if not flex_at_zero and not self.return_to_zero():
             return False
         self._horizon_paused = True
+        self._pull_out_complete_joints = None
         self._zero_hold_joints = None
         if flex_at_zero:
             self.client.command(ipc.IDLE)
@@ -608,7 +615,9 @@ class FlexControl:
     def confirm_pull_out(self, node):
         if (not self.procedure or self.procedure["stage"] != "confirm"
                 or not self._rcm_ready(node) or not self.ready() or not self._straight()
-                or node._arm_moving is not False):
+                or not self.status.flags & ipc.AT_SAVED_ZERO
+                or node._arm_moving is not False or node._teleop_servo_active or any(node._key_state.values())
+                or time.monotonic() >= self.procedure['deadline']):
             raise ValueError("Wait for the UR5 and Flex to finish resetting before confirming.")
         q = node.joint_positions.copy()
         axis, _, _ = node.kin.tube_axis_in_base(q)
@@ -645,7 +654,7 @@ class FlexControl:
             return
         ref, pivot = node.rcm_ref_axis, node.rcm_world_point
         actual_error = math.acos(float(np.clip(np.dot(axis, ref), -1., 1.)))
-        flex_ready = st["flex_zero"] and self._straight()
+        flex_ready = st["flex_zero"] and self._straight() and bool(self.status.flags & ipc.AT_SAVED_ZERO)
         aligned = actual_error <= PULL_OUT_ALIGN_TOLERANCE_RAD
         if stage == "confirm":
             if (not flex_ready or not aligned or node._arm_moving is not False
@@ -667,12 +676,10 @@ class FlexControl:
                     return
                 if not flex_ready:
                     self.message = "Pull Out · RCM aligned, waiting for Flex zero"
-                elif self.status.planned_feedback:
+                else:
                     st["stage"] = "confirm"
                     st["deadline"] = time.monotonic() + POSITION_TIMEOUT_S
-                    self.message = "Pull Out · verify the scope is physically straight"
-                else:
-                    self._begin_pull_out_retraction()
+                    self.message = "Pull Out · at zero. Verify straightness and path, then press PULL OUT again."
                 return
             seed_axis = node.kin.tube_axis_in_base(q_seed)[0] if q_seed is not q else axis
             angle = math.acos(float(np.clip(np.dot(seed_axis, ref), -1., 1.)))
@@ -698,6 +705,7 @@ class FlexControl:
             if remaining <= 0.001:
                 if node._arm_moving is False and not node._teleop_servo_active:
                     self.procedure = None
+                    self._pull_out_complete_joints = q.copy()
                     self.message = "Pull Out complete"
                 return
             end_seed = node.kin.straight_camera_position_in_base(q_seed) if q_seed is not q else end
@@ -858,6 +866,10 @@ class FlexControl:
             "connected": self.client.ready,
             "driver_online": s is not None,
             "calibrated": bool(s and s.calibrated),
+            "feedback": ({"driver": s.driver, "stamp_ms": s.stamp, "sequence": s.sequence,
+                          "request": s.request, "action": s.action, "result": s.result,
+                          "flags": s.flags, "bend_x_deg": s.bend_x, "bend_y_deg": s.bend_y}
+                         if s else None),
             "positioning_ready": bool(s and s.positioning_ready),
             "simulated": bool(s and s.flags & ipc.SIMULATED),
             "manual_bench": manual_bench,
@@ -885,5 +897,18 @@ class FlexControl:
             "tracking": self.tracking is not None,
             "tracking_horizon_supported": bool(s and s.flags & ipc.TRACK_HORIZON_SUPPORTED),
             "tracking_state": self.tracking_state,
+            "tracking_indicator": ('idle' if self.tracking is None else
+                                   'limited' if self.tracking_state.startswith('Tracking limited') else
+                                   'waiting' if self.tracking_state == 'Waiting for target' else 'active'),
             "pull_out_confirm": bool(self.procedure and self.procedure["stage"] == "confirm"),
         }
+
+    def pull_out_state(self, node):
+        if self.procedure:
+            return {'prepare': 'preparing', 'confirm': 'ready', 'retract': 'retracting'}[self.procedure['stage']]
+        if (self._pull_out_complete_joints is not None and node._arm_ready() and self.ready()
+                and node._arm_moving is False and self._straight()
+                and self.status.flags & ipc.AT_SAVED_ZERO
+                and np.max(np.abs(node.joint_positions - self._pull_out_complete_joints)) < math.radians(.1)):
+            return 'complete'
+        return 'idle'

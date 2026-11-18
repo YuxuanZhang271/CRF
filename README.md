@@ -95,6 +95,129 @@ Pull Out, camera tracking, and Bird-eye retain coordinated command ownership;
 an arm reset cancels a coordinated procedure. STOP and INTERRUPT still cancel
 both devices.
 
+## Keyboard and activity indicators
+
+The mappings and requested indicator behavior are in [keyboard_shortcuts.md](keyboard_shortcuts.md).
+Focus the dashboard to use held arrow keys and `[` / `]` for UR5 motion,
+`W` / `A` / `S` / `D` for Flex, and `R` / `F` for physical Flex roll.
+`I` interrupts motion. `Ctrl+B`, `Ctrl+P`, `Ctrl+T`, and `Ctrl+R` trigger
+Bird-eye, Pull Out, Track, and Record through their existing button handlers.
+Motion releases on key-up, focus loss, hidden tabs, and failed state polling;
+held keys use the same heartbeat/expiry checks as pointer controls. Auto-repeat
+does not repeatedly execute commands, and shortcuts are suspended in form fields.
+In arm-only modeled mode, `R` / `F` do not change arc length; the modeled arc
+buttons remain available with the pointer.
+
+Windows starts `keyboard_listener.py` to forward browser-reserved Ctrl shortcuts
+to the focused dashboard. It requires both a recent browser focus lease and a
+foreground window title beginning with `CRF Control`. It queues button clicks;
+the native hook does not issue motor commands. Other platforms retain the DOM
+listener, where browser-reserved shortcuts may take precedence. The implementation
+uses the documented [Windows low-level keyboard hook](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc).
+
+| Button | Indicator |
+| --- | --- |
+| BIRD-EYE | Yellow while positioning; green when the modeled camera view is 30° downward and level within 1°, with settled feedback, even if reached manually. |
+| PULL OUT | Yellow preparing; sky blue at the aligned UR5 / saved Flex zero pose; yellow withdrawing; green after settled completion. |
+| TRACK | Green following/centered; yellow when correction is limited; sky blue while waiting for a target. |
+| RECORD | Green while active; the console displays the zero-based slice directory index and the current slice timer. |
+
+**PULL OUT now requires two presses in both feedback modes.** First press aligns
+the UR5 and returns Flex to saved zero. When sky blue, verify straightness and a
+clear withdrawal path, then press **PULL OUT** or `Ctrl+P` again. The extra confirm
+button has been removed. Confirmation expires after 30 seconds and is rejected
+if feedback or the prepared pose changes. Colors come from state feedback, and
+the text below the buttons describes the current phase.
+
+## Session recording
+
+Use **RECORD** beside the console to start a session. The button turns green while
+recording. Press it again and confirm the popup to stop and save. Recording also
+closes during normal app shutdown, including **STOP**. It works in camera-only
+preview and continues when the dashboard is closed or refreshed.
+
+`src/status.py` defines the recording schema, configuration collection, sample
+rate, rotation interval, and background storage. Control settings stay owned by
+their existing controllers; the recorder collects their applied values. Sessions
+are saved to `recordings/<UTC-session-id>/` by default; use
+`--recordings-dir <path>` to choose another folder. Recordings are ignored by Git.
+
+Each session contains five-minute numbered directories (`00000`, `00001`, …):
+
+| File | Contents |
+| --- | --- |
+| `events.jsonl` | One complete JSON object per line, with event type, sequence, UTC timestamp, elapsed seconds, monotonic timestamp, and data. |
+| `camera.mjpeg` | Concatenated JPEG preview frames, created when frames are available. Each `camera_frame` JSON event identifies its file, byte offset, and byte length. |
+
+The shared timeline accommodates different source rates:
+
+- Robot and camera status are sampled at a target 20 Hz, independently of the
+  browser. Robot snapshots include source timestamps, joint angles, modeled
+  endoscope-link Cartesian pose in the base frame, Flex roll/bend/tendons,
+  connections, motion, faults, calibration flags, and native command feedback.
+  These are dashboard-rate snapshots, not every 125 Hz servo/RTDE packet.
+- Configuration is saved at the start of every segment and when values change:
+  launch arguments, Python module defaults, applied tip/bend/speed limits,
+  captured RCM point/axis/depth, and Flex calibration and feedback modes.
+- Camera previews are recorded at their available capture rate, even without a
+  browser viewer. They contain the same detection overlays as the dashboard.
+  YOLO events record every completed inference, including boxes, classes,
+  confidence, selected target, centering error, category revision, and original
+  frame capture timestamp. Match frame/revision IDs and capture times rather
+  than assuming inference and preview advance together.
+- Requests and HTTP outcomes are recorded for controls, settings, category
+  selection, **BIRD-EYE**, **PULL OUT**, **TRACK**, **INTERRUPT**, and **STOP**,
+  including refused commands. Matching request IDs join requests and responses;
+  motion completion is reported by subsequent robot feedback. **CALIBRATE**
+  also records the available pose at request time. Native raw motor zero offsets
+  are not exposed by the shared-memory protocol and are not reconstructed.
+- Python logging and dashboard console messages are recorded while active.
+  Dashboard messages require an open connected browser. The separate C++ driver
+  terminal's raw stdout is not forwarded to Python; its exposed fault and command
+  feedback are captured in robot snapshots.
+
+One writer performs disk I/O, with a bounded queue (4096 records and a 32 MiB
+estimated payload budget), reserving capacity for commands and logs when camera
+traffic is high. Disk errors and dropped-record counts appear beside **RECORD**;
+drop counts are also saved in state and session-stop events. Files flush about
+once a second and on stop. A forced process termination can lose buffered data;
+completed JSONL lines remain readable. Five-minute rotation limits individual
+file size; total disk use keeps growing until recording stops. Camera images
+usually account for most of it.
+
+## Recording viewer
+
+Run the viewer in the `crf` environment (Matplotlib, NumPy, and Pillow are already
+included). It reads files only and never connects to the arm, Flex, or camera.
+
+```powershell
+# Inspect the first five minutes of a saved session.
+python src/recording_viewer.py recordings/<session-id>
+
+# Follow the newest recording and automatically discover new slices/sessions.
+python src/recording_viewer.py recordings --live
+
+# Inspect minutes 5–10, or pass a single numbered segment / events.jsonl file.
+python src/recording_viewer.py recordings/<session-id> --start 300 --duration 300
+
+# Export a static plot or a JSON activity/configuration summary.
+python src/recording_viewer.py recordings/<session-id> --output activity.png
+python src/recording_viewer.py recordings/<session-id> --summary
+```
+
+The window shows six UR5 joint traces, Flex bend/roll, four tendon traces,
+command markers, a command/console log, connection and tracking states, applied
+limits, drop counts, and the recorded camera preview with YOLO summary. Drag the
+time slider to inspect a point in the selected window. In live mode, the window
+refreshes once per second and follows the newest data. Use a session path to
+follow just that session. Offline analysis defaults to the first five minutes;
+`--start` and `--duration` select another window (up to one hour).
+
+The reader retains a bounded window and reads only newly appended complete JSONL
+lines on refresh. It retries partial lines and buffered image bytes, tolerates
+invalid complete lines with a visible count, and reads camera JPEGs by byte range.
+Preview overlays come from the recording; the viewer does not rerun YOLO.
+
 Flex commands carry the time when the coordinator last published the intent.
 The IPC worker repeats that timestamp, so a stalled coordinator still trips the
 native 350 ms command watchdog. Vision keeps the original capture timestamp;
@@ -126,9 +249,13 @@ also logs its start/target, acceleration, deceleration, velocity, and duration.
 | File | Functionality |
 | --- | --- |
 | `src/app.py` | Entry point, CLI options, HTTP API, dashboard asset serving, camera streaming, and coordinated stop/shutdown handling. |
+| `src/status.py` | Recording schema/configuration collection, independent status sampling, timestamped events, bounded queue, and five-minute JSONL/MJPEG storage. |
+| `src/keyboard_listener.py` | Windows focus-gated bridge for browser-reserved Ctrl command shortcuts. |
+| `src/recording_viewer.py` | Offline/live activity plots, time-slider inspection, camera/YOLO replay, PNG/PDF export, and JSON summary. |
 | `src/static/index.html` | Dashboard structure: device controls, camera preview, category selector, status displays, and console. |
 | `src/static/dashboard.css` | Dashboard colors, responsive layout, controls, and motion plot styling. |
 | `src/static/dashboard.js` | Browser input handling, held-key heartbeats, API requests, state polling, category selection, and display updates. |
+| `src/static/keyboard.js` | Keyboard motion/command mappings, repeat/editing guards, and native shortcut polling. |
 | `src/flex_endo_robo/control_node.py` | 125 Hz coordinator, relay connection, input expiry, RCM capture, arm commands, modeled Flex, Bird-eye/Pull Out procedures, and state snapshots. |
 | `src/flex_endo_robo/kinematics.py` | KDL chain construction, forward kinematics, camera/shaft geometry, RCM angle conversions, horizon leveling, and wrist-constrained inverse kinematics. |
 | `src/flex_endo_robo/ur5_rtde_server.py` | RTDE relay, command validation, speed/RCM constraints, telemetry, watchdogs, interrupt handling, and Dashboard Stop. Also supports standalone relay execution. |
@@ -200,11 +327,14 @@ With the `crf` environment active:
 ```powershell
 python -m unittest discover -s tests -v
 node --check src/static/dashboard.js
+node tests/test_dashboard_recording.js
+node --check src/static/keyboard.js
+node tests/test_keyboard.js
 ```
 
 The Python tests use HTTP requests in memory, actual URDF kinematics, and fake device
 interfaces. They do not open the camera, connect to the UR5, or start the motor
-driver. Node.js is needed only for the optional JavaScript syntax check.
+driver. Node.js runs the optional JavaScript syntax and recording-button checks.
 Build the native solution separately in Visual Studio. Physical calibration,
 camera alignment, and coordinated motion still require bench verification.
 

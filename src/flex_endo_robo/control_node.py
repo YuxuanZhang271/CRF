@@ -11,8 +11,8 @@ from concurrent.futures import Future
 
 import numpy as np
 
-from .flex_endo.flex_control import FLEX_KEYS, PULL_OUT_BEHIND_RCM_M, PULL_OUT_RETRACT_SPEED_M_S
-from .flex_endo.flex_ipc import DEFAULT_SPEED_DEG_S, MIN_SPEED_DEG_S
+from .flex_endo.flex_control import FLEX_KEYS, POSITION_TIMEOUT_S, PULL_OUT_BEHIND_RCM_M, PULL_OUT_RETRACT_SPEED_M_S
+from .flex_endo.flex_ipc import DEFAULT_SPEED_DEG_S, MIN_SPEED_DEG_S, POSITION
 from .kinematics import EndoscopeKinematics, rcm_tip_angles
 from .ur5_rtde_server import DEFAULT_LINEAR_SPEED_MM_S, SERVO_RESYNC_RAD, limit_servo_target
 
@@ -28,6 +28,7 @@ FLEX_TENDON_R = 0.004
 FLEX_TENDONS = [(0,'R'), (90,'G'), (180,'B'), (270,'Y')]
 FLEX_STRAIGHT_KAPPA_TOL = 1e-3
 BIRD_EYE_HORIZON_DEG = 30.0
+BIRD_EYE_TOLERANCE_DEG = 1.0
 
 FLEX_MAX_EFFECTIVE_LENGTH = FLEX_ARC_MAX - FLEX_SEG_LEN
 
@@ -110,6 +111,7 @@ class ControlNode:
         self._last_model_update = time.monotonic()
 
         self._pull_out_state = None
+        self._pull_out_complete_joints = None
         self._flex_slew_target = None
         self._model_horizon_paused = False
 
@@ -609,9 +611,20 @@ class ControlNode:
     def cmd_pull_out(self):
         if self.flex is not None:
             return self.flex.pull_out(self)
+        if self._pull_out_state is not None:
+            if self._pull_out_state['stage'] != 'confirm':
+                raise ValueError('Pull Out is already moving. Wait for the ready indication.')
+            if not self._model_pull_out_ready(self._pull_out_state):
+                raise ValueError('The zero pose changed. Start Pull Out again.')
+            self._pull_out_state['stage'] = 'retract'
+            log.info('PULL OUT confirmed; retracting')
+            return True
         if not self._arm_ready():
             return False
+        if self._arm_moving is not False or any(self._key_state.values()):
+            raise ValueError('Release the controls and wait for the UR5 to stop before starting Pull Out.')
         with self._lock:
+            self._pull_out_complete_joints = None
             rcm_on = (self.arm_mode == 'rcm' and self.rcm_enabled)
             rcm_pt = None if self.rcm_world_point is None else self.rcm_world_point.copy()
             ref_axis = None if self.rcm_ref_axis is None else self.rcm_ref_axis.copy()
@@ -642,6 +655,7 @@ class ControlNode:
 
     def _step_pull_out(self):
         if not self._arm_ready():
+            self._pull_out_state = self._flex_slew_target = None
             return
         with self._lock:
             st = self._pull_out_state
@@ -657,6 +671,11 @@ class ControlNode:
             ref_axis = self.rcm_ref_axis.copy()
             q_now = self.joint_positions.copy()
             self._set_flex_slew_target(curvature=0., steer_yaw=0.)
+        if st['stage'] == 'confirm':
+            if not self._model_pull_out_ready(st):
+                self._pull_out_state = self._flex_slew_target = None
+                log.warning('PULL OUT stopped: zero pose changed or confirmation timed out')
+            return
         try:
             axis_cur, _, p_tip_cur = self.kin.tube_axis_in_base(q_now)
             p_end_cur = self.kin.end_cylinder_in_base(q_now)
@@ -681,15 +700,14 @@ class ControlNode:
                              else self.kin.rotate_about(axis_cmd, rk/kn, step))
                 axis_next /= max(float(np.linalg.norm(axis_next)), 1e-9)
             st['axis_cmd'] = axis_next
-            p_tip_t = rcm_pt + st['d_tip_align']*axis_next
-            q_t = self.kin.ik_along_axis(p_tip_t, axis_next, q_now)
-            if q_t is not None:
-                q_t = self._auto_solve_wrist1(q_t)
-                self._send_servo(q_t, q_now, self.dt, validate=self._rcm_pose_is_valid)
-
             err_actual = math.degrees(math.acos(float(np.clip(np.dot(axis_cur, ref_axis), -1., 1.))))
             aligned = (np.allclose(axis_next, ref_axis, atol=1e-3) and err_actual < 1.0)
             if not aligned:
+                p_tip_t = rcm_pt + st['d_tip_align']*axis_next
+                q_t = self.kin.ik_along_axis(p_tip_t, axis_next, q_now)
+                if q_t is not None:
+                    q_t = self._auto_solve_wrist1(q_t)
+                    self._send_servo(q_t, q_now, self.dt, validate=self._rcm_pose_is_valid)
                 return
             if not self._flex_is_straight():
                 if not st.get('waiting_logged', False):
@@ -697,16 +715,23 @@ class ControlNode:
                     st['waiting_logged'] = True
                 return
             st['waiting_logged'] = False
+            if self._arm_moving is not False or self._teleop_servo_active:
+                return
             s_end_cur = float(np.dot(p_end_cur - rcm_pt, ref_axis))
-            st['stage'] = 'retract'
+            st['stage'] = 'confirm'
+            st['deadline'] = time.monotonic() + POSITION_TIMEOUT_S
+            st['confirm_depth'] = float(np.dot(p_tip_cur - rcm_pt, ref_axis))
             st['s_end_cmd'] = s_end_cur
-            log.info(f"PULL OUT align done (err={err_actual:.2f}°); retracting")
+            log.info('PULL OUT at zero. Verify straightness and path, then press PULL OUT again.')
             return
 
         if st['stage'] == 'retract':
             s_end_cur = float(np.dot(p_end_cur - rcm_pt, ref_axis))
             if s_end_cur >= st['end'] - 0.003:
+                if self._arm_moving is not False or self._teleop_servo_active:
+                    return
                 with self._lock:
+                    self._pull_out_complete_joints = q_now.copy()
                     self._pull_out_state = None
                     self._flex_slew_target = None
                 log.info(f"PULL OUT complete ({s_end_cur*100:.1f} cm behind RCM)")
@@ -721,6 +746,16 @@ class ControlNode:
                 q_t = self._auto_solve_wrist1(q_t)
                 self._send_servo(q_t, q_now, self.dt, validate=self._rcm_pose_is_valid)
 
+    def _model_pull_out_ready(self, st):
+        if (not self._arm_ready() or not self.rcm_enabled or self.arm_mode != 'rcm'
+                or self._arm_moving is not False or not self._flex_is_straight()
+                or self._teleop_servo_active or any(self._key_state.values())
+                or time.monotonic() >= st['deadline']):
+            return False
+        axis, _, tip = self.kin.tube_axis_in_base(self.joint_positions)
+        return (float(np.dot(axis, self.rcm_ref_axis)) > math.cos(math.radians(1.))
+                and self._rcm_pivot_is_valid(axis, tip, st['confirm_depth']))
+
     def _cancel_motion(self, *, include_flex=True):
         if include_flex and self.flex is not None:
             self.flex_stop_delivered = self.flex.stop()
@@ -729,6 +764,7 @@ class ControlNode:
                 self._key_state[key] = False
                 self._key_updated.pop(key, None)
         self._pull_out_state = None
+        self._pull_out_complete_joints = None
         if include_flex:
             self._flex_slew_target = None
         self._teleop_servo_active = False
@@ -863,12 +899,53 @@ class ControlNode:
                 self._key_updated[key] = now
 
     # ---------- state snapshot ----------
+    def _procedure_status(self, q, theta_total):
+        bird = 'unavailable'
+        pitch = None
+        if q is not None and self.kin.ready and self._motion_fault is None:
+            if self.flex is not None:
+                s = self.flex.status
+                if self.flex.ready():
+                    rotation = self.kin.physical_flex_camera_rotation(q, s.bend_x, s.bend_y, s.roll)
+                    pitch = math.degrees(math.asin(float(np.clip(-rotation[2, 2], -1., 1.))))
+                    level_error = self.flex._horizon_error(self, q)
+                    moving = bool(self.flex.pending and self.flex.pending[1] == POSITION)
+                    settled = not s.moving and self._arm_moving is False
+                else:
+                    rotation = None
+            else:
+                bend = math.degrees(theta_total)
+                rotation = self.kin.physical_flex_camera_rotation(
+                    q, -bend * math.sin(self.flex_ext_yaw), bend * math.cos(self.flex_ext_yaw),
+                    math.degrees(self.flex_base_yaw))
+                pitch = math.degrees(math.asin(float(np.clip(-rotation[2, 2], -1., 1.))))
+                level_error = math.degrees(math.asin(float(np.clip(rotation[2, 1], -1., 1.))))
+                moving = self._flex_slew_target is not None and not self.pull_out_active
+                settled = not moving and not any(self._key_state.values()) and self._arm_moving is False
+            if rotation is not None:
+                at_goal = (abs(pitch - BIRD_EYE_HORIZON_DEG) <= BIRD_EYE_TOLERANCE_DEG
+                           and abs(level_error) <= BIRD_EYE_TOLERANCE_DEG and settled)
+                bird = 'moving' if moving else 'at_position' if at_goal else 'idle'
+        if self.pull_out_active and (q is None or self._motion_fault is not None):
+            pull_out = 'unavailable'
+        elif self.flex is not None:
+            pull_out = self.flex.pull_out_state(self)
+        elif self._pull_out_state:
+            pull_out = {'align': 'preparing', 'confirm': 'ready', 'retract': 'retracting'}[self._pull_out_state['stage']]
+        elif (q is not None and self._pull_out_complete_joints is not None
+              and self._arm_moving is False and self._flex_is_straight()
+              and np.max(np.abs(q - self._pull_out_complete_joints)) < math.radians(.1)):
+            pull_out = 'complete'
+        else:
+            pull_out = 'idle'
+        return {'bird_eye_state': bird, 'camera_pitch_down_deg': pitch, 'pull_out_state': pull_out}
+
     def get_state_snapshot(self):
         """HTTP readers never wait for motion planning or device communication."""
         with self._snapshot_lock:
             if self._running.is_set() and time.monotonic() - self._snapshot_at > STATE_TIMEOUT_S:
                 raise TimeoutError("Control state is stale; waiting for the coordinator.")
-            return dict(self._snapshot)
+            return {**self._snapshot, 'snapshot_monotonic_s': self._snapshot_at}
 
     def get_state_dict(self):
         with self._lock:
@@ -888,9 +965,13 @@ class ControlNode:
                 'arm_mode': self.arm_mode,
                 'rcm_enabled': self.rcm_enabled,
                 'rcm_point': None if self.rcm_world_point is None else self.rcm_world_point.tolist(),
+                'rcm_ref_axis': None if self.rcm_ref_axis is None else self.rcm_ref_axis.tolist(),
+                'rcm_ref_depth_m': self.rcm_ref_depth,
                 'rcm_cone_deg': round(math.degrees(self.rcm_cone_half_angle)),
                 'rcm_cone_max_deg': MAX_RCM_CONE_DEG,
                 'arm_linear_speed_mm_s': self.arm_linear_speed_m_s * 1000.,
+                'pull_out_tilt_speed_deg_s': self.ARM_TILT_VEL_DEG_S,
+                'jog_speed_scale': self.jog_speed_scale,
                 'rcm_tip_angles': tip_angles,
                 'rcm_outside_cone': rcm_outside,
                 'rcm_insertion_m': rcm_insertion_m,
@@ -911,6 +992,11 @@ class ControlNode:
                 'kinematics_ready':    self.kin.ready,
                 'motion_fault':        self._motion_fault,
             }
+            state['endoscope_link_pose_base'] = None
+            if q is not None and self.kin.ready:
+                rotation, position = self.kin.fk_matrix(q)
+                state['endoscope_link_pose_base'] = {
+                    'position_m': position.tolist(), 'rotation_matrix': rotation.tolist()}
             alpha = self.flex_base_yaw + self.flex_ext_yaw
             bend = state['flex_theta_total_deg']
             state['flex_model_bend_point'] = [bend * math.sin(alpha), -bend * math.cos(alpha)]
@@ -922,4 +1008,5 @@ class ControlNode:
             state['tendons'] = {n:(L*1000, dL*1000) for n,(L,dL) in tendons.items()}
             if self.flex is not None:
                 state['flex_hardware'] = self.flex.snapshot()
+            state.update(self._procedure_status(q, theta_total))
         return state

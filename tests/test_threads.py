@@ -38,6 +38,9 @@ class CameraThreadTests(unittest.TestCase):
         with patch("scope.camera.open_camera", return_value=capture), \
                 patch("scope.camera.Detector", return_value=detector):
             feed = CameraFeed()
+            recorded = []
+            feed.recorder = SimpleNamespace(event=lambda kind, data, **kwargs:
+                                           recorded.append((kind, data, kwargs)))
             feed.select_category(39)
             feed.__enter__()
             try:
@@ -59,6 +62,19 @@ class CameraThreadTests(unittest.TestCase):
                         lambda: feed._observation is not None and feed._observation.frame == 3, 1.))
                 self.assertEqual(seen, [10, 30])
                 self.assertEqual(feed.observation().captured_at, newest_stamp)
+                camera_records = [item for item in recorded if item[0] == 'camera_frame']
+                self.assertTrue(camera_records)
+                self.assertTrue(camera_records[-1][2]['jpeg'].startswith(b'\xff\xd8'))
+                # Inference publishes its completed record just after waking observers.
+                deadline = time.monotonic() + 1.
+                while time.monotonic() < deadline and not any(
+                        item[0] == 'yolo' and item[1]['observation'].frame == 3 for item in recorded):
+                    time.sleep(.001)
+                yolo = next(item[1] for item in recorded
+                            if item[0] == 'yolo' and item[1]['observation'].frame == 3)
+                self.assertEqual(yolo['observation'].captured_at, newest_stamp)
+                self.assertEqual(yolo['detections'][0].class_id, 39)
+                self.assertEqual(yolo['target'].class_id, 39)
                 feed.select_category(41)
                 self.assertIsNone(feed.observation())
             finally:

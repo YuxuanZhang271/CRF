@@ -183,6 +183,80 @@ class ControlTests(unittest.TestCase):
         self.assertIsNone(flex.procedure)
         self.assertEqual(client.status.action, ipc.STOP)
 
+    def fresh_arm(self):
+        self.node.joint_positions = np.deg2rad([0., -120., -120., -30., 90., 45.])
+        self.node.joint_received = True
+        self.node._last_joint_at = time.monotonic()
+        self.node._arm_moving = False
+        self.node.arm_mode = 'rcm'
+        self.node._capture_rcm_unlocked()
+
+    def test_physical_pull_out_waits_for_second_press_in_both_feedback_modes(self):
+        for planned in (False, True):
+            with self.subTest(planned=planned):
+                self.fresh_arm()
+                client = MemoryFlexClient()
+                client.status = replace(client.status, flags=ipc.CALIBRATED | ipc.AT_SAVED_ZERO |
+                                       (ipc.PLANNED_FULL | ipc.PLANNED_ZERO if planned else 0))
+                flex = self.node.flex = FlexControl(client, SimpleNamespace(observation=lambda: None))
+                self.assertTrue(self.node.cmd_pull_out())
+                self.assertEqual(flex.pull_out_state(self.node), 'preparing')
+                with self.assertRaises(ValueError):
+                    self.node.cmd_pull_out()  # A repeated press during preparation cannot restart it.
+                flex._step_pull_out(self.node)
+                self.assertEqual(flex.procedure['stage'], 'confirm')
+                self.assertEqual(flex.pull_out_state(self.node), 'ready')
+                self.assertTrue(self.node.cmd_pull_out())
+                self.assertEqual(flex.procedure['stage'], 'retract')
+                self.assertEqual(flex.pull_out_state(self.node), 'retracting')
+
+    def test_pull_out_confirmation_rejects_changed_or_expired_zero_pose(self):
+        self.fresh_arm()
+        client = MemoryFlexClient()
+        client.status = replace(client.status, flags=ipc.CALIBRATED | ipc.AT_SAVED_ZERO)
+        flex = self.node.flex = FlexControl(client, SimpleNamespace(observation=lambda: None))
+        self.node.cmd_pull_out()
+        flex._step_pull_out(self.node)
+        original = self.node.joint_positions.copy()
+        self.node.joint_positions[0] += .1
+        with self.assertRaises(ValueError):
+            self.node.cmd_pull_out()
+        self.node.joint_positions = original
+        flex.procedure['deadline'] = 0.
+        with self.assertRaises(ValueError):
+            self.node.cmd_pull_out()
+
+    def test_model_pull_out_also_requires_second_press(self):
+        self.fresh_arm()
+        self.assertTrue(self.node.cmd_pull_out())
+        self.node._step_pull_out()
+        self.assertEqual(self.node._pull_out_state['stage'], 'confirm')
+        self.assertEqual(self.node.get_state_dict()['pull_out_state'], 'ready')
+        self.assertTrue(self.node.cmd_pull_out())
+        self.assertEqual(self.node._pull_out_state['stage'], 'retract')
+
+    def test_bird_eye_indication_uses_pose_without_requiring_a_command(self):
+        self.fresh_arm()
+        client = MemoryFlexClient()
+        flex = self.node.flex = FlexControl(client, None)
+        # Generate a known geometric goal, then test it without calling bird_eye().
+        rotation, _ = self.node.kin.flex_base_frame_in_base(self.node.joint_positions)
+        required = math.radians(30) - math.asin(float(np.clip(-rotation[2, 2], -1., 1.)))
+        base, distal = self.node.kin.solve_horizon_flex_yaw(self.node.joint_positions, theta_total=required)
+        client.status = replace(client.status, bend_x=-math.degrees(required) * math.sin(distal),
+                                bend_y=math.degrees(required) * math.cos(distal), roll=math.degrees(base))
+        self.assertEqual(self.node.get_state_dict()['bird_eye_state'], 'at_position')
+        client.status = replace(client.status, bend_y=0.)
+        self.assertNotEqual(self.node.get_state_dict()['bird_eye_state'], 'at_position')
+
+    def test_tracking_indicator_distinguishes_waiting_limited_and_active(self):
+        flex = FlexControl(MemoryFlexClient(), None)
+        flex.tracking = (7, 39)
+        for label, expected in (('Waiting for target', 'waiting'), ('Tracking limited · limit', 'limited'),
+                                ('Following with Flex', 'active'), ('Centered', 'active')):
+            flex.tracking_state = label
+            self.assertEqual(flex.snapshot()['tracking_indicator'], expected)
+
 
 if __name__ == "__main__":
     unittest.main()
