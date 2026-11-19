@@ -45,6 +45,7 @@ STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
+    "/static/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
     "/static/keyboard.js": ("keyboard.js", "text/javascript; charset=utf-8"),
     "/imgs/ABML_logo.png": (Path(__file__).resolve().parents[1] / "imgs" / "ABML_logo.png", "image/png"),
 }

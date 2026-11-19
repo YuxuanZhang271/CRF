@@ -4,6 +4,10 @@ Windows control application for a UR5 arm, a tendon-driven flexible endoscope,
 and a SCOPE camera. The browser dashboard combines arm jogging, remote center
 of motion (RCM) control, Flex calibration and positioning, and YOLO tracking.
 
+The dashboard uses CUHK purple and gold with light and dark modes. Use the
+**Light mode** toggle beside the ABML logo; your choice is saved in the browser.
+Before a mode is chosen, the dashboard follows the system color preference.
+
 ## Setup and launch
 
 Run from the repository root:
@@ -274,6 +278,8 @@ usually account for most of it.
 
 Run the viewer in the `crf` environment (Matplotlib, NumPy, and Pillow are already
 included). It reads files only and never connects to the arm, Flex, or camera.
+The viewer and exported plots use the matching dark palette, with purple
+playback cursors, gold command markers, and distinct colors for the traces.
 
 ```powershell
 # Inspect the first five minutes of a saved session.

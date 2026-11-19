@@ -17,6 +17,14 @@ from pathlib import Path
 from status import RECORDINGS_DIR
 
 
+VIEWER_COLORS = {
+    'background': '#17151b', 'panel': '#211e27', 'edge': '#3b3542',
+    'text': '#f3f0f5', 'muted': '#b9b2c1', 'purple': '#c995d1',
+    'gold': '#dda300', 'camera': '#101014',
+}
+TRACE_COLORS = ('#c995d1', '#e9bc62', '#5bc5a4', '#79b2f2', '#edaa78', '#d8d2de')
+
+
 def resolve_recording(path):
     """Accept a session, a segment, a JSONL file, or a root containing sessions."""
     path = Path(path).resolve()
@@ -196,8 +204,7 @@ class ActivityViewer:
         from matplotlib.widgets import Slider
 
         self.data, self.plt = data, plt
-        plt.style.use('dark_background')
-        self.figure = plt.figure(figsize=(15, 9), facecolor='#111722')
+        self.figure = plt.figure(figsize=(15, 9), facecolor=VIEWER_COLORS['background'])
         grid = self.figure.add_gridspec(3, 3, left=.06, right=.97, bottom=.14, top=.89,
                                        hspace=.48, wspace=.26, width_ratios=(1.1, 1.1, 1.25))
         self.joints = self.figure.add_subplot(grid[0, :2])
@@ -205,16 +212,37 @@ class ActivityViewer:
         self.tendons = self.figure.add_subplot(grid[2, :2])
         self.camera = self.figure.add_subplot(grid[:2, 2])
         self.console = self.figure.add_subplot(grid[2, 2])
-        self.title = self.figure.text(.06, .955, '', fontsize=15, weight='bold')
-        self.status = self.figure.text(.06, .912, '', fontsize=10, color='#a8c5df')
-        self.notice = self.figure.text(.06, .025, '', fontsize=9, color='#a8c5df')
+        self.title = self.figure.text(.06, .955, '', fontsize=15, weight='bold', color=VIEWER_COLORS['purple'])
+        self.status = self.figure.text(.06, .912, '', fontsize=10, color=VIEWER_COLORS['muted'])
+        self.notice = self.figure.text(.06, .025, '', fontsize=9, color=VIEWER_COLORS['muted'])
         low, high = data.window
         self.slider = Slider(self.figure.add_axes((.12, .067, .75, .025)), 'Time (s)', low, high,
-                             valinit=min(high, max(low, data.latest)))
+                             valinit=min(high, max(low, data.latest)),
+                             color=VIEWER_COLORS['purple'], track_color=VIEWER_COLORS['edge'],
+                             initcolor=VIEWER_COLORS['muted'],
+                             handle_style={'facecolor': VIEWER_COLORS['purple'],
+                                           'edgecolor': VIEWER_COLORS['background']})
+        self.slider.ax.set_facecolor(VIEWER_COLORS['background'])
+        self.slider.label.set_color(VIEWER_COLORS['text'])
+        self.slider.valtext.set_color(VIEWER_COLORS['text'])
         self.slider.on_changed(self.select)
         self._frame_key = None
         self.timer = None
         self.draw()
+
+    @staticmethod
+    def _style_axis(axis, *, camera=False):
+        # Reapply after clear() so live redraws keep the same local theme.
+        axis.set_facecolor(VIEWER_COLORS['camera' if camera else 'panel'])
+        axis.set_prop_cycle(color=TRACE_COLORS)
+        axis.tick_params(colors=VIEWER_COLORS['muted'])
+        axis.xaxis.label.set_color(VIEWER_COLORS['muted'])
+        axis.yaxis.label.set_color(VIEWER_COLORS['muted'])
+        axis.xaxis.get_offset_text().set_color(VIEWER_COLORS['muted'])
+        axis.yaxis.get_offset_text().set_color(VIEWER_COLORS['muted'])
+        axis.title.set_color(VIEWER_COLORS['text'])
+        for spine in axis.spines.values():
+            spine.set_color(VIEWER_COLORS['edge'])
 
     def draw(self):
         import numpy as np
@@ -250,8 +278,9 @@ class ActivityViewer:
                                    (self.flex, 'FlexEndo bend / roll', 'degrees'),
                                    (self.tendons, 'FlexEndo tendons', 'mm')):
             axis.clear()
+            self._style_axis(axis)
             axis.set(title=title, ylabel=unit, xlim=(low, high))
-            axis.grid(alpha=.15)
+            axis.grid(color=VIEWER_COLORS['edge'], alpha=1, lw=.7)
             axis.tick_params(labelsize=8)
         self.tendons.set_xlabel('Session elapsed time (s)')
         for index in range(6):
@@ -261,13 +290,15 @@ class ActivityViewer:
         for index in range(4):
             self.tendons.plot(t, [value(s, 'tendon', index) for _, s in states], lw=1, label=f'T{index + 1}')
         for axis in (self.joints, self.flex, self.tendons):
-            axis.legend(loc='upper left', ncol=6, fontsize=8, framealpha=.3)
+            axis.legend(loc='upper left', ncol=6, fontsize=8, framealpha=.9,
+                        facecolor=VIEWER_COLORS['panel'], edgecolor=VIEWER_COLORS['edge'],
+                        labelcolor=VIEWER_COLORS['text'])
         for stamp, kind, event in data.events:
             if kind == 'command' and event.get('path', '').startswith(('/api/cmd/', '/api/flex/tracking')):
-                self.joints.axvline(stamp, color='#f2c56c', alpha=.45, lw=.7)
+                self.joints.axvline(stamp, color=VIEWER_COLORS['gold'], alpha=.65, lw=.7)
                 self.joints.text(stamp, .05, event.get('command', ''), rotation=90,
-                                 transform=self.joints.get_xaxis_transform(), fontsize=6, color='#f2c56c')
-        self.cursors = [axis.axvline(self.slider.val, color='#84deec', lw=.8) for axis in
+                                 transform=self.joints.get_xaxis_transform(), fontsize=6, color=VIEWER_COLORS['gold'])
+        self.cursors = [axis.axvline(self.slider.val, color=VIEWER_COLORS['purple'], lw=1, ls='--') for axis in
                         (self.joints, self.flex, self.tendons)]
         self.title.set_text(f'CRF recording activities  ·  {data.session.name if data.session else "Waiting for recordings"}')
         self.slider.valmin, self.slider.valmax = low, high
@@ -310,6 +341,7 @@ class ActivityViewer:
         key = str(data.session) + json.dumps(frame.get('image')) if frame else None
         if key != self._frame_key or self._frame_key is None:
             self.camera.clear()
+            self._style_axis(self.camera, camera=True)
             self.camera.axis('off')
             self.camera.set_title('Recorded camera preview', fontsize=11)
             shown = False
@@ -321,17 +353,20 @@ class ActivityViewer:
                         self._frame_key = key
                         shown = True
                 except (OSError, ValueError, KeyError, TypeError) as error:
-                    self.camera.text(.05, .5, str(error), transform=self.camera.transAxes, wrap=True, fontsize=9)
+                    self.camera.text(.05, .5, str(error), transform=self.camera.transAxes,
+                                     wrap=True, fontsize=9, color=VIEWER_COLORS['text'])
             if not shown:
-                self.camera.text(.5, .3, 'No readable frame at this time', ha='center', transform=self.camera.transAxes, fontsize=10)
+                self.camera.text(.5, .3, 'No readable frame at this time', ha='center',
+                                 transform=self.camera.transAxes, fontsize=10, color=VIEWER_COLORS['muted'])
         result = data.at(data.yolo, stamp) or {}
         obs = result.get('observation', {})
         self.camera.set_title(f'Camera · YOLO frame {obs.get("frame", "—")} · '
                               f'{len(result.get("detections", []))} detections · '
                               f'{"target centered" if obs.get("centered") else "target visible" if obs.get("valid") else "no target"}', fontsize=9)
         self.console.clear()
+        self._style_axis(self.console)
         self.console.axis('off')
-        self.console.set_title('Commands / console', loc='left', fontsize=11)
+        self.console.set_title('Commands / console', loc='left', fontsize=11, color=VIEWER_COLORS['text'])
         lines = []
         for at, kind, event in reversed(data.events):
             if at <= stamp:
@@ -340,7 +375,8 @@ class ActivityViewer:
                 if len(lines) >= 10:
                     break
         self.console.text(0, .98, '\n'.join(lines[-10:]) or 'No events in this window.',
-                          va='top', fontsize=8, family='monospace', transform=self.console.transAxes)
+                          va='top', fontsize=8, family='monospace', transform=self.console.transAxes,
+                          color=VIEWER_COLORS['text'])
         self.figure.canvas.draw_idle()
 
     def follow(self):
