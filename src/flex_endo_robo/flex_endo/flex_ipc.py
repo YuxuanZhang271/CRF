@@ -21,7 +21,10 @@ assert (COMMAND.size, STATUS.size, VISION.size) == (96, 160, 88)
 (IDLE, STOP, CALIBRATE, HORIZON, JOG, POSITION, TRACK, RETURN_ZERO,
  RECHECK_STARTUP, ROLL_JOG, SET_BEND_LIMIT, SET_SPEED_LIMIT,
  WATER_SPRAY, GAS_SPRAY, CLEAN_LENS) = range(15)
+DIRECTIONAL_LOOK = 15
 WATER_SPRAY_READY, GAS_SPRAY_READY = 131072, 262144
+TIMED_SPRAY_SUPPORTED = 524288
+DIRECTIONAL_LOOK_SUPPORTED = 1048576
 SPRAY_PHASES = ("idle", "water", "gas", "cleaning_water", "waiting_water_stop", "cleaning_gas", "stopping")
 SPRAY_ERRORS = {-203: "Water pump failed to start.", -204: "Water stop command failed.",
                 -205: "Pump stop confirmation timed out.", -206: "Gas serial command failed.",
@@ -41,7 +44,7 @@ COMBINED_LIMITS_SUPPORTED = 65536
 NO_RESULT, ACCEPTED, DONE, REFUSED, CANCELED, LIMIT = range(6)
 ACTIONS = ("idle", "stop", "calibrate", "horizon", "jog", "position", "track", "return to zero",
            "recheck startup", "roll jog", "set bend limit", "set speed limit",
-           "water spray", "gas spray", "clean lens")
+           "water spray", "gas spray", "clean lens", "directional look")
 RESULTS = ("", "in progress", "complete", "refused", "canceled", "limit reached")
 AXIS_FAULT_BITS = (
     (0x02, "drive alarm"),

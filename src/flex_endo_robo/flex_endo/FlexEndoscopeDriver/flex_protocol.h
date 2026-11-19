@@ -17,7 +17,7 @@ constexpr uint64_t CleanStageMs = 3000, WaterStopTimeoutMs = 5000;
 
 enum Action : uint32_t {
     Idle, Stop, Calibrate, Horizon, Jog, Position, Track, ReturnZero,
-    RecheckStartup, RollJog, SetBendLimit, SetSpeedLimit, WaterSpray, GasSpray, CleanLens
+    RecheckStartup, RollJog, SetBendLimit, SetSpeedLimit, WaterSpray, GasSpray, CleanLens, DirectionalLook
 };
 enum SprayPhase : uint32_t {
     SprayIdle, WaterHeld, GasHeld, CleaningWater, WaitingWaterStop, CleaningGas, SprayStopping
@@ -28,7 +28,8 @@ enum Flags : uint32_t {
     RollJogSupported = 1024, BendLimitSupported = 2048,
     TrackHorizonSupported = 4096, WideBendRange = 8192, AtSavedZero = 16384,
     CoupledRollSupported = 32768, CombinedLimitsSupported = 65536,
-    WaterSprayReady = 131072, GasSprayReady = 262144
+    WaterSprayReady = 131072, GasSprayReady = 262144, TimedSpraySupported = 524288,
+    DirectionalLookSupported = 1048576
 };
 enum Result : uint32_t { None, Accepted, Done, Refused, Canceled, Limit };
 

@@ -65,6 +65,7 @@ class ControlNode:
         self.relay_port = relay_port
         self.flex = flex
         self.flex_stop_delivered = False
+        self.task_executor = None
 
         # --- kinematics ---
         self.kin = EndoscopeKinematics(
@@ -299,12 +300,16 @@ class ControlNode:
                 log.exception(f"tick error: {e}")
                 with self.control_lock:
                     self.cmd_stop()
+                    if self.task_executor is not None and self.task_executor.active is not None:
+                        self.task_executor.fail(f'Control coordinator failed: {e}')
 
     # ==================================================================
     # Tick / helpers
     # ==================================================================
 
     def _tick(self):
+        if self.task_executor is not None:
+            self.task_executor.tick()
         with self._lock:
             fault = self._motion_fault
         if fault and (self._teleop_servo_active or self._pull_out_state is not None
@@ -332,6 +337,8 @@ class ControlNode:
         servo_was_active = self._teleop_servo_active
         self._servo_sent_this_tick = False
         try:
+            if self.task_executor is not None:
+                self.task_executor.step_motion()
             if self.flex is None or not self.flex.tick(self):
                 self._step_controls(ks, pull_out_active)
         finally:

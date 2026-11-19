@@ -22,6 +22,8 @@ const context = vm.createContext({
   AbortSignal, setTimeout: () => {}, held, stateFeedReady: true, stopping: false, interrupting: false, sessionStopped: false,
   sendKey: (key, down) => sent.push({key, down}),
 });
+vm.runInContext(`let taskLocked = false;
+  function manualControlsLocked() { return taskLocked || !stateFeedReady || stopping || interrupting || sessionStopped; }`, context);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/static/keyboard.js'), 'utf8'), context);
 function key(type, code, values = {}) {
   const event = {code, target, repeat: false, preventDefault() { this.prevented = true; }, ...values};
@@ -48,6 +50,17 @@ for (const [code, id] of Object.entries({KeyB: 'bird-eye', KeyP: 'pull-out', Key
 }
 key('keydown', 'KeyI');
 assert.equal(element('interrupt').clicks, 1);
+vm.runInContext('taskLocked = true', context);
+const beforeTaskLock = sent.length;
+key('keydown', 'ArrowUp');
+key('keydown', 'KeyB', {ctrlKey: true});
+key('keydown', 'KeyR', {ctrlKey: true});
+key('keydown', 'KeyI');
+assert.equal(sent.length, beforeTaskLock);
+assert.equal(element('bird-eye').clicks, 1);
+assert.equal(element('record').clicks, 1);
+assert.equal(element('interrupt').clicks, 2);
+vm.runInContext('taskLocked = false', context);
 const count = sent.length;
 key('keydown', 'KeyW', {target: editable});
 key('keydown', 'KeyW', {isComposing: true});

@@ -125,6 +125,60 @@ Pull Out, camera tracking, and Bird-eye retain coordinated command ownership;
 an arm reset cancels a coordinated procedure. STOP and INTERRUPT still cancel
 both devices.
 
+## Executable tasks and interaction panel
+
+The **Vision-Language Interaction** column contains a **Tasks** grid (5 rows ×
+3 columns) above **YOLO**. Task numbers and names follow [tasks.md](tasks.md).
+The **TASK** status beside ARM, FLEX, and MOTION starts at **0 · Stop** and is
+shared by all dashboard clients. Selecting a task releases manual inputs and
+confirms the existing interrupt/stop path before executing the new task. A failed
+stop or execution error leaves controls locked and shows an error. Execution runs
+on the control coordinator independently of browser timers.
+
+Select buttons **1–15** to execute a task. Forward/backward jog continuously;
+zoom changes the displayed crop between 1x and 2x at 0.2x per second. Look tasks
+steer Flex first, then use the existing constrained UR5 RCM assistance; unavailable
+travel produces an orange warning and a stationary hold. In Flex-only mode,
+look tasks stop at the Flex boundary. Roll tasks hold at their roll boundary.
+Bird-eye executes the existing procedure and returns to TASK 0 when it finishes.
+Tasks **1–10** stay active until replaced or interrupted.
+
+**12 · Reset** returns UR5 tip tilt to the captured RCM reference axis, preserving
+the pivot, current insertion depth, captured reference, and RCM mode. An enabled
+UR5 must already be in RCM mode; this task never runs the default arm joint reset
+or switches to linear mode. It also resets FlexEndo bend and roll to saved zero
+and waits for both devices to settle. In Flex-only mode, it resets Flex only.
+**13 · Clean lens** runs the existing
+three-second water, confirmed water stop, then three-second air sequence.
+**14 · Spray water** and **15 · Spray air** run for **3 seconds**, timed by the
+native driver, then wait for the outputs to stop. Tasks **11–15** automatically
+return to **0 · Stop** from device feedback. Clicking an active task does not
+claim completion. **INTERRUPT** (or `I`) returns any task to 0 after stopping motion
+and keeps the session open. **16 · Tracking** in YOLO executes tracking for the
+selected category; it requires calibrated Flex, active UR5 RCM, and fresh camera
+observations. Interrupt tracking before changing its category.
+
+Every left-column control except INTERRUPT requires TASK 0, including STOP,
+RECORD, calibration, resets, limits, speeds, and held controls. Browser and native
+shortcuts and direct command APIs enforce the same rule. Running recordings
+continue during a task. Existing device readiness checks still apply at TASK 0;
+unavailable task status also locks controls. Task state and transitions are saved
+in recordings.
+
+YOLO has **9 rows × 3 columns**: Person, Bottle, Cup, Banana, and Chair occupy the
+first five slots with their existing detector IDs; the other 22 slots are blank
+and inactive. Normal and active UI states use green and white, warnings and limits
+use orange, and errors use red.
+
+The execution API is `POST /api/task` with `{"id": 0..16}` and an optional
+`zoom` ratio from 1 to 2 to establish the current viewport before a zoom task.
+ID 0 uses the same interrupt behavior as `/api/cmd/interrupt`. Browser completion
+requests to `/api/task/complete` are rejected; device feedback owns completion.
+`GET /api/state` includes task phase, message, zoom, and revision; `/api/config`
+supplies button definitions. These routes are also the entry point for future
+ASR/LLM integration. Restart the rebuilt Flex driver for timed sprays and
+directional look support; older drivers reject these commands safely.
+
 ## Keyboard and activity indicators
 
 The mappings and requested indicator behavior are in [keyboard_shortcuts.md](keyboard_shortcuts.md).
@@ -132,6 +186,7 @@ Focus the dashboard to use held arrow keys and `[` / `]` for UR5 motion,
 `W` / `A` / `S` / `D` for Flex, and `R` / `F` for physical Flex roll.
 `I` interrupts motion. `Ctrl+B`, `Ctrl+P`, `Ctrl+T`, and `Ctrl+R` trigger
 Bird-eye, Pull Out, Track, and Record through their existing button handlers.
+Tracking starts task 16; the left-column shortcuts require TASK 0.
 Motion releases on key-up, focus loss, hidden tabs, and failed state polling;
 held keys use the same heartbeat/expiry checks as pointer controls. Auto-repeat
 does not repeatedly execute commands, and shortcuts are suspended in form fields.
@@ -147,13 +202,13 @@ uses the documented [Windows low-level keyboard hook](https://learn.microsoft.co
 
 | Button | Indicator |
 | --- | --- |
-| BIRD-EYE | Yellow while positioning; green when the modeled camera view is 30° downward and level within 1°, with settled feedback, even if reached manually. |
-| PULL OUT | Yellow preparing; sky blue at the aligned UR5 / saved Flex zero pose; yellow withdrawing; green after settled completion. |
-| TRACK | Green following/centered; yellow when correction is limited; sky blue while waiting for a target. |
+| BIRD-EYE | Green while positioning and when the modeled camera view is 30° downward and level within 1°, with settled feedback, even if reached manually. |
+| PULL OUT | Green preparing, at the aligned UR5 / saved Flex zero pose, withdrawing, and after settled completion; the status text distinguishes phases. |
+| TRACK | Green while following or centered; orange when limited or waiting for a target (task 16). |
 | RECORD | Green while active; the console displays the zero-based slice directory index and the current slice timer. |
 
 **PULL OUT now requires two presses in both feedback modes.** First press aligns
-the UR5 and returns Flex to saved zero. When sky blue, verify straightness and a
+the UR5 and returns Flex to saved zero. When the status reports ready, verify straightness and a
 clear withdrawal path, then press **PULL OUT** or `Ctrl+P` again. The extra confirm
 button has been removed. Confirmation expires after 30 seconds and is rejected
 if feedback or the prepared pose changes. Colors come from state feedback, and
@@ -280,6 +335,7 @@ also logs its start/target, acceleration, deceleration, velocity, and duration.
 | --- | --- |
 | `src/app.py` | Entry point, CLI options, HTTP API, dashboard asset serving, camera streaming, and coordinated stop/shutdown handling. |
 | `src/status.py` | Recording schema/configuration collection, independent status sampling, timestamped events, bounded queue, and five-minute JSONL/MJPEG storage. |
+| `src/tasks.py` | Shared task definitions/state and nonblocking execution, completion, limit, and failure handling on the coordinator. |
 | `src/keyboard_listener.py` | Windows focus-gated bridge for browser-reserved Ctrl command shortcuts. |
 | `src/recording_viewer.py` | Offline/live activity plots, time-slider inspection, camera/YOLO replay, PNG/PDF export, and JSON summary. |
 | `src/static/index.html` | Dashboard structure: device controls, camera preview, category selector, status displays, and console. |

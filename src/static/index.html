@@ -1,10 +1,14 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CRF Control</title>
+<title>ABML General Surgical Platform</title>
 <link rel="stylesheet" href="/static/dashboard.css"></head><body>
+<header class="platform-header">
+  <h1>ABML General Surgical Platform</h1>
+  <img class="lab-logo" src="/imgs/ABML_logo.png" alt="Advanced Bio-Medical Robotics Lab">
+</header>
 <main class="workspace">
 <section class="panel robot-panel" aria-labelledby="control-heading">
-<h1 id="control-heading">FlexEndoRobot ControlPanel</h1>
+<h2 id="control-heading">Flex-Endo-Robo</h2>
 <div class="panel-scroll" tabindex="0" aria-label="Robot controls">
   <div class="card primary-actions">
     <div class="actions">
@@ -131,7 +135,7 @@
 </section>
 
 <section class="panel camera-panel" aria-labelledby="camera-heading">
-  <h2 id="camera-heading">SCOPE Camera</h2>
+  <h2 id="camera-heading">SCOPE</h2>
   <div class="camera-stage">
     <div class="camera">
       <img id="camera-feed" alt="Live SCOPE camera with detection boxes">
@@ -145,7 +149,7 @@
     </div>
     <div class="zoom-slider">
       <label for="camera-zoom">Zoom <output id="camera-zoom-ratio" for="camera-zoom">1x</output></label>
-      <input id="camera-zoom" type="range" min="1" max="2" step="0.05" value="1" aria-valuetext="1x">
+      <input id="camera-zoom" type="range" min="1" max="2" step="0.001" value="1" aria-valuetext="1x">
     </div>
     <div class="zoom-actions">
       <button id="zoom-in" type="button" title="Hold to zoom in">ZOOM IN</button>
@@ -156,16 +160,24 @@
     <div class="status-chip" id="arm-status"><dt>ARM</dt><dd>Disconnected</dd></div>
     <div class="status-chip" id="flex-connection"><dt>FLEX</dt><dd>Disconnected</dd></div>
     <div class="status-chip" id="motion-status"><dt>MOTION</dt><dd>Unavailable</dd></div>
+    <div class="status-chip" id="task-status"><dt>TASK</dt><dd>Unavailable</dd></div>
   </dl>
 </section>
 
 <aside class="panel category-panel" aria-labelledby="categories-heading">
-  <h2 id="categories-heading">YOLO Categories</h2>
+  <h2 id="categories-heading">Vision-Language Interaction</h2>
   <div class="panel-scroll">
-    <div class="card">
-      <button id="tracking" type="button" aria-pressed="false" title="Toggle tracking · Ctrl+T" aria-keyshortcuts="Control+t" disabled>TRACK</button>
-      <div class="category-options" id="category-options"></div>
-    </div>
+    <section class="card" aria-labelledby="tasks-heading">
+      <h3 id="tasks-heading">Tasks</h3>
+      <p class="task-help">Select a task to execute. Spray water/air runs for 3 seconds. INTERRUPT stops.</p>
+      <div class="task-options" id="task-options" role="group" aria-label="Tasks"></div>
+      <p id="task-message" class="status" role="status">Waiting for task status…</p>
+    </section>
+    <section class="card" aria-labelledby="yolo-heading">
+      <h3 id="yolo-heading">YOLO</h3>
+      <button id="tracking" type="button" aria-pressed="false" title="Task 16 · Track selected category · Ctrl+T" aria-keyshortcuts="Control+t" disabled>16 · TRACKING</button>
+      <div class="category-options" id="category-options" role="group" aria-label="YOLO categories"></div>
+    </section>
   </div>
 </aside>
 </main>

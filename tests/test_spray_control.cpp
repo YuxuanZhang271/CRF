@@ -19,6 +19,27 @@ struct FakeSprayIO : SprayIO {
 };
 
 int main() {
+    for (Action action : {WaterSpray, GasSpray}) {
+        FakeSprayIO io;
+        SprayControl c(io);
+        assert(c.start(action, 100, true));
+        c.tick(3099);
+        assert(c.busy() && c.result == Accepted);
+        assert(action == WaterSpray ? io.water : io.air);
+        c.tick(3100);
+        assert(!io.water && !io.air);
+        io.stopped = true;
+        c.tick(3101);
+        assert(!c.busy() && c.result == Done);
+        c.tick(10000);
+        assert(!io.water && !io.air);
+        assert(c.start(action, 11000, true));
+        c.cancel(11500);
+        io.stopped = true;
+        c.tick(15000);
+        assert(!c.busy() && c.result == Canceled);
+        assert(!io.water && !io.air);
+    }
     {
         FakeSprayIO io;
         SprayControl c(io);

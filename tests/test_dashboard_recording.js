@@ -47,6 +47,7 @@ async function main() {
   const script = fs.readFileSync(path.join(__dirname, '../src/static/dashboard.js'), 'utf8');
   // Load recording and input handlers, before unrelated limit/plot initialization.
   vm.runInContext(script.slice(0, script.indexOf('const speedFieldIds')), context);
+  vm.runInContext('stateFeedReady = true; currentTask = {id:0, revision:0}', context);
   vm.runInContext('renderRecording({active:false, dropped:{}})', context);
   const button = get('record');
   assert.equal(button.disabled, false);

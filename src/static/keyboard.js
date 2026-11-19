@@ -13,6 +13,7 @@ function editing(element) {
 }
 
 function clickShortcut(id) {
+  if (!['interrupt', 'tracking'].includes(id) && manualControlsLocked()) return;
   const button = document.getElementById(id);
   if (button && !button.disabled && !stopping && !sessionStopped) button.click();
 }
@@ -34,7 +35,7 @@ document.addEventListener('keydown', event => {
   const key = armShortcuts[event.code] || flexShortcuts[event.code]?.[hardware ? 1 : 0];
   if (!key) return;
   event.preventDefault();
-  if (event.repeat || keyboardHeld.has(event.code) || held.has(key) || !stateFeedReady || interrupting || stopping || sessionStopped) return;
+  if (event.repeat || keyboardHeld.has(event.code) || held.has(key) || manualControlsLocked()) return;
   const button = document.querySelector(`button[data-key="${key}"]`);
   if (!button || button.disabled || button.closest('[hidden]')) return;
   const owner = `keyboard:${event.code}`;
@@ -62,7 +63,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 async function pollNativeShortcuts() {
-  const enabled = document.hasFocus() && !document.hidden && !editing(document.activeElement) && !stopping && !sessionStopped;
+  const enabled = document.hasFocus() && !document.hidden && !editing(document.activeElement) && !manualControlsLocked();
   try {
     const response = await fetch('/api/keyboard', {
       method: 'POST', headers: {'Content-Type': 'application/json'},

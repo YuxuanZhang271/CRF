@@ -44,8 +44,11 @@ class SimulatedDriverTests(unittest.TestCase):
         node.flex = FlexControl(client, camera)
         node.start(connect_arm=False)
         self.addCleanup(node.stop)
-        server = SimpleNamespace(node=node, camera=camera, relay=None, stopping=False,
+        from tasks import TaskExecutor, TaskState
+        server = SimpleNamespace(tasks=TaskState(), node=node, camera=camera, relay=None, stopping=False,
                                  interrupting=False, recorder=SimpleNamespace(event=lambda *a: None))
+        server.executor = TaskExecutor(server)
+        node.task_executor = server.executor
 
         def call(path, body=None):
             # Feed real HTTP bytes to the actual handler without network access.
@@ -87,6 +90,57 @@ class SimulatedDriverTests(unittest.TestCase):
         wait_phase('gas')
         # No browser heartbeat: the coordinator must terminate the held action.
         wait_phase('idle')
+        for task_id, phase in ((14, 'water'), (15, 'gas')):
+            code, response = call('/api/task', {'id': task_id})
+            self.assertEqual(code, 200, response)
+            wait_phase(phase)
+            started = time.monotonic()
+            state = wait_phase('idle', timeout=5.)
+            self.assertGreaterEqual(time.monotonic() - started, 2.8)
+            deadline = time.monotonic() + 1.
+            while state['task']['id'] and time.monotonic() < deadline:
+                time.sleep(.01)
+                state = call('/api/state')[1]
+            self.assertEqual(state['task']['id'], 0)
+        code, response = call('/api/task', {'id': 14})
+        self.assertEqual(code, 200, response)
+        wait_phase('water')
+        self.assertEqual(call('/api/cmd/interrupt', {})[0], 200)
+        self.assertEqual(wait_phase('idle')['task']['id'], 0)
+        self.assertEqual(call('/api/flex/calibrate', {'degrees': 60})[0], 200)
+        deadline = time.monotonic() + 3.
+        while time.monotonic() < deadline:
+            with node.control_lock:
+                calibrated = node.flex.status.calibrated and node.flex.pending is None
+            if calibrated:
+                break
+            time.sleep(.01)
+        self.assertTrue(calibrated, 'Wait for native calibration completion before selecting a task')
+        wait_phase('idle')
+        for task_id in (5, 6, 7, 8, 9, 10):
+            before = call('/api/state')[1]['flex_hardware']
+            code, response = call('/api/task', {'id': task_id})
+            self.assertEqual(code, 200, response)
+            time.sleep(.25)
+            state = call('/api/state')[1]
+            self.assertIsNone(state['task']['error'], state['task'])
+            self.assertEqual(state['task']['id'], task_id)
+            after = state['flex_hardware']
+            if task_id in (9, 10):
+                self.assertGreater(abs(after['roll'] - before['roll']), .01)
+            else:
+                self.assertGreater(sum(abs(a - b) for a, b in zip(
+                    after['bend_point'], before['bend_point'])), .01)
+            self.assertEqual(call('/api/cmd/interrupt', {})[0], 200)
+            wait_phase('idle')
+        code, response = call('/api/task', {'id': 12})
+        self.assertEqual(code, 200, response)
+        state = wait_phase('idle', timeout=5.)
+        deadline = time.monotonic() + 1.
+        while state['task']['id'] and time.monotonic() < deadline:
+            time.sleep(.01)
+            state = call('/api/state')[1]
+        self.assertEqual(state['task']['id'], 0)
 
     def test_holds_cleaning_cancellation_and_watchdog_through_real_ipc(self):
         executable = Path(os.environ['CRF_SIM_DRIVER']).resolve()

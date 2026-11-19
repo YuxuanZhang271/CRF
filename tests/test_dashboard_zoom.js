@@ -31,6 +31,7 @@ document.getElementById = get;
 document.querySelectorAll = () => presets;
 const timers = new Map();
 let nextTimer = 0;
+let time = 0;
 let resizeCamera;
 get('camera-feed').parentElement = new Element();
 const context = vm.createContext({document, window,
@@ -38,19 +39,28 @@ const context = vm.createContext({document, window,
     constructor(callback) { resizeCamera = callback; }
     observe(element) { assert.equal(element, get('camera-feed').parentElement); }
   },
-  setInterval(fn) { timers.set(++nextTimer, fn); return nextTimer; },
-  clearInterval(id) { timers.delete(id); },
+  performance: {now: () => time},
+  requestAnimationFrame(fn) { timers.set(++nextTimer, fn); return nextTimer; },
+  cancelAnimationFrame(id) { timers.delete(id); },
 });
 const source = fs.readFileSync(path.join(__dirname, '../src/static/dashboard.js'), 'utf8');
 vm.runInContext(source.slice(source.indexOf('const cameraImage'), source.indexOf('const categoryButtons')), context);
 const slider = get('camera-zoom'), ratio = get('camera-zoom-ratio');
 const zoomIn = get('zoom-in'), zoomOut = get('zoom-out');
-const tick = () => [...timers.values()].forEach(fn => fn());
+const tick = (elapsed = 50) => {
+  time += elapsed;
+  for (const [id, fn] of [...timers]) {
+    timers.delete(id);
+    fn(time);
+  }
+};
 const check = zoom => {
-  assert.equal(Number(slider.value), zoom);
-  assert.equal(ratio.value, `${zoom}x`);
-  assert.equal(slider.attrs['aria-valuetext'], `${zoom}x`);
-  assert.equal(get('camera-feed').style.transform, `scale(${zoom})`);
+  assert.ok(Math.abs(Number(slider.value) - zoom) < 1e-9);
+  const label = `${Number(Number(slider.value).toFixed(2))}x`;
+  assert.equal(ratio.value, label);
+  assert.equal(slider.attrs['aria-valuetext'], label);
+  const scale = Number(get('camera-feed').style.transform.slice(6, -1));
+  assert.ok(Math.abs(scale - zoom) < 1e-9);
 };
 
 for (const width of [600, 320]) {
@@ -71,13 +81,13 @@ check(1.35);
 assert.ok(presets.every(button => button.attrs['aria-pressed'] === 'false'));
 
 zoomIn.fire('pointerdown');
-check(1.4);
+check(1.355);
 tick(); tick();
-check(1.5);
+check(1.375);
 zoomIn.fire('pointerup');
 zoomIn.fire('click'); // A pointer click must not add a second step.
 tick();
-check(1.5);
+check(1.375);
 assert.equal(timers.size, 0);
 
 for (const event of ['pointercancel', 'lostpointercapture']) {
@@ -99,11 +109,11 @@ presets[1].fire('click');
 zoomIn.fire('keydown', {code: 'Space'});
 zoomIn.fire('keydown', {code: 'Space', repeat: true});
 tick();
-check(1.6);
+check(1.515);
 document.fire('keyup', {code: 'Space'});
 assert.equal(timers.size, 0);
 zoomOut.fire('click', {detail: 0});
-check(1.55);
+check(1.505);
 zoomIn.fire('keydown', {code: 'Enter'});
 zoomIn.fire('blur');
 assert.equal(timers.size, 0);
@@ -112,7 +122,7 @@ for (const [start, button, end] of [[1.95, zoomIn, 2], [1.05, zoomOut, 1]]) {
   slider.value = start;
   slider.fire('input');
   button.fire('pointerdown');
-  tick();
+  for (let frame = 0; frame < 10; frame++) tick();
   check(end);
   assert.equal(button.disabled, true);
   assert.equal(timers.size, 0, 'holding at a limit stops the timer');
@@ -133,4 +143,19 @@ for (const [value, expected] of [[0, 1], [6, 2]]) {
   slider.fire('input');
   check(expected);
 }
+// Smooth progress must depend on elapsed time, not monitor refresh rate.
+for (const frameMs of [10, 20]) {
+  presets[0].fire('click');
+  zoomIn.fire('pointerdown');
+  for (let elapsed = 0; elapsed < 1000; elapsed += frameMs) tick(frameMs);
+  check(1.205);
+  zoomIn.fire('pointerup');
+}
+presets[0].fire('click');
+zoomIn.fire('pointerdown');
+tick(16);
+check(1.0082);
+tick(2000);
+check(1.0282); // A delayed frame cannot cause a large jump.
+zoomIn.fire('pointerup');
 console.log('Zoom defaults, presets, slider, crop scale, holds, cancellation, keyboard and limits passed.');

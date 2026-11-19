@@ -2,6 +2,7 @@
 
 import math
 import time
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -52,6 +53,8 @@ class FlexControl:
         self.pending = None
         self.tracking = None
         self.tracking_state = "Off"
+        self.task_direction = None
+        self._task_frame = 0
         self.procedure = None
         self.message = ""
         self._driver = None
@@ -116,7 +119,7 @@ class FlexControl:
     def spray_busy(self):
         return self.spray is not None or self._spray_stopping or bool(self.status and self.status.spray_phase)
 
-    def start_spray(self, action, node):
+    def start_spray(self, action, node, *, timed=False):
         if (not self.ready(calibrated=False) or not self.stop_acknowledged()
                 or self.spray_busy or self.status.moving or self.pending or self.procedure or self.tracking or self.keys
                 or node.pull_out_active or any(node._key_state.values())
@@ -126,6 +129,9 @@ class FlexControl:
                 not node._arm_ready() or node._arm_moving is not False or node._teleop_servo_active):
             raise ValueError("Wait for the UR5 to stop before spraying.")
         s = self.status
+        if timed and (action not in (ipc.WATER_SPRAY, ipc.GAS_SPRAY)
+                      or not s.flags & ipc.TIMED_SPRAY_SUPPORTED):
+            raise ValueError('Rebuild and restart the Flex driver for three-second task sprays.')
         if s.spray_error:
             raise ValueError(ipc.SPRAY_ERRORS.get(s.spray_error, "Pump fault. Restart the driver."))
         if action != ipc.GAS_SPRAY and not s.flags & ipc.WATER_SPRAY_READY:
@@ -134,9 +140,9 @@ class FlexControl:
             raise ValueError("Gas pump unavailable. Check the configured serial port and restart the driver.")
         self._horizon_paused = True
         self.stop_request = None
-        request = self.client.request(action)
+        request = self.client.request(action, x=3.) if timed else self.client.request(action)
         self.spray = (request, action, time.monotonic() + 12.)
-        self.spray_key_at = time.monotonic() if action != ipc.CLEAN_LENS else None
+        self.spray_key_at = time.monotonic() if action != ipc.CLEAN_LENS and not timed else None
         self.spray_message = "Starting lens cleaning…" if action == ipc.CLEAN_LENS else "Starting spray…"
         if not self.client.send():
             self.stop()
@@ -234,6 +240,7 @@ class FlexControl:
         self._horizon_paused = True
         self._zero_hold_joints = None
         self.tracking = None
+        self.task_direction = None
         self.tracking_state = "Off"
         self._tracking_limit = None
         self._tracking_command = None
@@ -260,6 +267,7 @@ class FlexControl:
         self.message = message
 
     def cancel_tracking(self, state="Off"):
+        self.task_direction = None
         if self.tracking is None:
             return
         self.tracking = None
@@ -353,6 +361,46 @@ class FlexControl:
         self.message = ""
         return True
 
+    def start_look(self, direction, node):
+        if (not self.jog_ready() or not self.stop_acknowledged()
+                or not self._available_for_request() or self.keys or self.pending or self.procedure):
+            raise ValueError('Directional look requires idle, connected Flex hardware.')
+        if not self.status.flags & ipc.DIRECTIONAL_LOOK_SUPPORTED:
+            raise ValueError('Rebuild and restart the Flex driver for directional look tasks.')
+        if node._recv_thread and node._recv_thread.ident and not self._rcm_ready(node):
+            raise ValueError('Look tasks with UR5 assistance require active RCM and fresh arm feedback.')
+        if self._rcm_ready(node) and not self.ready():
+            raise ValueError('Calibrate Flex before coordinated look tasks.')
+        tendon_direction = self._image_to_flex @ np.asarray(direction)
+        if not self.ready() and any(abs(v - round(v)) > 1e-6 for v in tendon_direction):
+            raise ValueError('Calibrate Flex before using look tasks with an optical roll offset.')
+        self.task_direction = tuple(direction)
+        self.tracking = (0, 0)
+        self._tracking_limit = self._tracking_command = None
+        self.tracking_state = 'Looking with Flex'
+        self.resume_horizon()
+        return True
+
+    def _step_look_without_arm(self):
+        s = self.status
+        direction = self._image_to_flex @ np.asarray(self.task_direction, dtype=float)
+        bend = np.array((s.bend_x, s.bend_y))
+        limit = s.bend_limit if s.bend_limit > 0 else self.bend_limit_max
+        held_limit = (self._tracking_limit is not None and
+                      np.linalg.norm(bend - self._tracking_limit) < .02)
+        limited = (held_limit or (s.result == ipc.LIMIT and s.sequence == self.client.sequence)
+                   or np.linalg.norm(bend + TRACK_BEND_STEP_DEG * direction) > limit)
+        if limited:
+            self._tracking_limit = bend.copy()
+            self.client.command(ipc.IDLE)
+            self._owned = False
+            self.tracking_state = 'Tracking limited · Flex edge reached; UR5 assistance unavailable'
+        else:
+            self._tracking_limit = None
+            self.client.command(ipc.JOG, x=float(direction[0]), y=float(direction[1]))
+            self._owned = True
+            self.tracking_state = 'Looking with Flex'
+
     @staticmethod
     def _fresh(observation):
         return (observation is not None
@@ -377,7 +425,7 @@ class FlexControl:
         horizon_error = self._horizon_error(node, q_now) if obs.valid else 0.
         if obs.valid and not outside_cone and abs(horizon_error) > TRACK_HORIZON_TOLERANCE_DEG:
             self._tracking_command = None
-            if self.status.action == ipc.TRACK:
+            if self.status.action in (ipc.TRACK, ipc.DIRECTIONAL_LOOK):
                 self.client.command(ipc.IDLE)
                 self._owned = False
                 self.tracking_state = "Leveling horizon"
@@ -431,7 +479,8 @@ class FlexControl:
             required_roll = self._horizon_error(node, q_now, x, y, TRACK_BEND_STEP_DEG)
             roll = self._horizon_roll_command(required_roll, TRACK_ROLL_STEP_DEG)
             if abs(required_roll - roll * TRACK_ROLL_STEP_DEG) <= TRACK_HORIZON_TOLERANCE_DEG:
-                self.client.command(ipc.TRACK, frame=obs.frame, x=x, y=y, roll=roll)
+                action = ipc.DIRECTIONAL_LOOK if self.task_direction is not None else ipc.TRACK
+                self.client.command(action, frame=0 if self.task_direction is not None else obs.frame, x=x, y=y, roll=roll)
                 if self._tracking_command is None or self.client.sequence != self._tracking_command[0]:
                     self._tracking_command = (self.client.sequence, bend, s.roll, step)
                 self._owned = True
@@ -439,7 +488,7 @@ class FlexControl:
                 return
 
         self._tracking_command = None
-        if s.action == ipc.TRACK or (s.moving and (outside_cone or s.action != ipc.HORIZON)):
+        if s.action in (ipc.TRACK, ipc.DIRECTIONAL_LOOK) or (s.moving and (outside_cone or s.action != ipc.HORIZON)):
             self.client.command(ipc.IDLE)
             self._owned = False
             self.tracking_state = "Holding Flex before arm assist"
@@ -859,6 +908,8 @@ class FlexControl:
                     4: "CLEAN LENS · waiting for water stop", 5: "CLEAN LENS · gas (3 s)",
                     6: "Spray stopping",
                 }[s.spray_phase]
+                if self.spray_key_at is None and action != ipc.CLEAN_LENS and s.spray_phase in (1, 2):
+                    self.spray_message = ('Water' if action == ipc.WATER_SPRAY else 'Air') + ' spraying · 3 s task'
                 self.client.send()
                 return True
         if s.spray_phase or self.stop_request is not None:
@@ -913,7 +964,17 @@ class FlexControl:
         else:
             self._horizon_y, self._horizon_near_vertical = None, False
         obs = self.camera.observation()
-        if self.tracking:
+        if self.task_direction is not None:
+            self._task_frame += 1
+            direction = self.task_direction
+            intent = SimpleNamespace(frame=self._task_frame, captured_at=now, revision=0,
+                category=0, valid=True, centered=False, width=640, height=640,
+                dx=100 * direction[0], dy=100 * direction[1])
+            if self._rcm_ready(node):
+                self._step_tracking(node, intent)
+            else:
+                self._step_look_without_arm()
+        elif self.tracking:
             self._step_tracking(node, obs)
         elif self.procedure:
             self._step_pull_out(node)

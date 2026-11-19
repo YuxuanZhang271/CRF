@@ -34,6 +34,7 @@ from scope.camera import CAMERA_INDEX, CameraFeed
 from scope.yolo import CATEGORIES, COLORS, MODEL_PATH
 from status import COMMAND_NAMES, RECORDINGS_DIR, Recorder, Status, app_state
 from keyboard_listener import KeyboardListener
+from tasks import TASK_NAMES, TaskExecutor, TaskState
 
 log = logging.getLogger("WindowsApp")
 DASHBOARD_CONFIRM_TIMEOUT_S = 10.0
@@ -45,6 +46,7 @@ STATIC_ROUTES = {
     "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/static/keyboard.js": ("keyboard.js", "text/javascript; charset=utf-8"),
+    "/imgs/ABML_logo.png": (Path(__file__).resolve().parents[1] / "imgs" / "ABML_logo.png", "image/png"),
 }
 
 
@@ -101,6 +103,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(self.server.recorder.status())
         elif url.path == '/api/config':
             self._json({
+                'tasks': [{'id': i, 'label': name}
+                          for i, name in enumerate(TASK_NAMES) if 1 <= i <= 15],
                 'categories': [
                     {'id': class_id, 'label': label.title(), 'color': '#%02x%02x%02x' % COLORS[class_id][::-1]}
                     for class_id, label in CATEGORIES.items()
@@ -150,6 +154,33 @@ class _Handler(BaseHTTPRequestHandler):
         if origin is not None and origin != f"http://{self.headers.get('Host')}":
             return self._json({'error': 'Request must come from the control panel'}, 403)
 
+        if self.path in ('/api/recording/start', '/api/recording/stop'):
+            # Serialize recording changes with task entry, including direct API calls.
+            with self.server.node.control_lock:
+                if self._task_locked():
+                    return self._json({'error': 'Left-column controls require TASK 0.'}, 409)
+                return self._recording_command(body)
+        if self.path == '/api/keyboard':
+            if (not isinstance(body.get('client'), str) or not 1 <= len(body['client']) <= 100
+                    or type(body.get('enabled')) is not bool):
+                return self._json({'error': 'Expected keyboard client and enabled flag.'}, 400)
+            enabled = body['enabled'] and not self._task_locked()
+            return self._json(self.server.keyboard.poll(body['client'], enabled))
+        if self.path == '/api/recording/console':
+            if (not all(isinstance(body.get(key), str) for key in ('source', 'message', 'level'))
+                    or len(body['message']) > 3000):
+                return self._json({'error': 'Expected a console source, message and level.'}, 400)
+            self.server.recorder.event('console', {**body, 'origin': 'dashboard'})
+            return self._json({'ok': True})
+
+        self._control_command(body)
+
+    def _task_locked(self):
+        task = self.server.tasks.snapshot()
+        return (task['id'] != 0 or bool(task['error']) or self.server.interrupting
+                or self.server.stopping)
+
+    def _recording_command(self, body):
         if self.path == '/api/recording/start':
             if self.server.stopping:
                 return self._json({'error': 'Control session is stopping.'}, 409)
@@ -157,11 +188,6 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({'ok': True, **self.server.recorder.start()})
             except (OSError, RuntimeError, ValueError) as error:
                 return self._json({'error': str(error)}, 503)
-        if self.path == '/api/keyboard':
-            if (not isinstance(body.get('client'), str) or not 1 <= len(body['client']) <= 100
-                    or type(body.get('enabled')) is not bool):
-                return self._json({'error': 'Expected keyboard client and enabled flag.'}, 400)
-            return self._json(self.server.keyboard.poll(body['client'], body['enabled']))
         if self.path == '/api/recording/stop':
             if body.get('confirmed') is not True:
                 return self._json({'error': 'Confirm before stopping the recording.'}, 400)
@@ -170,13 +196,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({'ok': state['error'] is None, **state})
             except RuntimeError as error:
                 return self._json({'error': str(error)}, 503)
-        if self.path == '/api/recording/console':
-            if (not all(isinstance(body.get(key), str) for key in ('source', 'message', 'level'))
-                    or len(body['message']) > 3000):
-                return self._json({'error': 'Expected a console source, message and level.'}, 400)
-            self.server.recorder.event('console', {**body, 'origin': 'dashboard'})
-            return self._json({'ok': True})
 
+    def _control_command(self, body):
         if getattr(self.server, 'recorder', None) is not None:
             self._audit = {'id': uuid.uuid4().hex, 'path': self.path,
                            'command': COMMAND_NAMES.get(self.path, self.path), 'body': body}
@@ -192,26 +213,51 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({'error': 'Expected a category ID or null'}, 400)
             try:
                 with self.server.node.control_lock:
+                    if self.server.tasks.snapshot()['id'] == 16:
+                        return self._json({'error': 'Use INTERRUPT before changing the tracked category.'}, 409)
                     prior = self.server.camera.status()['revision']
                     state = self.server.camera.select_category(body['category'])
-                    if self.server.node.flex and state['revision'] != prior:
+                    if (self.server.node.flex and self.server.node.flex.task_direction is None
+                            and state['revision'] != prior):
                         self.server.node.stop_camera_tracking()
             except ValueError as error:
                 return self._json({'error': str(error)}, 400)
             return self._json(state)
 
-        if self.path == '/api/cmd/stop':
-            return self._stop_session()
         if self.path == '/api/cmd/interrupt':
             return self._interrupt_motion()
+        if self.path == '/api/task':
+            task_id = body.get('id')
+            if type(task_id) is not int or not 0 <= task_id <= 16:
+                return self._json({'error': 'Expected a task ID from 0 to 16.'}, 400)
+            zoom = body.get('zoom')
+            if zoom is not None and (type(zoom) not in (int, float) or not 1 <= zoom <= 2):
+                return self._json({'error': 'Expected a zoom ratio from 1 to 2.'}, 400)
+            return self._interrupt_motion(task_id, zoom)
+        if self.path == '/api/task/complete':
+            return self._json({'error': 'Tasks complete from device feedback. Use INTERRUPT to cancel.'}, 409)
+        if self.path == '/api/flex/tracking':
+            if type(body.get('enabled')) is not bool:
+                return self._json({'error': 'Expected a boolean enabled value.'}, 400)
+            return self._interrupt_motion(16 if body['enabled'] else 0)
+
+        # A release may always clean up ownership; heartbeats cannot revive a held key.
+        release = self.path == '/api/key' and body.get('down') is False
+        if self.path == '/api/cmd/stop':
+            return self._stop_session()
+        with self.server.node.control_lock:
+            if self._task_locked() and not release:
+                return self._json({'error': 'Left-column controls require TASK 0. Use INTERRUPT.'}, 409)
 
         if self.server.relay is None and self.server.node.flex is None:
             return self._json({'error': 'Robot controls are disabled in camera preview.'}, 503)
 
         with self.server.node.control_lock:
+            if self._task_locked() and not release:
+                return self._json({'error': 'Left-column controls require TASK 0. Use INTERRUPT.'}, 409)
             if self.server.stopping:
                 return self._json({'error': 'Control session is stopping.'}, 503)
-            if self.server.interrupting:
+            if self.server.interrupting and not release:
                 return self._json({'error': 'Waiting for motion to stop.'}, 409)
             try:
                 accepted = self._dispatch(body)
@@ -225,41 +271,74 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({'error': 'Command unavailable. Check the current mode and diagnostics.'}, 409)
         self._json({'ok': True})
 
-    def _interrupt_motion(self):
+    def _task_event(self, task, reason):
+        self.server.recorder.event('task', {**task, 'reason': reason})
+        log.info('TASK %s · %s (%s)', task['id'], task['name'], reason)
+
+    def _interrupt_motion(self, task_id=0, zoom=None):
         node = self.server.node
         started = False
+        error = None
+        arm_failure = None
         try:
             with node.control_lock:
+                if self.server.interrupting and not task_id and not self.server.stopping:
+                    # Task 0 takes precedence over a task whose entry stop is in flight.
+                    task = self.server.tasks.select(0)
+                    self.server.executor.cancel()
+                    self._task_event(task, 'interrupt requested')
+                    return self._json({'ok': True, 'pending': True, 'task': task}, 202)
                 if self.server.stopping or self.server.interrupting:
                     return self._json({'error': 'A stop request is already in progress.'}, 409)
-                if self.server.relay is None and node.flex is None:
-                    return self._json({'error': 'Robot controls are disabled in camera preview.'}, 503)
                 self.server.interrupting = started = True
+                self.server.executor.cancel()
+                # Lock out manual inputs before clearing keys or talking to devices.
+                if task_id:
+                    task = self.server.tasks.select(task_id)
+                    revision = task['revision']
+                    if zoom is not None:
+                        self.server.tasks.update(zoom=float(zoom))
+                    self._task_event(self.server.tasks.snapshot(), 'selected')
                 arm_result = node.cmd_interrupt(self.server.relay is not None)
                 flex_request = node.flex.stop_request if node.flex_stop_delivered else None
-            flex = self._wait_for_flex_stop(flex_request)
-            arm_failure = None
+            flex = self._wait_for_flex_stop(flex_request, idle=bool(task_id))
             if arm_result is not None:
                 try:
                     arm_failure = arm_result.result(timeout=ARM_INTERRUPT_CONFIRM_TIMEOUT_S)
                 except FutureTimeoutError:
                     arm_failure = 'The UR5 did not confirm that motion stopped.'
+            error = ' '.join(filter(None, [arm_failure,
+                'Flex did not confirm that motion stopped.' if flex == 'unconfirmed' else None]))
+        except (OSError, RuntimeError) as failure:
+            error = str(failure)
+            flex, arm_result = 'unconfirmed', None
         finally:
             if started:
                 with node.control_lock:
+                    if error:
+                        self._task_event(self.server.tasks.fail(error), 'stop failed')
+                    elif not task_id:
+                        self._task_event(self.server.tasks.select(0), 'interrupted')
+                    elif self.server.tasks.snapshot()['revision'] == revision:
+                        try:
+                            self.server.executor.activate(task_id, revision)
+                        except (ValueError, RuntimeError, OSError) as failure:
+                            error = str(failure)
+                            self.server.executor.fail(error)
                     self.server.interrupting = False
         arm = 'disabled' if arm_result is None else 'unconfirmed' if arm_failure else 'confirmed'
-        errors = [arm_failure, 'Flex did not confirm that motion stopped.' if flex == 'unconfirmed' else None]
-        error = ' '.join(filter(None, errors))
-        self._json({'error': error, 'arm': arm, 'flex': flex} if error else
-                   {'ok': True, 'arm': arm, 'flex': flex}, 503 if error else 200)
+        self._json({'ok': not bool(error), 'error': error, 'arm': arm, 'flex': flex,
+                    'task': self.server.tasks.snapshot()}, 503 if error else 200)
 
     def _stop_session(self):
         node = self.server.node
         with node.control_lock:
+            if self._task_locked():
+                return self._json({'error': 'Left-column controls require TASK 0. Use INTERRUPT.'}, 409)
             if self.server.stopping:
                 return self._json({'error': 'Control session is already stopping.'}, 503)
             self.server.stopping = True
+            self.server.executor.cancel()
             node.cancel_motion()
             flex_request = (node.flex.stop_request
                             if node.flex is not None and node.flex_stop_delivered else None)
@@ -291,7 +370,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({'error': 'PolyScope stopped. Flex did not confirm Stop.'}, 503)
         self._json({'ok': True, 'arm': 'confirmed', 'flex': flex_state})
 
-    def _wait_for_flex_stop(self, flex_request):
+    def _wait_for_flex_stop(self, flex_request, *, idle=False):
         flex = self.server.node.flex
         if flex is None:
             return 'disabled'
@@ -299,7 +378,8 @@ class _Handler(BaseHTTPRequestHandler):
             deadline = time.monotonic() + FLEX_STOP_CONFIRM_TIMEOUT_S
             while time.monotonic() < deadline:
                 with self.server.node.control_lock:
-                    if flex.stop_acknowledged(flex_request):
+                    if (flex.stop_acknowledged(flex_request) and
+                            (not idle or (flex.status.action == 0 and flex.stop_request is None))):
                         return 'confirmed'
                 time.sleep(0.01)
         return 'unconfirmed'
@@ -361,16 +441,6 @@ class _Handler(BaseHTTPRequestHandler):
                 return node.flex.recheck_startup_inputs()
             if self.path == '/api/flex/confirm_pull_out':
                 return node.flex.confirm_pull_out(node)
-            if self.path == '/api/flex/tracking':
-                enabled = body.get('enabled')
-                if type(enabled) is not bool:
-                    raise ValueError("Expected a boolean enabled value.")
-                if enabled and any(node._key_state.values()):
-                    raise ValueError("Release arm controls before enabling tracking.")
-                if not enabled:
-                    node.stop_camera_tracking()
-                    return True
-                return node.flex.set_tracking(True, node)
         if self.path == '/api/key':
             key, down = body.get('key'), body.get('down')
             if not isinstance(key, str) or type(down) is not bool:
@@ -429,6 +499,7 @@ def main():
             srv = resources.enter_context(ThreadingHTTPServer((args.host_web, args.port_web), _Handler))
             srv.stopping = False
             srv.interrupting = False
+            srv.tasks = TaskState()
             srv.relay = None
             relay_port = args.relay_port
             if not (args.camera_only or args.flex_only):
@@ -450,6 +521,8 @@ def main():
                 flex=flex,
             )
             srv.recorder = Recorder(Status(srv, vars(args)), args.recordings_dir)
+            srv.executor = TaskExecutor(srv)
+            srv.node.task_executor = srv.executor
             srv.keyboard = KeyboardListener().start()
             resources.callback(srv.keyboard.close)
             srv.camera.recorder = srv.recorder
@@ -463,9 +536,8 @@ def main():
                 relay_thread.start()
                 resources.callback(relay_thread.join)
                 resources.callback(relay_shutdown.set)
-            if srv.relay is not None or flex is not None:
-                resources.callback(srv.node.stop)
-                srv.node.start(connect_arm=srv.relay is not None)
+            resources.callback(srv.node.stop)
+            srv.node.start(connect_arm=srv.relay is not None)
             log.info("Web panel: http://%s:%d", args.host_web, srv.server_port)
             try:
                 srv.serve_forever()

@@ -706,7 +706,7 @@ private:
         status_.sprayPhase = spray_.phase;
         status_.sprayError = spray_.error;
         status_.flags = RollJogSupported | CoupledRollSupported | BendLimitSupported | CombinedLimitsSupported |
-                        TrackHorizonSupported | WideBendRange |
+                        TrackHorizonSupported | WideBendRange | TimedSpraySupported | DirectionalLookSupported |
                         (sprayHardware_.waterReady() && !spray_.error ? WaterSprayReady : 0) |
                         (sprayHardware_.gasReady() && !spray_.error ? GasSprayReady : 0) |
                         (calibrated_ ? Calibrated : 0) |
@@ -736,7 +736,7 @@ private:
         const uint64_t now = GetTickCount64();
         if (busy && fresh(lastCommandAt_, now, CommandTimeoutMs)) return;
         const bool validCommand = read && valid(cmd) && cmd.driver == status_.driver &&
-                                  cmd.app && cmd.sequence && cmd.action <= CleanLens &&
+                                  cmd.app && cmd.sequence && cmd.action <= DirectionalLook &&
                                   !cmd.reserved && fresh(cmd.stamp, now, CommandTimeoutMs);
         const bool heartbeatLost = !validCommand || !fresh(lastCommandAt_, now, CommandTimeoutMs);
         const bool wasConnected = status_.app != 0;
@@ -807,12 +807,12 @@ private:
                 if (!cmd.request || cmd.request <= status_.request) return;
                 if (motion_.moving()) return;
                 if ((status_.action != Idle && status_.action != Horizon) ||
-                    !finiteAxes(cmd) || cmd.x || cmd.y || cmd.roll) {
+                    !finiteAxes(cmd) || (cmd.x != 0. && (cmd.x != 3. || cmd.action == CleanLens)) || cmd.y || cmd.roll) {
                     acknowledge(cmd, Refused);
                     return;
                 }
                 motion_.stop();
-                const bool started = spray_.start(static_cast<Action>(cmd.action), now);
+                const bool started = spray_.start(static_cast<Action>(cmd.action), now, cmd.x == 3.);
                 acknowledge(cmd, started ? Accepted : Refused);
                 if (started) status_.action = cmd.action;
                 return;
@@ -828,7 +828,7 @@ private:
                 motion_.moving()) return;
             if (cmd.request && cmd.request > status_.request) acceptRequest(cmd);
             if (cmd.action == Idle || cmd.action == Jog || cmd.action == RollJog ||
-                cmd.action == Track || cmd.action == Horizon) {
+                cmd.action == Track || cmd.action == DirectionalLook || cmd.action == Horizon) {
                 if (!calibrated_ && !plannedZero_) serviceSetupJog(cmd);
                 else serviceContinuous(cmd);
             }
@@ -1033,7 +1033,7 @@ private:
         if (motion_.moving()) return;
         const Pose current = readPose(positionFeedback(), reference_);
         const bool horizon = cmd.action == Horizon;
-        const bool tracking = cmd.action == Track;
+        const bool tracking = cmd.action == Track || cmd.action == DirectionalLook;
         const double speed = motion_.speedLimit();
         const double bendStep = horizon || manualRoll ? 0.0 : tracking ? TrackBendStep :
                                 std::min(speed, JogBendRate) * JogSegmentSeconds;

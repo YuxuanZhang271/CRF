@@ -20,11 +20,12 @@ class SprayControl {
 public:
     explicit SprayControl(SprayIO& io) : io_(io) {}
     bool busy() const { return phase != SprayIdle; }
-    bool start(Action action, uint64_t now) {
+    bool start(Action action, uint64_t now, bool timed = false) {
         if (busy() || error) return false;
         if ((action != GasSpray && !io_.waterReady()) ||
             (action != WaterSpray && !io_.gasReady())) return false;
         result = Accepted;
+        timed_ = timed;
         deadline_ = now + CleanStageMs;
         if (action == GasSpray) {
             phase = GasHeld;
@@ -43,6 +44,10 @@ public:
     void tick(uint64_t now) {
         if ((phase == WaterHeld || phase == CleaningWater || phase == WaitingWaterStop) &&
             !io_.waterHealthy()) { fail(-207, now); return; }
+        if (timed_ && (phase == WaterHeld || phase == GasHeld) && now >= deadline_) {
+            result = Done;
+            stop(now);
+        }
         if (phase == CleaningWater && now >= deadline_) {
             if (!io_.waterOff()) { fail(-204, now); return; }
             phase = WaitingWaterStop;
@@ -88,5 +93,6 @@ private:
     }
     SprayIO& io_;
     uint64_t deadline_ = 0;
+    bool timed_ = false;
 };
 }

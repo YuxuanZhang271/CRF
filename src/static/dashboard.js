@@ -6,6 +6,102 @@ const consoleRequests = new Set();
 let consoleForwardFailed = false;
 let stateFeedReady = false;
 let recordingClock = null;
+let recordingReady = false;
+let currentTask = null;
+let taskPending = false;
+let remoteBusy = false;
+const taskButtons = new Map();
+
+function manualControlsLocked() {
+  return !stateFeedReady || taskPending || currentTask?.id !== 0 || Boolean(currentTask?.error) ||
+    remoteBusy || interrupting || stopping || sessionStopped;
+}
+
+function applyTaskLock() {
+  const locked = manualControlsLocked();
+  if (locked) {
+    document.querySelectorAll('.robot-panel button, .robot-panel input, .robot-panel select').forEach(control => {
+      if (control.id !== 'interrupt') control.disabled = true;
+    });
+  }
+  document.getElementById('stop').disabled = locked;
+  recordButton.disabled = locked || recordingPending || !recordingReady;
+  document.getElementById('interrupt').disabled = interrupting || stopping || sessionStopped;
+  taskButtons.forEach(button => {
+    button.disabled = !stateFeedReady || taskPending || remoteBusy || interrupting || stopping || sessionStopped || Boolean(currentTask?.error);
+  });
+}
+
+function renderTask(task) {
+  if (!task || !Number.isInteger(task.id) || !Number.isInteger(task.revision)) {
+    currentTask = null;
+    setStatusChip('task-status', 'Unavailable', 'warning');
+    return;
+  }
+  if (currentTask && task.revision < currentTask.revision) return;
+  if (([3, 4].includes(task.id) || [3, 4].includes(currentTask?.id)) && Number.isFinite(task.zoom)) {
+    setCameraZoom(task.zoom);
+  }
+  if (task.id !== 0 && currentTask?.id !== task.id) releaseKeys();
+  currentTask = task;
+  setStatusChip('task-status', `${task.id} · ${task.name}`, task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'ok');
+  taskButtons.forEach((button, id) => {
+    const active = id === task.id;
+    button.setAttribute('aria-pressed', String(active));
+    button.title = `Execute task ${id}: ${button.dataset.label}`;
+  });
+  const message = document.getElementById('task-message');
+  message.textContent = task.error ? `${task.error} Use INTERRUPT to retry stopping.` :
+    task.id === 0 ? '0 · Stop — manual controls available when devices are ready.' :
+    `${task.id} · ${task.name} — ${task.message || 'Running; manual controls locked.'}`;
+  message.dataset.level = task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'info';
+  reportStatus('task-state', 'TASK', `${task.id} · ${task.name} · ${task.error || task.message || ''}`, message.dataset.level);
+}
+
+async function selectTask(id) {
+  if (taskPending || !stateFeedReady || remoteBusy || interrupting || stopping || sessionStopped || currentTask?.error) return;
+  if (currentTask?.id === id) return;
+  stopZoom();
+  taskPending = true;
+  releaseKeys();
+  applyTaskLock();
+  try {
+    await keyRequest;
+    const response = await fetch('/api/task', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id, zoom: cameraZoom}),
+      signal: AbortSignal.timeout(5000)
+    });
+    const result = await response.json();
+    if (result.task) renderTask(result.task);
+    if (!response.ok || !result.ok) throw new Error(result.error || 'Task request failed.');
+  } catch (error) {
+    // A timed-out request may still have reached the server. Wait for fresh state.
+    stateFeedReady = false;
+    releaseKeys();
+    writeOutput('TASK', error.message, 'error');
+  } finally {
+    taskPending = false;
+    applyTaskLock();
+  }
+}
+
+function renderTaskButtons(tasks) {
+  const options = document.getElementById('task-options');
+  options.replaceChildren();
+  taskButtons.clear();
+  for (const {id, label} of tasks) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.dataset.label = label;
+    button.setAttribute('aria-pressed', 'false');
+    button.textContent = `${id} · ${label}`;
+    button.disabled = true;
+    button.addEventListener('click', () => selectTask(id));
+    taskButtons.set(id, button);
+    options.appendChild(button);
+  }
+}
 
 function writeOutput(source, message, level = 'info', record = true) {
   const atEnd = consoleOutput.scrollHeight - consoleOutput.scrollTop - consoleOutput.clientHeight < 12;
@@ -41,11 +137,12 @@ function writeOutput(source, message, level = 'info', record = true) {
 
 const recordButton = document.getElementById('record');
 function renderRecording(state) {
+  recordingReady = true;
   recordingActive = state.active;
   recordButton.setAttribute('aria-pressed', String(recordingActive));
   recordButton.textContent = recordingActive ? 'RECORD ●' : 'RECORD';
   recordButton.title = recordingActive ? 'Stop recording' : 'Start recording';
-  recordButton.disabled = recordingPending || stopping || sessionStopped;
+  recordButton.disabled = recordingPending || manualControlsLocked();
   const label = document.getElementById('recording-status');
   recordingClock = {at: performance.now(), state};
   const dropped = Object.values(state.dropped || {}).reduce((a, b) => a + b, 0);
@@ -73,7 +170,7 @@ function updateRecordingClock() {
 setInterval(updateRecordingClock, 200);
 
 recordButton.addEventListener('click', async () => {
-  if (recordingPending || stopping || sessionStopped) return;
+  if (recordingPending || manualControlsLocked()) return;
   recordingPending = true;
   recordButton.disabled = true;
   try {
@@ -99,7 +196,7 @@ recordButton.addEventListener('click', async () => {
     writeOutput('RECORD', error.message, 'error');
   } finally {
     recordingPending = false;
-    recordButton.disabled = stopping || sessionStopped;
+    recordButton.disabled = manualControlsLocked();
   }
 });
 
@@ -111,6 +208,7 @@ async function pollRecording() {
     if (!recordingPending) renderRecording(state);
   } catch (error) {
     if (!stopping && !sessionStopped) {
+      recordingReady = false;
       document.getElementById('recording-status').textContent = error.message;
       recordButton.disabled = true;
     }
@@ -125,6 +223,8 @@ function reportStatus(key, source, message, level) {
 }
 
 async function post(path, body = {}, quiet = false) {
+  const release = path === '/api/key' && body.down === false;
+  if (!['/api/cmd/interrupt', '/api/cmd/stop'].includes(path) && !release && manualControlsLocked()) return false;
   const timeout = path === '/api/cmd/stop' ? 12000 : path === '/api/cmd/interrupt' ? 4000 : 1000;
   try {
     const response = await fetch(path, {
@@ -135,6 +235,10 @@ async function post(path, body = {}, quiet = false) {
     });
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error(result.error || 'Command refused');
+    if (path === '/api/cmd/interrupt') {
+      if (result.pending) remoteBusy = true;
+      if (result.task) renderTask(result.task);
+    }
     return true;
   } catch (e) {
     if (!quiet) writeOutput('CMD', e.message, 'error');
@@ -207,7 +311,7 @@ function releaseKeys() {
   document.querySelectorAll('[data-held]').forEach(button => delete button.dataset.held);
 }
 async function stopSession() {
-  if (stopping) return;
+  if (manualControlsLocked()) return;
   stopping = true;
   document.getElementById('stop').disabled = true;
   document.getElementById('interrupt').disabled = true;
@@ -232,15 +336,17 @@ async function stopSession() {
 async function interruptMotion() {
   if (interrupting || stopping) return;
   interrupting = true;
+  applyTaskLock();
   const button = document.getElementById('interrupt');
   button.disabled = true;
-  held.clear();
+  releaseKeys();
   writeOutput('APP', 'Waiting for motion to stop.');
   if (await post('/api/cmd/interrupt') && !stopping) {
-    writeOutput('APP', 'Motion interrupted. Control session remains open.', 'success');
+    writeOutput('APP', remoteBusy ? 'Interrupt requested; waiting for motion to stop.' :
+      'Motion interrupted. Control session remains open.', remoteBusy ? 'warning' : 'success');
   }
   interrupting = false;
-  button.disabled = stopping;
+  applyTaskLock();
 }
 async function calibrateFlex() {
   if (applyingLimits.has('flex')) return;
@@ -274,6 +380,8 @@ async function pollState() {
     stateFeedReady = false;
     renderMeasurements();
     renderStatusBar({});
+    renderTask(null);
+    document.getElementById('task-message').textContent = 'Task status unavailable; manual controls locked.';
     syncDeviceLimits('arm', null, null, null, false, false);
     syncDeviceLimits('flex', null, null, null, false, false);
     pullOutButton.disabled = true;
@@ -282,6 +390,7 @@ async function pollState() {
       delete document.getElementById(id).dataset.activity;
     });
     releaseKeys();
+    applyTaskLock();
     document.querySelectorAll('button[data-key]').forEach(button => { button.disabled = true; });
     if (!stopping) reportStatus('state-feed', 'APP', 'Control state unavailable.', 'error');
   }
@@ -476,19 +585,20 @@ function renderStatusBar(s) {
   if (s.arm_enabled === false) setStatusChip('arm-status', 'Disabled');
   else if (armFault) setStatusChip('arm-status', 'Error', 'error');
   else if (armConnected) setStatusChip('arm-status', 'Connected', 'ok');
-  else setStatusChip('arm-status', 'Disconnected');
+  else setStatusChip('arm-status', 'Disconnected', 'warning');
 
   if (flexFault) setStatusChip('flex-connection', 'Error', 'error');
   else if (flex?.connected) setStatusChip('flex-connection', 'Connected', 'ok');
-  else if (flex?.driver_online) setStatusChip('flex-connection', 'Connecting', 'active');
+  else if (flex?.driver_online) setStatusChip('flex-connection', 'Connecting', 'warning');
   else if (!flex && s.arm_enabled !== undefined) {
     setStatusChip('flex-connection', s.arm_enabled ? 'Modeled' : 'Disabled');
-  } else setStatusChip('flex-connection', 'Disconnected');
+  } else setStatusChip('flex-connection', 'Disconnected', 'warning');
 
   const armStill = s.arm_enabled === false || (armConnected && !armFault && s.arm_moving === false);
   const flexStill = !flex || (flex.connected && !flexFault && flex.moving === false);
   if (sessionStopped) setStatusChip('motion-status', 'Stopped', 'ok');
-  else if (stopping || s.stopping || interrupting || s.interrupting) setStatusChip('motion-status', 'Stopping', 'active');
+  else if (stopping || s.stopping || interrupting || s.interrupting) setStatusChip('motion-status', 'Stopping', 'warning');
+  else if ([5, 6, 7, 8].includes(currentTask?.id) && flex?.tracking) setStatusChip('motion-status', 'Looking', 'active');
   else if (flex?.tracking || s.tracking) setStatusChip('motion-status', 'Tracking', 'tracking');
   else if (s.arm_moving === true || flex?.moving === true) setStatusChip('motion-status', 'Moving', 'active');
   else if ((s.arm_enabled || flex) && armStill && flexStill) setStatusChip('motion-status', 'Standstill', 'ok');
@@ -497,6 +607,8 @@ function renderStatusBar(s) {
 
 function renderState(s) {
   stateFeedReady = true;
+  remoteBusy = Boolean(s.stopping || s.interrupting);
+  renderTask(s.task);
   renderMeasurements(s);
   renderStatusBar(s);
   const flex = s.flex_hardware;
@@ -509,7 +621,7 @@ function renderState(s) {
   const armReady = s.relay_connected && s.joints_received && s.kinematics_ready && !s.motion_fault;
   const rcmReady = armReady && s.arm_mode === 'rcm' && s.rcm_enabled;
   const sprayBusy = Boolean(flex?.spray_busy);
-  const controlsAvailable = !stopping && !interrupting && !s.stopping && !s.interrupting;
+  const controlsAvailable = !manualControlsLocked() && !s.stopping && !s.interrupting;
   const limitEditable = controlsAvailable && !sprayBusy;
   document.querySelectorAll('button[data-key^="arm_"]').forEach(button => {
     button.disabled = !armReady || !limitEditable;
@@ -526,9 +638,10 @@ function renderState(s) {
   reportStatus('arm-fault', 'ARM', s.motion_fault, s.stopping ? 'info' : 'error');
   reportStatus('arm-kinematics', 'ARM', s.arm_enabled && s.kinematics_ready === false ? 'Kinematics unavailable.' : '', 'error');
   reportStatus('arm-mode', 'ARM', armReady ? `Arm mode ${s.arm_mode.toUpperCase()}.` : '');
-  tracking.setAttribute('aria-pressed', String(Boolean(flex?.tracking)));
-  tracking.disabled = !limitEditable || !flex || (!flex.tracking && (!flexReady ||
-    !flex.tracking_horizon_supported || flex.busy || !rcmReady || selectedCategory === null));
+  tracking.setAttribute('aria-pressed', String(currentTask?.id === 16));
+  tracking.disabled = taskPending || remoteBusy || interrupting || stopping || sessionStopped || !stateFeedReady ||
+    Boolean(currentTask?.error) || (currentTask?.id !== 16 &&
+      (!flexReady || !flex.tracking_horizon_supported || !rcmReady || selectedCategory === null));
   reportStatus('tracking', 'TRACKING', flex?.tracking_state);
   const birdEye = document.getElementById('bird-eye');
   birdEye.disabled = !limitEditable || !armReady || (hardware && (!flexReady || flex.busy || flex.tracking));
@@ -550,16 +663,16 @@ function renderState(s) {
     const ready = flex.connected && !flex.fault;
     const flexSpeedEditable = limitEditable && ready && !flex.busy && !flex.tracking;
     const calibrate = document.getElementById('calibrate');
-    calibrate.disabled = !ready || flex.busy || flex.tracking || flex.setup_encoder_mismatch;
+    calibrate.disabled = !controlsAvailable || !ready || flex.busy || flex.tracking || flex.setup_encoder_mismatch;
     calibrate.dataset.planned = String(flex.planned_feedback);
     const editable = limitEditable && !calibrate.disabled && flex.bend_limit_supported;
     syncDeviceLimits('flex', flex.bend_limit || flex.bend_limit_default, flex.bend_limit_max,
       flex.speed_limit_deg_s, editable, flexSpeedEditable, editable && flex.bend_limit > 0);
     const recheck = document.getElementById('flex-recheck');
     recheck.hidden = !flex.startup_recheck && !flex.recheck_pending;
-    recheck.disabled = flex.recheck_pending;
+    recheck.disabled = !controlsAvailable || flex.recheck_pending;
     document.getElementById('flex-return-zero').disabled =
-      !ready || flex.busy || flex.tracking || !(flex.calibrated || flex.planned_zero);
+      !controlsAvailable || !ready || flex.busy || flex.tracking || !(flex.calibrated || flex.planned_zero);
     document.querySelectorAll('#flex-hardware-controls button').forEach(button => {
       const needsRollSupport = button.dataset.key.startsWith('flex_roll_') && !flex.roll_jog_supported;
       button.disabled = !limitEditable || !ready || flex.setup_encoder_mismatch || needsRollSupport;
@@ -567,15 +680,15 @@ function renderState(s) {
     reportStatus('flex-fault', 'FLEX', flex.fault ? `GTS fault ${flex.fault}${flex.fault_detail ? ' · ' + flex.fault_detail : ''}` : '', 'error');
     reportStatus('flex-recovery', 'FLEX', flex.startup_recheck ?
       'Check Flex drive power, the shared I/O connection, and the alarm and limit inputs. Then recheck Flex inputs.' :
-      flex.fault ? 'Resolve the GTS fault and restart the session.' : '');
+      flex.fault ? 'Resolve the GTS fault and restart the session.' : '', 'warning');
     reportStatus('flex-encoder', 'FLEX', flex.setup_encoder_mismatch ?
       'Setup blocked. Planned travel and encoder feedback disagree. See the driver console.' : '', 'error');
     reportStatus('flex-setup', 'FLEX', ready && !flex.calibrated && !flex.planned_zero && !flex.setup_encoder_mismatch ?
-      'Straighten and align Flex before calibrating. CALIBRATE also saves the bend limit.' : '');
+      'Straighten and align Flex before calibrating. CALIBRATE also saves the bend limit.' : '', 'warning');
     reportStatus('flex-capability', 'FLEX', ready && (!flex.bend_limit_supported || !flex.roll_jog_supported) ?
-      'Rebuild and restart the Flex driver for adjustable bend limits and coordinated roll jogging.' : '');
+      'Rebuild and restart the Flex driver for adjustable bend limits and coordinated roll jogging.' : '', 'warning');
     reportStatus('tracking-capability', 'TRACKING', ready && !flex.tracking_horizon_supported ?
-      'Rebuild and restart the Flex driver for horizon-constrained tracking and the expanded bend range.' : '');
+      'Rebuild and restart the Flex driver for horizon-constrained tracking and the expanded bend range.' : '', 'warning');
     reportStatus('flex-message', 'FLEX', flex.message);
   } else {
     const editable = Boolean(s.arm_enabled && limitEditable && !s.pull_out_active && !s.tracking);
@@ -598,6 +711,14 @@ function renderState(s) {
   });
   reportStatus('spray-message', 'SPRAY', flex?.spray_message || '');
   reportStatus('spray-error', 'SPRAY', flex?.spray_error || '', 'error');
+  applyTaskLock();
+  const taskZoom = [3, 4].includes(currentTask?.id) || taskPending;
+  zoomSlider.disabled = taskZoom;
+  zoomPresets.forEach(button => { button.disabled = taskZoom; });
+  zoomIn.disabled = taskZoom || cameraZoom === 2;
+  zoomOut.disabled = taskZoom || cameraZoom === 1;
+  if (taskZoom) stopZoom();
+  categoryButtons.forEach(button => { button.disabled = currentTask?.id === 16; });
 }
 
 function setActivity(button, state) {
@@ -617,19 +738,19 @@ const zoomIn = document.getElementById('zoom-in');
 const zoomOut = document.getElementById('zoom-out');
 const zoomPresets = document.querySelectorAll('[data-zoom]');
 let cameraZoom = 1;
-let zoomTimer = null;
+let zoomFrame = null;
 let zoomOwner = null;
 
 function stopZoom() {
-  clearInterval(zoomTimer);
-  zoomTimer = null;
+  cancelAnimationFrame(zoomFrame);
+  zoomFrame = null;
   zoomOwner = null;
 }
 
 function setCameraZoom(value) {
   if (!Number.isFinite(value)) return;
-  cameraZoom = Math.round(Math.min(2, Math.max(1, value)) * 100) / 100;
-  const label = `${cameraZoom}x`;
+  cameraZoom = Math.min(2, Math.max(1, value));
+  const label = `${Number(cameraZoom.toFixed(2))}x`;
   // Enlarge around the center; the camera viewport clips the outer image.
   cameraImage.style.transform = `scale(${cameraZoom})`;
   zoomSlider.value = cameraZoom;
@@ -656,9 +777,17 @@ zoomPresets.forEach(button => button.addEventListener('click', () => {
   const start = owner => {
     stopZoom();
     zoomOwner = owner;
-    setCameraZoom(cameraZoom + direction * 0.05);
+    setCameraZoom(cameraZoom + direction * 0.005);
+    let previousTime = performance.now();
+    const advance = time => {
+      // 0.2x per second, with small frame updates and no jump after a stall.
+      const elapsed = Math.min(100, Math.max(0, time - previousTime));
+      previousTime = time;
+      setCameraZoom(cameraZoom + direction * elapsed * 0.0002);
+      if (zoomOwner !== null) zoomFrame = requestAnimationFrame(advance);
+    };
     if (zoomOwner !== null) {
-      zoomTimer = setInterval(() => setCameraZoom(cameraZoom + direction * 0.05), 100);
+      zoomFrame = requestAnimationFrame(advance);
     }
   };
   button.addEventListener('pointerdown', event => {
@@ -682,7 +811,7 @@ zoomPresets.forEach(button => button.addEventListener('click', () => {
   button.addEventListener('click', event => {
     if (event.detail === 0 && !button.disabled) {
       stopZoom();
-      setCameraZoom(cameraZoom + direction * 0.05);
+      setCameraZoom(cameraZoom + direction * 0.01);
     }
   });
 });
@@ -697,7 +826,9 @@ setCameraZoom(1);
 
 const categoryButtons = new Map();
 document.getElementById('tracking').addEventListener('click', event => {
-  post('/api/flex/tracking', {enabled: event.currentTarget.getAttribute('aria-pressed') !== 'true'});
+  if (event.currentTarget.disabled) return;
+  if (currentTask?.id === 16) interruptMotion();
+  else selectTask(16);
 });
 let selectedCategory = null;
 let viewRevision = -1;
@@ -765,6 +896,8 @@ async function pollCamera() {
 
 function renderCategoryButtons(categories) {
   const options = document.getElementById('category-options');
+  options.replaceChildren();
+  categoryButtons.clear();
   for (const {id, label, color} of categories) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -782,16 +915,24 @@ function renderCategoryButtons(categories) {
     categoryButtons.set(id, button);
     options.appendChild(button);
   }
+  for (let i = categories.length; i < 27; i++) {
+    const slot = document.createElement('div');
+    slot.className = 'category-placeholder';
+    slot.setAttribute('aria-hidden', 'true');
+    options.appendChild(slot);
+  }
 }
 
 async function init() {
   pollRecording();
   const cfg = await (await fetch('/api/config')).json();
+  renderTaskButtons(cfg.tasks);
   renderCategoryButtons(cfg.categories);
   pollState();
   pollCamera();
 }
 renderMeasurements();
+applyTaskLock();
 init().catch(error => {
   writeOutput('APP', `Could not load the control panel. ${error.message}`, 'error');
 });

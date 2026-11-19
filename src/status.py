@@ -44,6 +44,7 @@ COMMAND_NAMES = {
     '/api/flex/tracking': 'TRACK', '/api/cmd/interrupt': 'INTERRUPT',
     '/api/cmd/stop': 'STOP', '/api/flex/calibrate': 'CALIBRATE',
     '/api/cmd/clean_lens': 'CLEAN LENS',
+    '/api/task': 'TASK', '/api/task/complete': 'TASK COMPLETE',
 }
 
 
@@ -69,6 +70,7 @@ def app_state(server):
     state = server.node.get_state_snapshot()
     state.update(stopping=server.stopping, interrupting=server.interrupting,
                  arm_enabled=server.relay is not None)
+    state['task'] = server.tasks.snapshot()
     if server.relay is not None:
         state['motion_fault'] = server.relay.motion_fault()
     return state
@@ -99,7 +101,8 @@ class Status:
         except TimeoutError as error:
             state = {'error': str(error), 'stale': True,
                      'stopping': self.server.stopping,
-                     'interrupting': self.server.interrupting}
+                     'interrupting': self.server.interrupting,
+                     'task': self.server.tasks.snapshot()}
         camera = self.server.camera.status()
         config = {'launch': self.launch_config, 'module_defaults': self.defaults,
                   'control': {key: state.get(key) for key in CONFIG_FIELDS},

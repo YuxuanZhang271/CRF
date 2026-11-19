@@ -46,7 +46,7 @@ async function main() {
   });
   const source = fs.readFileSync(path.join(__dirname, '../src/static/dashboard.js'), 'utf8');
   vm.runInContext(source.slice(0, source.indexOf('const speedFieldIds')), context);
-  vm.runInContext('stateFeedReady = true', context);
+  vm.runInContext('stateFeedReady = true; currentTask = {id:0, revision:0}', context);
   const flush = () => vm.runInContext('keyRequest', context);
   water.fire('pointerdown');
   await flush();
@@ -93,12 +93,18 @@ async function main() {
   vm.runInContext(`
     const pullOutButton = document.getElementById('pull-out');
     let pullOutPending = false, selectedCategory = null;
+    const zoomSlider = document.getElementById('camera-zoom'), zoomPresets = [],
+      zoomIn = document.getElementById('zoom-in'), zoomOut = document.getElementById('zoom-out');
+    let cameraZoom = 1;
+    const categoryButtons = new Map();
+    function stopZoom() {}
     function renderMeasurements() {}
     function renderStatusBar() {}
+    function setStatusChip() {}
     function syncDeviceLimits() {}
   `, context);
   vm.runInContext(source.slice(source.indexOf('function renderState('), source.indexOf('const cameraImage')), context);
-  context.state = {arm_enabled: false, flex_hardware: {connected: true, moving: false,
+  context.state = {task: {id:0, name:'Stop', revision:0}, arm_enabled: false, flex_hardware: {connected: true, moving: false,
     busy: false, tracking: false, fault: 0, water_ready: true, gas_ready: true}};
   vm.runInContext('renderState(state)', context);
   assert.equal(water.disabled, false);
