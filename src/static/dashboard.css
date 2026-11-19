@@ -11,7 +11,7 @@ body{height:100dvh;padding:14px;font-family:system-ui,Arial,sans-serif;backgroun
 .category-panel{grid-area:categories}
 .panel-scroll{overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
 .panel-scroll>.card:last-child{margin-bottom:0}
-.camera-panel{grid-area:camera;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:8px}
+.camera-panel{grid-area:camera;display:grid;grid-template-rows:auto minmax(0,1fr) auto auto;gap:8px}
 .camera-panel h2{margin-bottom:0}
 h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
 .card{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:12px;margin-bottom:10px}
@@ -75,6 +75,17 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
 .camera{position:relative;display:grid;place-items:center;width:min(100cqw,100cqh);aspect-ratio:1;border:1px solid var(--edge);border-radius:10px;background:#080a10;overflow:hidden}
 .camera img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .camera img:not([src]){visibility:hidden}
+.camera-zoom{display:flex;flex-wrap:wrap;justify-self:center;align-items:center;gap:10px;min-width:0;max-width:100%}
+.zoom-presets,.zoom-actions{display:flex;gap:4px;flex:none}
+.camera-zoom button{padding:8px 6px;white-space:nowrap}
+.zoom-presets button[aria-pressed="true"]{background:var(--hi);color:var(--bg)}
+.zoom-actions{margin-left:auto}
+.zoom-actions button{touch-action:none;user-select:none}
+.zoom-slider{flex:1;min-width:60px}
+.zoom-slider label{display:flex;justify-content:space-between;color:var(--dim);font-size:11px}
+.zoom-slider output{color:var(--fg);font:12px ui-monospace,Consolas,monospace}
+.zoom-slider input{display:block;width:100%;margin:4px 0 0;accent-color:var(--hi)}
+.zoom-slider input:focus-visible{outline:2px solid var(--hi);outline-offset:2px}
 .motion-plots{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 .motion-plot{display:grid;justify-items:center;align-content:start;min-width:0;
   margin:0;padding:6px;background:var(--card);border:1px solid var(--edge);border-radius:8px;text-align:center}
@@ -125,6 +136,7 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
   .category-panel{max-height:44dvh}
   .category-options{display:flex;overflow:auto;gap:5px;padding:2px}
   .category-options button{flex:none}
+  .camera-zoom{gap:6px}
 }
 @media(max-width:560px){
   .workspace{grid-template-columns:minmax(0,1fr);grid-template-areas:"camera" "categories" "controls";

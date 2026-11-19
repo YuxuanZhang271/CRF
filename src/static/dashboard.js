@@ -606,6 +606,95 @@ function setActivity(button, state) {
 }
 
 const cameraImage = document.getElementById('camera-feed');
+const zoomControls = document.getElementById('camera-zoom-controls');
+// Match the actual square viewport, including when its height limits its width.
+new ResizeObserver(([entry]) => {
+  zoomControls.style.width = `${entry.borderBoxSize[0].inlineSize}px`;
+}).observe(cameraImage.parentElement);
+const zoomSlider = document.getElementById('camera-zoom');
+const zoomRatio = document.getElementById('camera-zoom-ratio');
+const zoomIn = document.getElementById('zoom-in');
+const zoomOut = document.getElementById('zoom-out');
+const zoomPresets = document.querySelectorAll('[data-zoom]');
+let cameraZoom = 1;
+let zoomTimer = null;
+let zoomOwner = null;
+
+function stopZoom() {
+  clearInterval(zoomTimer);
+  zoomTimer = null;
+  zoomOwner = null;
+}
+
+function setCameraZoom(value) {
+  if (!Number.isFinite(value)) return;
+  cameraZoom = Math.round(Math.min(2, Math.max(1, value)) * 100) / 100;
+  const label = `${cameraZoom}x`;
+  // Enlarge around the center; the camera viewport clips the outer image.
+  cameraImage.style.transform = `scale(${cameraZoom})`;
+  zoomSlider.value = cameraZoom;
+  zoomSlider.setAttribute('aria-valuetext', label);
+  zoomRatio.value = label;
+  zoomIn.disabled = cameraZoom === 2;
+  zoomOut.disabled = cameraZoom === 1;
+  zoomPresets.forEach(button => {
+    button.setAttribute('aria-pressed', String(Number(button.dataset.zoom) === cameraZoom));
+  });
+  if (zoomIn.disabled || zoomOut.disabled) stopZoom();
+}
+
+zoomSlider.addEventListener('input', () => {
+  stopZoom();
+  setCameraZoom(Number(zoomSlider.value));
+});
+zoomPresets.forEach(button => button.addEventListener('click', () => {
+  stopZoom();
+  setCameraZoom(Number(button.dataset.zoom));
+}));
+
+[[zoomIn, 1], [zoomOut, -1]].forEach(([button, direction]) => {
+  const start = owner => {
+    stopZoom();
+    zoomOwner = owner;
+    setCameraZoom(cameraZoom + direction * 0.05);
+    if (zoomOwner !== null) {
+      zoomTimer = setInterval(() => setCameraZoom(cameraZoom + direction * 0.05), 100);
+    }
+  };
+  button.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || button.disabled) return;
+    event.preventDefault();
+    button.setPointerCapture(event.pointerId);
+    start(event.pointerId);
+  });
+  ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(type => {
+    button.addEventListener(type, event => {
+      if (zoomOwner === event.pointerId) stopZoom();
+    });
+  });
+  button.addEventListener('keydown', event => {
+    if (!['Space', 'Enter'].includes(event.code)) return;
+    event.preventDefault();
+    if (!event.repeat && !button.disabled) start(event.code);
+  });
+  button.addEventListener('blur', stopZoom);
+  // Assistive technology and programmatic clicks have no pointer press.
+  button.addEventListener('click', event => {
+    if (event.detail === 0 && !button.disabled) {
+      stopZoom();
+      setCameraZoom(cameraZoom + direction * 0.05);
+    }
+  });
+});
+document.addEventListener('keyup', event => {
+  if (zoomOwner === event.code) stopZoom();
+});
+window.addEventListener('blur', stopZoom);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopZoom();
+});
+setCameraZoom(1);
+
 const categoryButtons = new Map();
 document.getElementById('tracking').addEventListener('click', event => {
   post('/api/flex/tracking', {enabled: event.currentTarget.getAttribute('aria-pressed') !== 'true'});

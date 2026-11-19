@@ -137,6 +137,21 @@
       <img id="camera-feed" alt="Live SCOPE camera with detection boxes">
     </div>
   </div>
+  <div id="camera-zoom-controls" class="camera-zoom" role="group" aria-label="Camera zoom">
+    <div class="zoom-presets" aria-label="Zoom presets">
+      <button type="button" data-zoom="1" aria-pressed="true">1x</button>
+      <button type="button" data-zoom="1.5" aria-pressed="false">1.5x</button>
+      <button type="button" data-zoom="2" aria-pressed="false">2x</button>
+    </div>
+    <div class="zoom-slider">
+      <label for="camera-zoom">Zoom <output id="camera-zoom-ratio" for="camera-zoom">1x</output></label>
+      <input id="camera-zoom" type="range" min="1" max="2" step="0.05" value="1" aria-valuetext="1x">
+    </div>
+    <div class="zoom-actions">
+      <button id="zoom-in" type="button" title="Hold to zoom in">ZOOM IN</button>
+      <button id="zoom-out" type="button" title="Hold to zoom out" disabled>ZOOM OUT</button>
+    </div>
+  </div>
   <dl class="status-bar" aria-label="Robot status">
     <div class="status-chip" id="arm-status"><dt>ARM</dt><dd>Disconnected</dd></div>
     <div class="status-chip" id="flex-connection"><dt>FLEX</dt><dd>Disconnected</dd></div>

@@ -71,6 +71,10 @@ the scope. Camera tracking requires a selected category, fresh feedback,
 calibrated Flex, and an active UR5 RCM. **INTERRUPT** cancels motion while keeping
 the session open; **STOP** stops motion and shuts down the app.
 
+The camera zoom slider defaults to **1x** and ranges from **1x to 2x**. Use the
+**1x**, **1.5x**, and **2x** presets, or hold **ZOOM IN** / **ZOOM OUT** for continuous
+adjustment. Zoom enlarges and crops the center of the displayed image.
+
 **WATER SPRAY** and **GAS SPRAY** sit between APPLY and CALIBRATE in FlexEndo.
 Hold either button to spray and release to stop. Pointer cancellation, moving
 the mouse outside the button, focus loss, and held-input expiry also stop the
@@ -355,6 +359,7 @@ python -m unittest discover -s tests -v
 node --check src/static/dashboard.js
 node tests/test_dashboard_recording.js
 node tests/test_dashboard_spray.js
+node tests/test_dashboard_zoom.js
 node --check src/static/keyboard.js
 node tests/test_keyboard.js
 ```
