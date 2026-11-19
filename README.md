@@ -1,116 +1,72 @@
-# CRF
+# CRF (Currently flexible endoscopic robot only)
 
-Windows control application for a UR5 arm, a tendon-driven flexible endoscope,
-and a SCOPE camera. The browser dashboard combines arm jogging, remote center
-of motion (RCM) control, Flex calibration and positioning, and YOLO tracking.
+CRF is an integrated surgical agentic system for gastrectomy. 
 
-The dashboard uses CUHK purple and gold with light and dark modes. Use the
-**Light mode** toggle beside the ABML logo; your choice is saved in the browser.
-Before a mode is chosen, the dashboard follows the system color preference.
+![System architecture](imgs/system_architecture.jpg)
 
-## Setup and launch
+- [CRF (Currently flexible endoscopic robot only)](#crf-currently-flexible-endoscopic-robot-only)
+  - [Prerequisites](#prerequisites)
+  - [Quick start](#quick-start)
+  - [Recording viewer](#recording-viewer)
+  - [Architecture](#architecture)
+    - [Thread ownership](#thread-ownership)
+  - [File reference](#file-reference)
+    - [Application](#application)
+    - [Native Flex driver](#native-flex-driver)
+    - [Repository and verification](#repository-and-verification)
+    - [Bundled KDL parser dependency](#bundled-kdl-parser-dependency)
+
+
+
+## Prerequisites
+
+Due to control card driver supported system, the device system has to be ***Windows***. Hopefully we can use ***RTDE*** to control the UR5 robot arm, skipping the ROS2 bridge so there's no requirements for a second Ubuntu device. For an alternative, you may use a Jetson connecting to PC as a virtual network card. 
+
+![Alternative System Architecture](imgs/system_architecture_alt.jpg)
+
+
+
+## Quick start
 
 Run from the repository root:
 
 ```powershell
+# Config python env
 conda env create -f environment.yaml
 conda activate crf
-```
 
-The pinned Windows environment includes PyKDL, OpenCV, Ultralytics, and
-`ur-rtde`. For the native driver, install Visual Studio 2022 with the C++ desktop
-workload, v143 toolset, and a Windows SDK. Build
-`src/flex_endo_robo/flex_endo/FlexEndoscopeDriver.sln` in **Debug | x86** to match
-the supplied GTS library. Python and the driver exchange fixed-size messages
-through Windows shared memory.
-
-Close any running driver or Web UI, then start the full system:
-
-```powershell
+# Run the WebUI and control system in one-click
 .\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1
 ```
 
-Open [the control panel](http://127.0.0.1:8080). The default UR5 address is
-`192.168.1.10`. The launcher starts the driver and Python app and waits for the
-driver to exit when the app closes.
+Open [the control panel](http://127.0.0.1:8080). 
 
-| Launcher option | Purpose |
-| --- | --- |
-| `-RobotIp 192.168.1.10` | Override the UR5 address. |
-| `-Port 8080` | Change the dashboard port. |
-| `-Configuration Release` | Use a Release build. |
-| `-Feedback Planned` | Default: use planned motor travel as feedback. |
-| `-Feedback Encoder` | Use encoder feedback. |
-| `-Feedback Simulated` | Simulate Flex motors; full-app mode still connects to the UR5. |
-| `-FlexOnly` | Run Flex without connecting to the UR5. |
-| `-CameraRollOffsetDeg 0` | Supply optical roll relative to the modeled camera. |
-| `-GasPort COM4` | Arduino gas-pump serial port (9600 baud, 8N1; `1` on / `0` off). |
-| `-WaterVelocity 30` | Axis-6 water-pump velocity; nonzero, from -30 to 30 controller units. Verify direction and flow on the bench. |
+![WebUI Dark](imgs/dark_webui.png)
+![WebUI Light](imgs/light_webui.png)
 
-Pull Out uses a fixed endpoint 100 mm beyond the captured RCM on the withdrawal
-side. This preserves the previous 100 mm setting. It describes the final tip
-location, so the total withdrawal from the starting pose can be about 267 mm.
 
-Other entry points:
+
+## Recording viewer
+
+Run the viewer in the `crf` environment (Matplotlib, NumPy, and Pillow are already
+included). It reads files only and never connects to the arm, Flex, or camera.
+The viewer and exported plots use the matching dark palette, with purple
+playback cursors, gold command markers, and distinct colors for the traces.
 
 ```powershell
-# Passive camera preview without motor or RTDE connections.
-python src/app.py --camera-only
+# Inspect the first five minutes of a saved session.
+python src/recording_viewer.py recordings/<session-id>
 
-# Simulated Flex without a UR5 connection; requires a built native driver.
-.\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -FlexOnly -Feedback Simulated
-
-# UR5 with modeled Flex, without the native motor driver.
-python src/app.py --arm-only
-
-# Full app when the Flex driver is already running separately.
-python src/app.py --robot-ip 192.168.1.10
-
-# Show all Python app options.
-python src/app.py --help
+# Export a static plot or a JSON activity/configuration summary.
+python src/recording_viewer.py recordings/<session-id> --output activity.png
+python src/recording_viewer.py recordings/<session-id> --summary
 ```
 
-Startup leaves motion idle. Calibrate Flex at rest after physically aligning
-the scope. Camera tracking requires a selected category, fresh feedback,
-calibrated Flex, and an active UR5 RCM. **INTERRUPT** cancels motion while keeping
-the session open; **STOP** stops motion and shuts down the app.
+![Recording Viewer](imgs/recording_viewer.png)
 
-The camera zoom slider defaults to **1x** and ranges from **1x to 2x**. Use the
-**1x**, **1.5x**, and **2x** presets, or hold **ZOOM IN** / **ZOOM OUT** for continuous
-adjustment. Zoom enlarges and crops the center of the displayed image.
 
-**WATER SPRAY** and **GAS SPRAY** sit between APPLY and CALIBRATE in FlexEndo.
-Hold either button to spray and release to stop. Pointer cancellation, moving
-the mouse outside the button, focus loss, and held-input expiry also stop the
-spray. A focused spray button supports holding Space or Enter.
-**CLEAN LENS**, between BIRD-EYE and PULL OUT, runs water for **3 seconds**,
-waits for axis 6 to stop, then runs gas for **3 seconds**. Click it again to
-cancel. INTERRUPT and STOP cancel both pump outputs.
-
-Spraying requires stationary connected motion hardware, released manual
-controls, and no tracking or positioning procedure. Motion and settings are
-blocked during spraying; automatic horizon adjustments stay paused until
-manual control or a new procedure resumes them. Bend calibration and a UR5
-connection are not required in Flex-only mode. Water and gas availability are
-independent; CLEAN LENS requires both. Missing gas hardware does not prevent
-Flex motion or water spraying. Pump faults remain latched until driver restart.
-
-The native driver owns axis 6 and the serial port, uses nonblocking stage
-timing, and stops pumps on application-heartbeat loss. Water stop confirmation
-uses controller status/velocity. Gas feedback confirms serial writes only,
-not measured flow. The Arduino firmware is external to this repository; its
-`1`/`0` protocol cannot guarantee shutoff after driver termination, USB loss,
-or host failure without a firmware watchdog. Simulated mode performs no pump
-or serial I/O. Python and native code must both use IPC protocol V5.
 
 ## Architecture
-
-`app.py` owns HTTP routes and process lifetimes. `control_node.py` coordinates
-arm intent and procedures; `ur5_rtde_server.py` owns RTDE connections and arm
-motion. `flex_control.py` coordinates physical Flex behavior, while
-`flex_ipc.py` transports commands and feedback to the C++ driver. The camera
-workers share one camera stream across viewers, with capture and preview
-running separately from YOLO inference.
 
 ### Thread ownership
 
@@ -124,214 +80,7 @@ running separately from YOLO inference.
 | YOLO inference | Processes the newest available raw frame; skips superseded frames instead of growing a queue. |
 | HTTP request handlers | Serve controls, cached state, and MJPEG streams. State requests do not acquire the motion lock; stale control snapshots return HTTP 503. |
 
-Standalone UR5 RESET and Flex RESET can run independently, in either order.
-Pull Out, camera tracking, and Bird-eye retain coordinated command ownership;
-an arm reset cancels a coordinated procedure. STOP and INTERRUPT still cancel
-both devices.
 
-## Executable tasks and interaction panel
-
-The **Vision-Language Interaction** column contains a **Tasks** grid (5 rows ×
-3 columns) above **YOLO**. Task numbers and names follow [tasks.md](tasks.md).
-The **TASK** status beside ARM, FLEX, and MOTION starts at **0 · Stop** and is
-shared by all dashboard clients. Selecting a task releases manual inputs and
-confirms the existing interrupt/stop path before executing the new task. A failed
-stop or execution error leaves controls locked and shows an error. Execution runs
-on the control coordinator independently of browser timers.
-
-Select buttons **1–15** to execute a task. Forward/backward jog continuously;
-zoom changes the displayed crop between 1x and 2x at 0.2x per second. Look tasks
-steer Flex first, then use the existing constrained UR5 RCM assistance; unavailable
-travel produces an orange warning and a stationary hold. In Flex-only mode,
-look tasks stop at the Flex boundary. Roll tasks hold at their roll boundary.
-Bird-eye executes the existing procedure and returns to TASK 0 when it finishes.
-Tasks **1–10** stay active until replaced or interrupted.
-
-**12 · Reset** returns UR5 tip tilt to the captured RCM reference axis, preserving
-the pivot, current insertion depth, captured reference, and RCM mode. An enabled
-UR5 must already be in RCM mode; this task never runs the default arm joint reset
-or switches to linear mode. It also resets FlexEndo bend and roll to saved zero
-and waits for both devices to settle. In Flex-only mode, it resets Flex only.
-**13 · Clean lens** runs the existing
-three-second water, confirmed water stop, then three-second air sequence.
-**14 · Spray water** and **15 · Spray air** run for **3 seconds**, timed by the
-native driver, then wait for the outputs to stop. Tasks **11–15** automatically
-return to **0 · Stop** from device feedback. Clicking an active task does not
-claim completion. **INTERRUPT** (or `I`) returns any task to 0 after stopping motion
-and keeps the session open. **16 · Tracking** in YOLO executes tracking for the
-selected category; it requires calibrated Flex, active UR5 RCM, and fresh camera
-observations. Interrupt tracking before changing its category.
-
-Every left-column control except INTERRUPT requires TASK 0, including STOP,
-RECORD, calibration, resets, limits, speeds, and held controls. Browser and native
-shortcuts and direct command APIs enforce the same rule. Running recordings
-continue during a task. Existing device readiness checks still apply at TASK 0;
-unavailable task status also locks controls. Task state and transitions are saved
-in recordings.
-
-YOLO has **9 rows × 3 columns**: Person, Bottle, Cup, Banana, and Chair occupy the
-first five slots with their existing detector IDs; the other 22 slots are blank
-and inactive. Normal and active UI states use green and white, warnings and limits
-use orange, and errors use red.
-
-The execution API is `POST /api/task` with `{"id": 0..16}` and an optional
-`zoom` ratio from 1 to 2 to establish the current viewport before a zoom task.
-ID 0 uses the same interrupt behavior as `/api/cmd/interrupt`. Browser completion
-requests to `/api/task/complete` are rejected; device feedback owns completion.
-`GET /api/state` includes task phase, message, zoom, and revision; `/api/config`
-supplies button definitions. These routes are also the entry point for future
-ASR/LLM integration. Restart the rebuilt Flex driver for timed sprays and
-directional look support; older drivers reject these commands safely.
-
-## Keyboard and activity indicators
-
-The mappings and requested indicator behavior are in [keyboard_shortcuts.md](keyboard_shortcuts.md).
-Focus the dashboard to use held arrow keys and `[` / `]` for UR5 motion,
-`W` / `A` / `S` / `D` for Flex, and `R` / `F` for physical Flex roll.
-`I` interrupts motion. `Ctrl+B`, `Ctrl+P`, `Ctrl+T`, and `Ctrl+R` trigger
-Bird-eye, Pull Out, Track, and Record through their existing button handlers.
-Tracking starts task 16; the left-column shortcuts require TASK 0.
-Motion releases on key-up, focus loss, hidden tabs, and failed state polling;
-held keys use the same heartbeat/expiry checks as pointer controls. Auto-repeat
-does not repeatedly execute commands, and shortcuts are suspended in form fields.
-In arm-only modeled mode, `R` / `F` do not change arc length; the modeled arc
-buttons remain available with the pointer.
-
-Windows starts `keyboard_listener.py` to forward browser-reserved Ctrl shortcuts
-to the focused dashboard. It requires both a recent browser focus lease and a
-foreground window title beginning with `CRF Control`. It queues button clicks;
-the native hook does not issue motor commands. Other platforms retain the DOM
-listener, where browser-reserved shortcuts may take precedence. The implementation
-uses the documented [Windows low-level keyboard hook](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc).
-
-| Button | Indicator |
-| --- | --- |
-| BIRD-EYE | Green while positioning and when the modeled camera view is 30° downward and level within 1°, with settled feedback, even if reached manually. |
-| PULL OUT | Green preparing, at the aligned UR5 / saved Flex zero pose, withdrawing, and after settled completion; the status text distinguishes phases. |
-| TRACK | Green while following or centered; orange when limited or waiting for a target (task 16). |
-| RECORD | Green while active; the console displays the zero-based slice directory index and the current slice timer. |
-
-**PULL OUT now requires two presses in both feedback modes.** First press aligns
-the UR5 and returns Flex to saved zero. When the status reports ready, verify straightness and a
-clear withdrawal path, then press **PULL OUT** or `Ctrl+P` again. The extra confirm
-button has been removed. Confirmation expires after 30 seconds and is rejected
-if feedback or the prepared pose changes. Colors come from state feedback, and
-the text below the buttons describes the current phase.
-
-## Session recording
-
-Use **RECORD** beside the console to start a session. The button turns green while
-recording. Press it again and confirm the popup to stop and save. Recording also
-closes during normal app shutdown, including **STOP**. It works in camera-only
-preview and continues when the dashboard is closed or refreshed.
-
-`src/status.py` defines the recording schema, configuration collection, sample
-rate, rotation interval, and background storage. Control settings stay owned by
-their existing controllers; the recorder collects their applied values. Sessions
-are saved to `recordings/<UTC-session-id>/` by default; use
-`--recordings-dir <path>` to choose another folder. Recordings are ignored by Git.
-
-Each session contains five-minute numbered directories (`00000`, `00001`, …):
-
-| File | Contents |
-| --- | --- |
-| `events.jsonl` | One complete JSON object per line, with event type, sequence, UTC timestamp, elapsed seconds, monotonic timestamp, and data. |
-| `camera.mjpeg` | Concatenated JPEG preview frames, created when frames are available. Each `camera_frame` JSON event identifies its file, byte offset, and byte length. |
-
-The shared timeline accommodates different source rates:
-
-- Robot and camera status are sampled at a target 20 Hz, independently of the
-  browser. Robot snapshots include source timestamps, joint angles, modeled
-  endoscope-link Cartesian pose in the base frame, Flex roll/bend/tendons,
-  connections, motion, faults, calibration flags, and native command feedback.
-  These are dashboard-rate snapshots, not every 125 Hz servo/RTDE packet.
-- Configuration is saved at the start of every segment and when values change:
-  launch arguments, Python module defaults, applied tip/bend/speed limits,
-  captured RCM point/axis/depth, and Flex calibration and feedback modes.
-- Camera previews are recorded at their available capture rate, even without a
-  browser viewer. They contain the same detection overlays as the dashboard.
-  YOLO events record every completed inference, including boxes, classes,
-  confidence, selected target, centering error, category revision, and original
-  frame capture timestamp. Match frame/revision IDs and capture times rather
-  than assuming inference and preview advance together.
-- Requests and HTTP outcomes are recorded for controls, settings, category
-  selection, **BIRD-EYE**, **PULL OUT**, **TRACK**, **INTERRUPT**, and **STOP**,
-  including refused commands. Matching request IDs join requests and responses;
-  motion completion is reported by subsequent robot feedback. **CALIBRATE**
-  also records the available pose at request time. Native raw motor zero offsets
-  are not exposed by the shared-memory protocol and are not reconstructed.
-- Python logging and dashboard console messages are recorded while active.
-  Dashboard messages require an open connected browser. The separate C++ driver
-  terminal's raw stdout is not forwarded to Python; its exposed fault and command
-  feedback are captured in robot snapshots.
-
-One writer performs disk I/O, with a bounded queue (4096 records and a 32 MiB
-estimated payload budget), reserving capacity for commands and logs when camera
-traffic is high. Disk errors and dropped-record counts appear beside **RECORD**;
-drop counts are also saved in state and session-stop events. Files flush about
-once a second and on stop. A forced process termination can lose buffered data;
-completed JSONL lines remain readable. Five-minute rotation limits individual
-file size; total disk use keeps growing until recording stops. Camera images
-usually account for most of it.
-
-## Recording viewer
-
-Run the viewer in the `crf` environment (Matplotlib, NumPy, and Pillow are already
-included). It reads files only and never connects to the arm, Flex, or camera.
-The viewer and exported plots use the matching dark palette, with purple
-playback cursors, gold command markers, and distinct colors for the traces.
-
-```powershell
-# Inspect the first five minutes of a saved session.
-python src/recording_viewer.py recordings/<session-id>
-
-# Follow the newest recording and automatically discover new slices/sessions.
-python src/recording_viewer.py recordings --live
-
-# Inspect minutes 5–10, or pass a single numbered segment / events.jsonl file.
-python src/recording_viewer.py recordings/<session-id> --start 300 --duration 300
-
-# Export a static plot or a JSON activity/configuration summary.
-python src/recording_viewer.py recordings/<session-id> --output activity.png
-python src/recording_viewer.py recordings/<session-id> --summary
-```
-
-The window shows six UR5 joint traces, Flex bend/roll, four tendon traces,
-command markers, a command/console log, connection and tracking states, applied
-limits, drop counts, and the recorded camera preview with YOLO summary. Drag the
-time slider to inspect a point in the selected window. In live mode, the window
-refreshes once per second and follows the newest data. Use a session path to
-follow just that session. Offline analysis defaults to the first five minutes;
-`--start` and `--duration` select another window (up to one hour).
-
-The reader retains a bounded window and reads only newly appended complete JSONL
-lines on refresh. It retries partial lines and buffered image bytes, tolerates
-invalid complete lines with a visible count, and reads camera JPEGs by byte range.
-Preview overlays come from the recording; the viewer does not rerun YOLO.
-
-Flex commands carry the time when the coordinator last published the intent.
-The IPC worker repeats that timestamp, so a stalled coordinator still trips the
-native 350 ms command watchdog. Vision keeps the original capture timestamp;
-late inference does not make an old target fresh. Preview overlays use recent
-completed detections, and inference failure is reported while preview continues.
-Thread rates are scheduling targets, not hard real-time guarantees.
-
-Native position completion allows a settled profile residual of up to eight
-pulses (under 0.01° on roll). Planned return-to-zero uses the same tolerance.
-Trap acceleration has a 0.01 pulse/ms² floor so a small roll correction beside
-a large tendon move cannot produce a near-zero ramp. Shared completion timing
-includes acceleration/deceleration and smoothing, with velocities solved for
-that duration while retaining the existing speed caps.
-If a planned profile stops 8–64 pulses from its target, the driver can issue at
-most two small correction moves toward the original endpoint. It does not
-report completion until feedback reaches the eight-pulse tolerance. Larger
-errors, continued motion past the deadline, exhausted retries, and SDK errors
-still fault. Correction moves are disabled in encoder mode.
-The encoder travel check remains 25 pulses in encoder mode, and a profile still
-moving at its deadline still faults. Driver faults `-112` and `-113` mean profile
-completion timeout and encoder-following failure respectively; terminal output
-includes the residual, feedback mode, and axis status. A rejected trap command
-also logs its start/target, acceleration, deceleration, velocity, and duration.
 
 ## File reference
 
@@ -411,56 +160,3 @@ from the application.
 | `kdl_parser/urdf_parser_py/xml_reflection/__init__.py` | XML reflection package exports. |
 | `kdl_parser/urdf_parser_py/xml_reflection/basics.py` | Basic XML value conversion and helpers. |
 | `kdl_parser/urdf_parser_py/xml_reflection/core.py` | XML reflection types, attributes, aggregates, and serialization machinery. |
-
-## Validation
-
-With the `crf` environment active:
-
-```powershell
-python -m unittest discover -s tests -v
-node --check src/static/dashboard.js
-node tests/test_dashboard_recording.js
-node tests/test_dashboard_spray.js
-node tests/test_dashboard_zoom.js
-node --check src/static/keyboard.js
-node tests/test_keyboard.js
-```
-
-The Python tests use HTTP requests in memory, actual URDF kinematics, and fake device
-interfaces. They do not open the camera, connect to the UR5, or start the motor
-driver. Node.js runs the optional JavaScript syntax and recording-button checks.
-Build the native solution separately in Visual Studio. Physical calibration,
-camera alignment, and coordinated motion still require bench verification.
-
-To build from a VS 2022 Developer PowerShell or Developer Command Prompt:
-
-```powershell
-msbuild src/flex_endo_robo/flex_endo/FlexEndoscopeDriver.sln /p:Configuration=Debug /p:Platform=x86
-```
-
-To run the native completion checks, use an **x86** VS 2022 developer shell
-after building the driver:
-
-```powershell
-$driverSource = 'src/flex_endo_robo/flex_endo/FlexEndoscopeDriver'
-$testOutput = 'src/flex_endo_robo/flex_endo/build/Win32/Debug'
-cl /nologo /std:c++17 /EHsc /source-charset:.936 /execution-charset:utf-8 "/Fo$testOutput/test_flex_motion.obj" "/Fe$testOutput/test_flex_motion.exe" tests/test_flex_motion.cpp "$driverSource/gts.lib" /link /INCREMENTAL:NO
-& "$testOutput/test_flex_motion.exe"
-```
-
-These checks mock GTS feedback and never open hardware. Fault messages from the
-negative cases are expected; the final line reports the number of passed checks.
-
-The pump state machine also has a standalone native test:
-
-```powershell
-cl /nologo /std:c++17 /EHsc "/Fo$testOutput/test_spray_control.obj" "/Fe$testOutput/test_spray_control.exe" tests/test_spray_control.cpp
-& "$testOutput/test_spray_control.exe"
-# Opt-in real shared-memory integration; the test always spawns --simulate.
-$env:CRF_SIM_DRIVER = (Resolve-Path "$testOutput/FlexEndoscopeDriver.exe").Path
-python -m unittest discover -s tests -p test_spray_driver.py -v
-```
-
-The retired named-world-target prototype, its unused geometry helpers, the old
-integration plan, and the Visual C++ template header have been removed. The
-active YOLO camera tracker and `--arm-only` modeled Flex mode remain.
