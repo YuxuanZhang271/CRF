@@ -10,16 +10,22 @@ import time
 from dataclasses import dataclass
 
 
-PREFIX = r"Local\CRFFlexV4"
+PREFIX = r"Local\CRFFlexV5"
 APPLICATION_MUTEX = r"Local\CRFFlexV1Application"
-MAGIC, VERSION = 0x58454C46, 4
+MAGIC, VERSION = 0x58454C46, 5
 COMMAND = struct.Struct("<4I6Q2I3d")
-STATUS = struct.Struct("<4I5Q4IiI9d")
+STATUS = struct.Struct("<4I5Q4IiI9dIi")
 VISION = struct.Struct("<4I4Q4I2diI")
-assert (COMMAND.size, STATUS.size, VISION.size) == (96, 152, 88)
+assert (COMMAND.size, STATUS.size, VISION.size) == (96, 160, 88)
 
 (IDLE, STOP, CALIBRATE, HORIZON, JOG, POSITION, TRACK, RETURN_ZERO,
- RECHECK_STARTUP, ROLL_JOG, SET_BEND_LIMIT, SET_SPEED_LIMIT) = range(12)
+ RECHECK_STARTUP, ROLL_JOG, SET_BEND_LIMIT, SET_SPEED_LIMIT,
+ WATER_SPRAY, GAS_SPRAY, CLEAN_LENS) = range(15)
+WATER_SPRAY_READY, GAS_SPRAY_READY = 131072, 262144
+SPRAY_PHASES = ("idle", "water", "gas", "cleaning_water", "waiting_water_stop", "cleaning_gas", "stopping")
+SPRAY_ERRORS = {-203: "Water pump failed to start.", -204: "Water stop command failed.",
+                -205: "Pump stop confirmation timed out.", -206: "Gas serial command failed.",
+                -207: "Water pump axis fault or status unavailable."}
 CALIBRATED, MOVING, SIMULATED, SETUP_ENCODER_MISMATCH = (1, 4, 8, 32)
 MANUAL_BENCH = 64
 PLANNED_ZERO = 128
@@ -34,7 +40,8 @@ COUPLED_ROLL_SUPPORTED = 32768
 COMBINED_LIMITS_SUPPORTED = 65536
 NO_RESULT, ACCEPTED, DONE, REFUSED, CANCELED, LIMIT = range(6)
 ACTIONS = ("idle", "stop", "calibrate", "horizon", "jog", "position", "track", "return to zero",
-           "recheck startup", "roll jog", "set bend limit", "set speed limit")
+           "recheck startup", "roll jog", "set bend limit", "set speed limit",
+           "water spray", "gas spray", "clean lens")
 RESULTS = ("", "in progress", "complete", "refused", "canceled", "limit reached")
 AXIS_FAULT_BITS = (
     (0x02, "drive alarm"),
@@ -73,6 +80,8 @@ class FlexStatus:
     tendons: tuple
     fault_axis_status: int = 0
     speed_limit: float = DEFAULT_SPEED_DEG_S
+    spray_phase: int = 0
+    spray_error: int = 0
 
     @property
     def fault_detail(self):
@@ -261,11 +270,12 @@ class FlexClient:
         driver, stamp, app, seq, req, action, reserved, flags, result, fault, axis_status, *pose = fields[4:]
         if (not driver or not stamp or not 0 <= self._api.now() - stamp <= FEEDBACK_TIMEOUT_MS
                 or action >= len(ACTIONS) or reserved or result >= len(RESULTS)
+                or not 0 <= pose[9] < len(SPRAY_PHASES)
                 or not all(map(math.isfinite, pose)) or pose[3] < 0 or pose[8] < MIN_SPEED_DEG_S
                 or (pose[3] == 0 and flags & (CALIBRATED | PLANNED_ZERO))):
             raise OSError("Invalid or stale Flex status")
         return FlexStatus(driver, stamp, app, seq, req, action, flags, result, fault,
-                          *pose[:4], tuple(pose[4:8]), axis_status, pose[8])
+                          *pose[:4], tuple(pose[4:8]), axis_status, pose[8], pose[9], pose[10])
 
     def command(self, action, *, request=0, frame=0, x=0., y=0., roll=0.):
         with self._lock:

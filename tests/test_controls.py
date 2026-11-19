@@ -106,7 +106,7 @@ class ControlTests(unittest.TestCase):
     def test_camera_tracking_uses_current_observation(self):
         observation = SimpleNamespace(revision=7, category=39, captured_at=time.monotonic())
         camera = SimpleNamespace(observation=lambda: observation)
-        status = SimpleNamespace(fault=0, positioning_ready=True, moving=False,
+        status = SimpleNamespace(fault=0, positioning_ready=True, moving=False, spray_phase=0,
                                  action=ipc.IDLE, flags=ipc.TRACK_HORIZON_SUPPORTED)
         flex = FlexControl(SimpleNamespace(status=status, ready=True), camera)
         node = SimpleNamespace(_arm_ready=lambda: True, arm_mode="rcm", rcm_enabled=True,
@@ -122,7 +122,7 @@ class ControlTests(unittest.TestCase):
 
     def test_ipc_layout_sizes_match_native_protocol(self):
         self.assertEqual(ipc.COMMAND.size, 96)
-        self.assertEqual(ipc.STATUS.size, 152)
+        self.assertEqual(ipc.STATUS.size, 160)
         self.assertEqual(ipc.VISION.size, 88)
 
     def test_profile_timeout_has_a_readable_driver_diagnostic(self):

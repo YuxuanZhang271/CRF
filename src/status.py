@@ -43,6 +43,7 @@ COMMAND_NAMES = {
     '/api/cmd/bird_eye': 'BIRD-EYE', '/api/cmd/pull_out': 'PULL OUT',
     '/api/flex/tracking': 'TRACK', '/api/cmd/interrupt': 'INTERRUPT',
     '/api/cmd/stop': 'STOP', '/api/flex/calibrate': 'CALIBRATE',
+    '/api/cmd/clean_lens': 'CLEAN LENS',
 }
 
 

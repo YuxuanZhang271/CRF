@@ -307,6 +307,14 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, body):
         node = self.server.node
         flex = node.flex
+        if self.path == '/api/cmd/clean_lens':
+            if flex is None:
+                raise ValueError('The Flex hardware interface is disabled.')
+            return flex.clean_lens(node)
+        if flex is not None and flex.spray_busy and not (
+                self.path == '/api/key/heartbeat' or
+                (self.path == '/api/key' and body.get('down') is False)):
+            raise ValueError('Release the spray control or cancel CLEAN LENS before moving or changing settings.')
         if self.path in ('/api/speed/arm/linear', '/api/limits/arm'):
             if self.server.relay is None:
                 raise ValueError('The arm is disabled for this session.')

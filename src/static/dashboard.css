@@ -64,6 +64,7 @@ button.interrupt{background:#8a5423}button.interrupt:hover{background:#a6682f}
 #flex-hardware-controls,#flex-model-controls{grid-template-columns:repeat(4,minmax(0,1fr));
   grid-template-areas:"left up right forward" "left down right backward"}
 .command-grid [data-key]{touch-action:none}
+#water-spray,#gas-spray{touch-action:none;user-select:none}
 .command-grid .direction{font-size:15px}
 .control-mode{grid-area:mode}
 .control-left{grid-area:left}.control-up{grid-area:up}.control-down{grid-area:down}.control-right{grid-area:right}

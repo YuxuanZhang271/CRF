@@ -10,7 +10,8 @@ from . import flex_ipc as ipc
 
 BEND_KEYS = ("flex_left", "flex_right", "flex_up", "flex_down")
 ROLL_KEYS = ("flex_roll_minus", "flex_roll_plus")
-FLEX_KEYS = BEND_KEYS + ROLL_KEYS
+SPRAY_KEYS = ("flex_water", "flex_gas")
+FLEX_KEYS = BEND_KEYS + ROLL_KEYS + SPRAY_KEYS
 POSITION_TIMEOUT_S = 30.0
 KEY_TIMEOUT_S = 0.65
 STRAIGHT_BEND_DEG = 0.25
@@ -64,6 +65,10 @@ class FlexControl:
         self._horizon_near_vertical = False
         self._zero_hold_joints = None
         self._pull_out_complete_joints = None
+        self.spray = None
+        self._spray_stopping = False
+        self.spray_key_at = None
+        self.spray_message = ""
 
     @property
     def status(self):
@@ -105,7 +110,54 @@ class FlexControl:
 
     def _available_for_request(self):
         s = self.status
-        return s.action == ipc.HORIZON or (s.action == ipc.IDLE and not s.moving)
+        return not self.spray_busy and (s.action == ipc.HORIZON or (s.action == ipc.IDLE and not s.moving))
+
+    @property
+    def spray_busy(self):
+        return self.spray is not None or self._spray_stopping or bool(self.status and self.status.spray_phase)
+
+    def start_spray(self, action, node):
+        if (not self.ready(calibrated=False) or not self.stop_acknowledged()
+                or self.spray_busy or self.status.moving or self.pending or self.procedure or self.tracking or self.keys
+                or node.pull_out_active or any(node._key_state.values())
+                or not self._available_for_request()):
+            raise ValueError("Release controls and stop procedures before spraying.")
+        if node._recv_thread and node._recv_thread.ident and (
+                not node._arm_ready() or node._arm_moving is not False or node._teleop_servo_active):
+            raise ValueError("Wait for the UR5 to stop before spraying.")
+        s = self.status
+        if s.spray_error:
+            raise ValueError(ipc.SPRAY_ERRORS.get(s.spray_error, "Pump fault. Restart the driver."))
+        if action != ipc.GAS_SPRAY and not s.flags & ipc.WATER_SPRAY_READY:
+            raise ValueError("Water pump unavailable. Check axis 6 and restart the driver.")
+        if action != ipc.WATER_SPRAY and not s.flags & ipc.GAS_SPRAY_READY:
+            raise ValueError("Gas pump unavailable. Check the configured serial port and restart the driver.")
+        self._horizon_paused = True
+        self.stop_request = None
+        request = self.client.request(action)
+        self.spray = (request, action, time.monotonic() + 12.)
+        self.spray_key_at = time.monotonic() if action != ipc.CLEAN_LENS else None
+        self.spray_message = "Starting lens cleaning…" if action == ipc.CLEAN_LENS else "Starting spray…"
+        if not self.client.send():
+            self.stop()
+            raise ValueError("Could not send the spray command.")
+        return True
+
+    def set_spray_key(self, key, down, node):
+        action = ipc.WATER_SPRAY if key == "flex_water" else ipc.GAS_SPRAY
+        if not down:
+            if self.spray and self.spray[1] == action:
+                self.stop()
+                self.spray_message = "Spray released · stopping"
+            return True
+        return self.start_spray(action, node)
+
+    def clean_lens(self, node):
+        if self.spray and self.spray[1] == ipc.CLEAN_LENS:
+            self.stop()
+            self.spray_message = "Lens cleaning canceled · stopping"
+            return True
+        return self.start_spray(ipc.CLEAN_LENS, node)
 
     @property
     def bend_limit_max(self):
@@ -120,7 +172,7 @@ class FlexControl:
                 self.client.send()
                 self._owned = False
             return True
-        if not self.jog_ready() or not self.stop_acknowledged():
+        if self.spray_busy or not self.jog_ready() or not self.stop_acknowledged():
             return False
         if key in ROLL_KEYS and not self.status.flags & ipc.COUPLED_ROLL_SUPPORTED:
             raise ValueError("Rebuild and restart the Flex driver to enable coordinated roll jogging.")
@@ -142,11 +194,17 @@ class FlexControl:
 
     def heartbeat(self, held):
         now = time.monotonic()
+        if self.spray and self.spray_key_at is not None:
+            key = "flex_water" if self.spray[1] == ipc.WATER_SPRAY else "flex_gas"
+            if key in held and now - self.spray_key_at <= KEY_TIMEOUT_S:
+                self.spray_key_at = now
         for key in self.keys.keys() & set(held):
             if now - self.keys[key] <= KEY_TIMEOUT_S:
                 self.keys[key] = now
 
     def _request(self, action, **parameters):
+        if self.stop_acknowledged():
+            self.stop_request = None
         request = self.client.request(action, **parameters)
         timeout = POSITION_TIMEOUT_S
         if action in (ipc.POSITION, ipc.RETURN_ZERO):
@@ -167,6 +225,11 @@ class FlexControl:
         return False
 
     def stop(self):
+        self._spray_stopping |= self.spray is not None or bool(self.status and self.status.spray_phase)
+        if self.spray is not None:
+            self.spray_message = "Spray canceled · stopping"
+        self.spray = None
+        self.spray_key_at = None
         self._pull_out_complete_joints = None
         self._horizon_paused = True
         self._zero_hold_joints = None
@@ -190,7 +253,7 @@ class FlexControl:
         s = self.status
         return (request is None or
                 (s is not None and s.app == self.client.app and s.request == request
-                 and s.result == ipc.DONE and not s.fault and not s.moving))
+                 and s.result == ipc.DONE and not s.fault and not s.moving and not s.spray_phase))
 
     def cancel(self, message):
         self.stop()
@@ -727,7 +790,7 @@ class FlexControl:
         self._driver = s.driver if s is not None and self.client.ready else None
         # A standalone return to zero owns Flex only. Coordinated procedures
         # and Bird-eye positioning retain exclusive arm control.
-        exclusive = bool(self.tracking or self.procedure or
+        exclusive = bool(self.spray_busy or self.tracking or self.procedure or
                          (self.pending and self.pending[1] == ipc.POSITION))
         if old is not None and old != self._driver:
             issue = DRIVER_DISCONNECTED
@@ -761,12 +824,46 @@ class FlexControl:
             self.message = "GTS startup inputs are clear."
         if s.fault:
             self.stop_request = None
-            if self.tracking or self.procedure or self.keys or self.pending:
+            if self.spray or self.tracking or self.procedure or self.keys or self.pending:
                 self.cancel("Flex driver fault")
         if self.stop_request is not None and self.stop_acknowledged():
             self.stop_request = None
+            self._spray_stopping = False
             self.client.command(ipc.IDLE)
+            if self.spray_message:
+                self.spray_message = "Spray stopped"
+        if (self._spray_stopping and self.stop_request is None and not s.spray_phase
+                and not s.fault and not s.moving):
+            self._spray_stopping = False
+            self.spray_message = "Spray stopped"
         now = time.monotonic()
+        if self.spray:
+            request, action, deadline = self.spray
+            result = s.result if s.app == self.client.app and s.request == request else ipc.NO_RESULT
+            arm_lost = bool(node._recv_thread and node._recv_thread.ident and (
+                not node._arm_ready() or node._arm_moving is not False or node._motion_fault))
+            expired = self.spray_key_at is not None and now - self.spray_key_at > KEY_TIMEOUT_S
+            if arm_lost or expired or (now >= deadline and (action == ipc.CLEAN_LENS or result != ipc.ACCEPTED)):
+                self.stop()
+                self.spray_message = "Spray stopped · input expired or control state unavailable"
+            elif result in (ipc.DONE, ipc.REFUSED, ipc.CANCELED):
+                self.spray = None
+                self.spray_key_at = None
+                self.client.command(ipc.IDLE)
+                self.spray_message = (ipc.SPRAY_ERRORS.get(s.spray_error) or
+                                      f"{ipc.ACTIONS[action].capitalize()} {ipc.RESULTS[result]}")
+            else:
+                self.spray_message = {
+                    0: "Starting spray…", 1: "Water spraying · release to stop",
+                    2: "Gas spraying · release to stop", 3: "CLEAN LENS · water (3 s)",
+                    4: "CLEAN LENS · waiting for water stop", 5: "CLEAN LENS · gas (3 s)",
+                    6: "Spray stopping",
+                }[s.spray_phase]
+                self.client.send()
+                return True
+        if s.spray_phase or self.stop_request is not None:
+            self.client.send()
+            return exclusive
         self.keys = {k: t for k, t in self.keys.items() if now - t <= KEY_TIMEOUT_S}
         if self.pending:
             request, action, deadline = self.pending
@@ -875,7 +972,7 @@ class FlexControl:
             "manual_bench": manual_bench,
             "planned_feedback": bool(s and s.planned_feedback),
             "planned_zero": planned_zero,
-            "busy": bool(self.keys or self.pending or self.procedure or
+            "busy": bool(self.spray_busy or self.keys or self.pending or self.procedure or
                          (s and s.action != ipc.HORIZON and (s.moving or s.action == ipc.JOG))),
             "bend": bend,
             "bend_point": [bend * math.sin(plane), -bend * math.cos(plane)] if s else None,
@@ -889,6 +986,13 @@ class FlexControl:
             "moving": s.moving if s and self.client.ready else None,
             "fault": s.fault if s else 0,
             "fault_detail": s.fault_detail if s else "",
+            "spray_busy": self.spray_busy,
+            "spray_action": ipc.ACTIONS[self.spray[1]] if self.spray else None,
+            "spray_phase": ipc.SPRAY_PHASES[s.spray_phase] if s else "idle",
+            "spray_error": ipc.SPRAY_ERRORS.get(s.spray_error, "Pump fault") if s and s.spray_error else "",
+            "spray_message": self.spray_message,
+            "water_ready": bool(s and s.flags & ipc.WATER_SPRAY_READY),
+            "gas_ready": bool(s and s.flags & ipc.GAS_SPRAY_READY),
             "startup_recheck": bool(s and s.flags & ipc.STARTUP_RECHECK),
             "recheck_pending": self._startup_recheck is not None,
             "setup_encoder_mismatch": bool(s and s.flags & ipc.SETUP_ENCODER_MISMATCH),

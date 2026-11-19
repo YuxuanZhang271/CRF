@@ -40,6 +40,8 @@ driver to exit when the app closes.
 | `-Feedback Simulated` | Simulate Flex motors; full-app mode still connects to the UR5. |
 | `-FlexOnly` | Run Flex without connecting to the UR5. |
 | `-CameraRollOffsetDeg 0` | Supply optical roll relative to the modeled camera. |
+| `-GasPort COM4` | Arduino gas-pump serial port (9600 baud, 8N1; `1` on / `0` off). |
+| `-WaterVelocity 30` | Axis-6 water-pump velocity; nonzero, from -30 to 30 controller units. Verify direction and flow on the bench. |
 
 Pull Out uses a fixed endpoint 100 mm beyond the captured RCM on the withdrawal
 side. This preserves the previous 100 mm setting. It describes the final tip
@@ -68,6 +70,30 @@ Startup leaves motion idle. Calibrate Flex at rest after physically aligning
 the scope. Camera tracking requires a selected category, fresh feedback,
 calibrated Flex, and an active UR5 RCM. **INTERRUPT** cancels motion while keeping
 the session open; **STOP** stops motion and shuts down the app.
+
+**WATER SPRAY** and **GAS SPRAY** sit between APPLY and CALIBRATE in FlexEndo.
+Hold either button to spray and release to stop. Pointer cancellation, moving
+the mouse outside the button, focus loss, and held-input expiry also stop the
+spray. A focused spray button supports holding Space or Enter.
+**CLEAN LENS**, between BIRD-EYE and PULL OUT, runs water for **3 seconds**,
+waits for axis 6 to stop, then runs gas for **3 seconds**. Click it again to
+cancel. INTERRUPT and STOP cancel both pump outputs.
+
+Spraying requires stationary connected motion hardware, released manual
+controls, and no tracking or positioning procedure. Motion and settings are
+blocked during spraying; automatic horizon adjustments stay paused until
+manual control or a new procedure resumes them. Bend calibration and a UR5
+connection are not required in Flex-only mode. Water and gas availability are
+independent; CLEAN LENS requires both. Missing gas hardware does not prevent
+Flex motion or water spraying. Pump faults remain latched until driver restart.
+
+The native driver owns axis 6 and the serial port, uses nonblocking stage
+timing, and stops pumps on application-heartbeat loss. Water stop confirmation
+uses controller status/velocity. Gas feedback confirms serial writes only,
+not measured flow. The Arduino firmware is external to this repository; its
+`1`/`0` protocol cannot guarantee shutoff after driver termination, USB loss,
+or host failure without a firmware watchdog. Simulated mode performs no pump
+or serial I/O. Python and native code must both use IPC protocol V5.
 
 ## Architecture
 
@@ -328,6 +354,7 @@ With the `crf` environment active:
 python -m unittest discover -s tests -v
 node --check src/static/dashboard.js
 node tests/test_dashboard_recording.js
+node tests/test_dashboard_spray.js
 node --check src/static/keyboard.js
 node tests/test_keyboard.js
 ```
@@ -356,6 +383,16 @@ cl /nologo /std:c++17 /EHsc /source-charset:.936 /execution-charset:utf-8 "/Fo$t
 
 These checks mock GTS feedback and never open hardware. Fault messages from the
 negative cases are expected; the final line reports the number of passed checks.
+
+The pump state machine also has a standalone native test:
+
+```powershell
+cl /nologo /std:c++17 /EHsc "/Fo$testOutput/test_spray_control.obj" "/Fe$testOutput/test_spray_control.exe" tests/test_spray_control.cpp
+& "$testOutput/test_spray_control.exe"
+# Opt-in real shared-memory integration; the test always spawns --simulate.
+$env:CRF_SIM_DRIVER = (Resolve-Path "$testOutput/FlexEndoscopeDriver.exe").Path
+python -m unittest discover -s tests -p test_spray_driver.py -v
+```
 
 The retired named-world-target prototype, its unused geometry helpers, the old
 integration plan, and the Visual C++ template header have been removed. The

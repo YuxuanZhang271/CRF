@@ -13,6 +13,7 @@
 
 #include "flex_protocol.h"
 #include "gts.h"
+#include "spray_hardware.h"
 
 namespace {
 using namespace flex;
@@ -627,7 +628,7 @@ Pose nextPosition(Pose current, Pose target) {
 class Driver {
 public:
     Driver(bool simulated, bool manualBench, bool plannedFull, bool managedSession)
-        : motion_(simulated), simulated_(simulated),
+        : motion_(simulated), sprayHardware_(simulated), spray_(sprayHardware_), simulated_(simulated),
           manualBench_(manualBench), plannedFull_(plannedFull), managedSession_(managedSession) {
         status_.header = header<Status>();
         LARGE_INTEGER counter{};
@@ -646,6 +647,7 @@ public:
         if (plannedFull_)
             std::puts("Full app bench mode. Flex positions are planned, with no encoder verification. Q exits.");
         motion_.open();
+        sprayHardware_.open(!motion_.fault(), gasPort, waterVelocity);
         startedAt_ = GetTickCount64();
         setupReference_ = motion_.profile();
         setupEncoder_ = motion_.encoder();
@@ -659,21 +661,37 @@ public:
                 status_.fault = motion_.fault();
             }
             process();
+            spray_.tick(now);
+            if (isSpray(status_.action) && !spray_.busy()) {
+                status_.action = Idle;
+                status_.result = spray_.result;
+            }
             publish(now);
             Sleep(PollIntervalMs);
         }
         halt();
+        const uint64_t stopDeadline = GetTickCount64() + WaterStopTimeoutMs;
+        while (spray_.busy() && GetTickCount64() < stopDeadline) {
+            spray_.tick(GetTickCount64());
+            Sleep(PollIntervalMs);
+        }
+        if (spray_.busy()) std::fputs("Spray shutdown could not confirm both outputs off.\n", stderr);
         status_.stamp = 0;
         statusMapping_.write(status_);
         return motion_.fault() ? 1 : 0;
     }
 
+    std::wstring gasPort = L"COM4";
+    double waterVelocity = 30;
+
 private:
+    static bool isSpray(uint32_t action) { return action >= WaterSpray && action <= CleanLens; }
     bool usesPlannedFeedback() const { return manualBench_ || plannedFull_; }
     bool positioningReady() const { return calibrated_ || (plannedFull_ && plannedZero_); }
     const Axes& positionFeedback() const { return calibrated_ ? motion_.encoder() : motion_.profile(); }
 
     void halt() {
+        spray_.cancel(GetTickCount64());
         motion_.stop();
         setupIntent_ = {};
         manualIntent_ = {};
@@ -685,8 +703,12 @@ private:
         status_.stamp = now;
         status_.fault = motion_.fault();
         status_.faultAxisStatus = motion_.faultAxisStatus();
+        status_.sprayPhase = spray_.phase;
+        status_.sprayError = spray_.error;
         status_.flags = RollJogSupported | CoupledRollSupported | BendLimitSupported | CombinedLimitsSupported |
                         TrackHorizonSupported | WideBendRange |
+                        (sprayHardware_.waterReady() && !spray_.error ? WaterSprayReady : 0) |
+                        (sprayHardware_.gasReady() && !spray_.error ? GasSprayReady : 0) |
                         (calibrated_ ? Calibrated : 0) |
                         (motion_.moving() ? Moving : 0) | (simulated_ ? Simulated : 0) |
                         (manualBench_ ? ManualBench : 0) |
@@ -714,7 +736,7 @@ private:
         const uint64_t now = GetTickCount64();
         if (busy && fresh(lastCommandAt_, now, CommandTimeoutMs)) return;
         const bool validCommand = read && valid(cmd) && cmd.driver == status_.driver &&
-                                  cmd.app && cmd.sequence && cmd.action <= SetSpeedLimit &&
+                                  cmd.app && cmd.sequence && cmd.action <= CleanLens &&
                                   !cmd.reserved && fresh(cmd.stamp, now, CommandTimeoutMs);
         const bool heartbeatLost = !validCommand || !fresh(lastCommandAt_, now, CommandTimeoutMs);
         const bool wasConnected = status_.app != 0;
@@ -733,6 +755,13 @@ private:
             std::fputs("Flex command heartbeat lost. Motion stopped. Waiting for the Web UI.\n", stderr);
         if (!validCommand) return;
         lastCommandAt_ = cmd.stamp;
+        if (cmd.action == Stop && cmd.sequence >= status_.sequence) {
+            halt();
+            acknowledge(cmd, spray_.busy() ? Accepted : (motion_.fault() ? Refused : Done));
+            blockedSequence_ = cmd.sequence;
+            waitForNeutral_ = false;
+            return;
+        }
         if (motion_.fault()) {
             if (cmd.action == RecheckStartup && cmd.request &&
                 (cmd.app != recheckApp_ || cmd.sequence > status_.sequence) &&
@@ -764,11 +793,9 @@ private:
             waitForNeutral_ = false;
         }
 
-        if (cmd.sequence > status_.sequence && cmd.action == Stop) {
-            halt();
-            acknowledge(cmd, motion_.fault() ? Refused : Done);
-            blockedSequence_ = cmd.sequence;
-            waitForNeutral_ = false;
+        if (spray_.busy()) {
+            if (cmd.action != status_.action || cmd.request != status_.request || cmd.sequence != status_.sequence)
+                spray_.cancel(now);
             return;
         }
         if (waitForNeutral_) {
@@ -776,6 +803,20 @@ private:
             waitForNeutral_ = false;
         }
         if (cmd.sequence > blockedSequence_ && cmd.sequence >= status_.sequence) {
+            if (isSpray(cmd.action)) {
+                if (!cmd.request || cmd.request <= status_.request) return;
+                if (motion_.moving()) return;
+                if ((status_.action != Idle && status_.action != Horizon) ||
+                    !finiteAxes(cmd) || cmd.x || cmd.y || cmd.roll) {
+                    acknowledge(cmd, Refused);
+                    return;
+                }
+                motion_.stop();
+                const bool started = spray_.start(static_cast<Action>(cmd.action), now);
+                acknowledge(cmd, started ? Accepted : Refused);
+                if (started) status_.action = cmd.action;
+                return;
+            }
             if ((status_.action == Position || status_.action == ReturnZero) &&
                 (cmd.action != status_.action || cmd.sequence != status_.sequence || cmd.request != status_.request)) {
                 halt();
@@ -1133,6 +1174,8 @@ private:
     }
 
     Motion motion_;
+    SprayHardware sprayHardware_;
+    SprayControl spray_;
     bool simulated_, calibrated_ = false;
     bool manualBench_;
     bool plannedFull_;
@@ -1159,11 +1202,24 @@ private:
 
 int wmain(int argc, wchar_t** argv) {
     bool simulated = false, manualBench = false, plannedFull = false, managedSession = false;
+    std::wstring gasPort = L"COM4";
+    double waterVelocity = 30;
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--simulate") == 0) simulated = true;
         else if (std::wcscmp(argv[i], L"--manual-bench") == 0) manualBench = true;
         else if (std::wcscmp(argv[i], L"--planned-full") == 0) plannedFull = true;
         else if (std::wcscmp(argv[i], L"--managed-session") == 0) managedSession = true;
+        else if (std::wcscmp(argv[i], L"--gas-port") == 0 && i + 1 < argc) {
+            gasPort = argv[++i];
+            if (gasPort.size() < 4 || gasPort.substr(0, 3) != L"COM" ||
+                gasPort.find_first_not_of(L"0123456789", 3) != std::wstring::npos) return 2;
+        }
+        else if (std::wcscmp(argv[i], L"--water-velocity") == 0 && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            waterVelocity = std::wcstod(argv[++i], &end);
+            if (!end || *end || !std::isfinite(waterVelocity) || waterVelocity == 0 ||
+                std::abs(waterVelocity) > 30) return 2;
+        }
         else {
             std::fprintf(stderr, "Unknown Flex driver option.\n");
             return 2;
@@ -1183,6 +1239,8 @@ int wmain(int argc, wchar_t** argv) {
     int result = 1;
     {
         Driver driver(simulated, manualBench, plannedFull, managedSession);
+        driver.gasPort = gasPort;
+        driver.waterVelocity = waterVelocity;
         if (driver.open()) result = driver.run();
         else std::fprintf(stderr, "Could not initialize Flex shared memory.\n");
     }

@@ -9,10 +9,15 @@ param(
     [string]$RobotIp,
     [ValidateRange(-180.0, 180.0)]
     [double]$CameraRollOffsetDeg,
-    [switch]$FlexOnly
+    [switch]$FlexOnly,
+    [ValidatePattern('^COM[0-9]+$')]
+    [string]$GasPort = 'COM4',
+    [ValidateRange(-30.0, 30.0)]
+    [double]$WaterVelocity = 30
 )
 
 $ErrorActionPreference = 'Stop'
+if ($WaterVelocity -eq 0) { throw 'WaterVelocity must be nonzero.' }
 
 if ($FlexOnly -and $FullApp -and $PSBoundParameters.ContainsKey('FullApp')) {
     throw 'Choose either -FullApp or -FlexOnly.'
@@ -49,7 +54,8 @@ $driverOptions = @{
     WorkingDirectory = $buildFolder
     NoNewWindow = $true
     PassThru = $true
-    ArgumentList = @('--managed-session')
+    ArgumentList = @('--managed-session', '--gas-port', $GasPort,
+        '--water-velocity', $WaterVelocity.ToString([Globalization.CultureInfo]::InvariantCulture))
 }
 switch ($Feedback) {
     'Planned' {

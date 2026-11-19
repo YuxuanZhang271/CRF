@@ -163,11 +163,13 @@ document.querySelectorAll('button[data-key]').forEach(btn => {
     e.preventDefault();
     btn.setPointerCapture(e.pointerId);
     held.set(key, e.pointerId);
+    btn.dataset.held = 'true';
     sendKey(key, true, e.pointerId);
   });
   const release = e => {
     if (held.get(key) !== e.pointerId) return;
     held.delete(key);
+    delete btn.dataset.held;
     sendKey(key, false);
   };
   btn.addEventListener('pointerup', release);
@@ -179,6 +181,24 @@ document.querySelectorAll('button[data-key]').forEach(btn => {
     if (e.clientX < rect.left || e.clientX > rect.right ||
         e.clientY < rect.top || e.clientY > rect.bottom) release(e);
   });
+  if (key === 'flex_water' || key === 'flex_gas') {
+    btn.addEventListener('keydown', e => {
+      if (!['Space', 'Enter'].includes(e.code)) return;
+      e.preventDefault();
+      if (e.repeat || btn.disabled || !stateFeedReady || held.has(key) || interrupting || stopping) return;
+      const owner = `spray:${e.code}`;
+      held.set(key, owner);
+      btn.dataset.held = 'true';
+      sendKey(key, true, owner);
+    });
+    document.addEventListener('keyup', e => {
+      if (held.get(key) !== `spray:${e.code}`) return;
+      e.preventDefault();
+      held.delete(key);
+      delete btn.dataset.held;
+      sendKey(key, false);
+    });
+  }
 });
 
 function releaseKeys() {
@@ -257,7 +277,7 @@ async function pollState() {
     syncDeviceLimits('arm', null, null, null, false, false);
     syncDeviceLimits('flex', null, null, null, false, false);
     pullOutButton.disabled = true;
-    ['bird-eye', 'pull-out', 'tracking'].forEach(id => {
+    ['bird-eye', 'pull-out', 'tracking', 'clean-lens', 'water-spray', 'gas-spray'].forEach(id => {
       document.getElementById(id).disabled = true;
       delete document.getElementById(id).dataset.activity;
     });
@@ -488,7 +508,9 @@ function renderState(s) {
   const flexReady = hardware && flex.connected && flex.positioning_ready && !flex.fault;
   const armReady = s.relay_connected && s.joints_received && s.kinematics_ready && !s.motion_fault;
   const rcmReady = armReady && s.arm_mode === 'rcm' && s.rcm_enabled;
-  const limitEditable = !stopping && !interrupting && !s.stopping && !s.interrupting;
+  const sprayBusy = Boolean(flex?.spray_busy);
+  const controlsAvailable = !stopping && !interrupting && !s.stopping && !s.interrupting;
+  const limitEditable = controlsAvailable && !sprayBusy;
   document.querySelectorAll('button[data-key^="arm_"]').forEach(button => {
     button.disabled = !armReady || !limitEditable;
   });
@@ -520,7 +542,8 @@ function renderState(s) {
   const instruction = {preparing: 'Pull Out: moving to zero.',
     ready: 'At zero. Verify straightness and a clear path; press PULL OUT or Ctrl+P again to withdraw.',
     retracting: 'Pull Out: withdrawing.', complete: 'Pull Out complete.'}[s.pull_out_state] || '';
-  document.getElementById('procedure-status').textContent = instruction;
+  document.getElementById('procedure-status').textContent =
+    flex?.spray_action === 'clean lens' ? flex.spray_message : instruction;
 
 
   if (flex) {
@@ -559,6 +582,22 @@ function renderState(s) {
     syncDeviceLimits('flex', s.flex_model_bend_limit, s.flex_model_bend_max_deg, s.flex_model_speed_deg_s,
       editable, editable);
   }
+  const sprayReady = controlsAvailable && flex?.connected && !flex.fault && !flex.spray_error &&
+    !flex.busy && flex.moving === false && !flex.tracking && (s.arm_enabled === false || (armReady && s.arm_moving === false));
+  const cleanActive = flex?.spray_action === 'clean lens';
+  const cleanButton = document.getElementById('clean-lens');
+  cleanButton.disabled = !controlsAvailable || (!cleanActive && !(sprayReady && flex.water_ready && flex.gas_ready));
+  cleanButton.setAttribute('aria-pressed', String(cleanActive));
+  setActivity(cleanButton, cleanActive ? 'moving' : '');
+  [['water-spray', 'water spray', 'water_ready'], ['gas-spray', 'gas spray', 'gas_ready']].forEach(([id, action, capability]) => {
+    const button = document.getElementById(id);
+    const active = flex?.spray_action === action;
+    button.disabled = !controlsAvailable || (!active && !(sprayReady && flex[capability]));
+    button.setAttribute('aria-pressed', String(active));
+    setActivity(button, active ? 'active' : '');
+  });
+  reportStatus('spray-message', 'SPRAY', flex?.spray_message || '');
+  reportStatus('spray-error', 'SPRAY', flex?.spray_error || '', 'error');
 }
 
 function setActivity(button, state) {

@@ -11,7 +11,7 @@ from concurrent.futures import Future
 
 import numpy as np
 
-from .flex_endo.flex_control import FLEX_KEYS, POSITION_TIMEOUT_S, PULL_OUT_BEHIND_RCM_M, PULL_OUT_RETRACT_SPEED_M_S
+from .flex_endo.flex_control import FLEX_KEYS, SPRAY_KEYS, POSITION_TIMEOUT_S, PULL_OUT_BEHIND_RCM_M, PULL_OUT_RETRACT_SPEED_M_S
 from .flex_endo.flex_ipc import DEFAULT_SPEED_DEG_S, MIN_SPEED_DEG_S, POSITION
 from .kinematics import EndoscopeKinematics, rcm_tip_angles
 from .ur5_rtde_server import DEFAULT_LINEAR_SPEED_MM_S, SERVO_RESYNC_RAD, limit_servo_target
@@ -308,7 +308,7 @@ class ControlNode:
         with self._lock:
             fault = self._motion_fault
         if fault and (self._teleop_servo_active or self._pull_out_state is not None
-                      or (self.flex is not None and (self.flex.procedure or self.flex.tracking))):
+                      or (self.flex is not None and (self.flex.spray_busy or self.flex.procedure or self.flex.tracking))):
             self.cmd_stop()
         now = time.monotonic()
         for key, updated_at in list(self._key_updated.items()):
@@ -863,6 +863,12 @@ class ControlNode:
 
     # ---------- key state ----------
     def set_key(self, key, down):
+        if key in SPRAY_KEYS:
+            if self.flex is None:
+                return False
+            return self.flex.set_spray_key(key, down, self)
+        if down and self.flex is not None and self.flex.spray_busy:
+            return False
         if self.flex is not None and key in FLEX_KEYS:
             if down and any(self._key_state.values()):
                 return False

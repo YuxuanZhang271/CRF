@@ -9,6 +9,7 @@
   <div class="card primary-actions">
     <div class="actions">
       <button id="bird-eye" onclick="post('/api/cmd/bird_eye')" title="Bird-eye view · Ctrl+B" aria-keyshortcuts="Control+b">BIRD-EYE</button>
+      <button id="clean-lens" onclick="post('/api/cmd/clean_lens')" title="Water 3 seconds, then gas 3 seconds; click again to cancel" disabled>CLEAN LENS</button>
       <button id="pull-out" title="Prepare zero pose, then press again to withdraw · Ctrl+P" aria-keyshortcuts="Control+p" disabled>PULL OUT</button>
     </div>
     <div class="actions stop-actions">
@@ -74,6 +75,8 @@
           <button type="submit" disabled>APPLY</button>
         </form>
         <div class="actions device-actions" id="flex-calibration" hidden>
+          <button id="water-spray" data-key="flex_water" title="Hold to spray water; release to stop" disabled>WATER SPRAY</button>
+          <button id="gas-spray" data-key="flex_gas" title="Hold to spray gas; release to stop" disabled>GAS SPRAY</button>
           <button id="calibrate" onclick="calibrateFlex()">CALIBRATE</button>
           <button id="flex-return-zero" onclick="post('/api/flex/return_zero')" aria-label="Reset Flex to saved zero" disabled>RESET</button>
           <button id="flex-recheck" onclick="post('/api/flex/recheck_startup')" hidden>Recheck Flex inputs</button>

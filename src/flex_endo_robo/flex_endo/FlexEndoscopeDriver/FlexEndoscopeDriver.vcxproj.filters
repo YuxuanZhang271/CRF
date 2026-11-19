@@ -21,6 +21,12 @@
     <ClInclude Include="flex_protocol.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="spray_control.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="spray_hardware.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="FlexEndoscopeDriver.cpp">

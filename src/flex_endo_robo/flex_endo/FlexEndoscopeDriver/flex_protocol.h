@@ -5,25 +5,30 @@
 
 namespace flex {
 constexpr uint32_t Magic = 0x58454c46;  // FLEX
-constexpr uint32_t Version = 4;
-constexpr wchar_t Prefix[] = L"Local\\CRFFlexV4";
+constexpr uint32_t Version = 5;
+constexpr wchar_t Prefix[] = L"Local\\CRFFlexV5";
 // All driver versions must share the same hardware ownership lock.
 constexpr wchar_t DriverMutex[] = L"Local\\CRFFlexV1Driver";
 // Match the ownership mutex that FlexClient holds open for its lifetime.
 constexpr wchar_t ApplicationMutex[] = L"Local\\CRFFlexV1Application";
 constexpr uint64_t CommandTimeoutMs = 350;
 constexpr uint64_t VisionTimeoutMs = 500;
+constexpr uint64_t CleanStageMs = 3000, WaterStopTimeoutMs = 5000;
 
 enum Action : uint32_t {
     Idle, Stop, Calibrate, Horizon, Jog, Position, Track, ReturnZero,
-    RecheckStartup, RollJog, SetBendLimit, SetSpeedLimit
+    RecheckStartup, RollJog, SetBendLimit, SetSpeedLimit, WaterSpray, GasSpray, CleanLens
+};
+enum SprayPhase : uint32_t {
+    SprayIdle, WaterHeld, GasHeld, CleaningWater, WaitingWaterStop, CleaningGas, SprayStopping
 };
 enum Flags : uint32_t {
     Calibrated = 1, Moving = 4, Simulated = 8, SetupEncoderMismatch = 32,
     ManualBench = 64, PlannedZero = 128, PlannedFull = 256, StartupRecheck = 512,
     RollJogSupported = 1024, BendLimitSupported = 2048,
     TrackHorizonSupported = 4096, WideBendRange = 8192, AtSavedZero = 16384,
-    CoupledRollSupported = 32768, CombinedLimitsSupported = 65536
+    CoupledRollSupported = 32768, CombinedLimitsSupported = 65536,
+    WaterSprayReady = 131072, GasSprayReady = 262144
 };
 enum Result : uint32_t { None, Accepted, Done, Refused, Canceled, Limit };
 
@@ -44,6 +49,8 @@ struct Status {
     int32_t fault;
     uint32_t faultAxisStatus;
     double x, y, roll, bendLimit, tendon[4], speedLimit;
+    uint32_t sprayPhase;
+    int32_t sprayError;
 };
 struct Vision {
     Header header;
@@ -56,7 +63,7 @@ struct Vision {
 #pragma pack(pop)
 
 static_assert(sizeof(Command) == 96 && offsetof(Command, x) == 72);
-static_assert(sizeof(Status) == 152 && offsetof(Status, x) == 80 && offsetof(Status, speedLimit) == 144);
+static_assert(sizeof(Status) == 160 && offsetof(Status, x) == 80 && offsetof(Status, speedLimit) == 144);
 static_assert(sizeof(Vision) == 88 && offsetof(Vision, dx) == 64);
 
 template<class T> constexpr Header header() { return {Magic, Version, sizeof(T), 0}; }

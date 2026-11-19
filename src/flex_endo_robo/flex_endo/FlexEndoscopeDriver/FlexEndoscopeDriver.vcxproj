@@ -88,6 +88,8 @@
   <ItemGroup>
     <ClInclude Include="gts.h" />
     <ClInclude Include="flex_protocol.h" />
+    <ClInclude Include="spray_control.h" />
+    <ClInclude Include="spray_hardware.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="FlexEndoscopeDriver.cpp" />
