@@ -44,6 +44,7 @@ COMMAND_NAMES = {
     '/api/flex/tracking': 'TRACK', '/api/cmd/interrupt': 'INTERRUPT',
     '/api/cmd/stop': 'STOP', '/api/flex/calibrate': 'CALIBRATE',
     '/api/cmd/clean_lens': 'CLEAN LENS',
+    '/api/cmd/freedrive': 'FREEDRIVE',
     '/api/task': 'TASK', '/api/task/complete': 'TASK COMPLETE',
 }
 

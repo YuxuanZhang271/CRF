@@ -95,6 +95,14 @@ For example, to change the dashboard and gas controller ports:
 .\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -RobotIp 192.168.1.10 -Feedback Encoder -Port 8081 -GasPort COM5
 ```
 
+### UR5 Freedrive (PolyScope 3.15 / CB3)
+
+In the **UR5** section, click **FREEDRIVE** between **APPLY** and **RESET** to enter hand guiding. The arm and Flex must be stationary, controls released, and TASK 0 selected. The button highlights while active. Click it again to hold the current pose; **INTERRUPT** also exits without ending the session. Robot motion controls and tasks are blocked during hand guiding and the exit transition.
+
+You can also hold **Alt+Shift+F** for Freedrive and release F, Alt, or Shift to request exit immediately. Keep the dashboard focused while guiding. Losing focus, hiding or closing the page, or losing its heartbeat ends Freedrive (the heartbeat lease expires after 1.5 seconds). A controller RTDE watchdog stops the program if the relay stops communicating. Entry clears the old RCM pivot and queued targets; after repositioning, select RCM mode again to capture a new pivot. Verify the installed tool's payload and center of gravity on the pendant before hand guiding.
+
+PolyScope 3.15 supports the no-argument URScript functions `freedrive_mode()` and `end_freedrive_mode()` ([UR release notes](https://www.universal-robots.com/articles/ur/release-notes/release-note-software-version-31xx/)). This app uses the installed `ur_rtde` library's `teachMode()` / `endTeachMode()` compatibility API: its control script retains these CB3 handlers, whereas its newer `freedriveMode()` / `endFreedriveMode()` handlers are gated to PolyScope 5.10 and later ([upstream control script](https://gitlab.com/sdurobotics/ur_rtde/-/blob/master/scripts/rtde_control.script)). The legacy names are intentional for this controller; no ROS or PolyScope X SDK is required.
+
 ### Simulated Flex control
 
 To try Flex controls without motor hardware, first [build the native driver](#build-the-native-driver), then run in the activated `crf` environment:

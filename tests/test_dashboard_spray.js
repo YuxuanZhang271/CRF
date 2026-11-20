@@ -98,6 +98,8 @@ async function main() {
     let cameraZoom = 1;
     const categoryButtons = new Map();
     function stopZoom() {}
+    function stopTaskZoom() {}
+    function syncTaskZoom(task) { setCameraZoom(task.zoom); }
     function renderMeasurements() {}
     function renderStatusBar() {}
     function setStatusChip() {}
@@ -109,6 +111,16 @@ async function main() {
   vm.runInContext('renderState(state)', context);
   assert.equal(water.disabled, false);
   assert.equal(gas.disabled, false);
+  assert.equal(get('clean-lens').disabled, false);
+  Object.assign(context.state.flex_hardware, {water_ready: false, gas_ready: true});
+  vm.runInContext('renderState(state)', context);
+  assert.equal(water.disabled, true, 'A missing water capability must retain the interlock');
+  assert.match(water.title, /GTS axis 6/);
+  assert.equal(gas.disabled, false, 'Water readiness must not disable independent gas');
+  assert.equal(get('clean-lens').disabled, true);
+  context.state.flex_hardware.water_ready = true;
+  vm.runInContext('renderState(state)', context);
+  assert.equal(water.disabled, false, 'Recovered driver readiness automatically restores the button');
   assert.equal(get('clean-lens').disabled, false);
   Object.assign(context.state.flex_hardware, {busy: true, spray_busy: true, spray_action: 'water spray'});
   vm.runInContext('renderState(state)', context);
@@ -129,6 +141,34 @@ async function main() {
   delete context.state.flex_hardware;
   vm.runInContext('renderState(state)', context);
   assert.equal(get('clean-lens').disabled, true);
+
+  // A Freedrive lease belongs only to its initiating tab and cannot outlive focus.
+  doc.hidden = false;
+  Object.assign(context.state, {arm_enabled: true, relay_connected: true,
+    joints_received: true, kinematics_ready: true, arm_moving: false, arm_mode: 'linear'});
+  vm.runInContext('renderState(state)', context);
+  await vm.runInContext('toggleFreedrive()', context);
+  context.state.freedrive_active = true;
+  vm.runInContext('renderState(state)', context);
+  intervals.at(-1)();
+  await Promise.resolve();
+  assert.equal(sent.at(-1).url, '/api/freedrive/heartbeat');
+  assert.equal(typeof sent.at(-1).body.lease, 'string');
+  win.fire('blur');
+  assert.equal(sent.at(-1).url, '/api/cmd/freedrive');
+  assert.equal(sent.at(-1).body.enabled, false);
+  const afterBlur = sent.length;
+  intervals.at(-1)();
+  assert.equal(sent.length, afterBlur, 'Focus loss stops lease renewal');
+  context.state.freedrive_active = false;
+  vm.runInContext('renderState(state)', context);
+  await vm.runInContext('toggleFreedrive()', context);
+  context.state.freedrive_active = true;
+  vm.runInContext('renderState(state)', context);
+  doc.hidden = true;
+  doc.fire('visibilitychange');
+  assert.equal(sent.at(-1).url, '/api/cmd/freedrive');
+  assert.equal(sent.at(-1).body.enabled, false);
 
   const html = fs.readFileSync(path.join(__dirname, '../src/static/index.html'), 'utf8');
   assert.ok(html.indexOf('id="bird-eye"') < html.indexOf('id="clean-lens"'));

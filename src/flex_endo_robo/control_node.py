@@ -89,6 +89,8 @@ class ControlNode:
         self._last_joint_at = float("-inf")
         self._motion_fault = None
         self._arm_moving = None
+        self._freedrive_active = False
+        self._freedrive_transition = False
 
         self.rcm_enabled = False
         self.rcm_world_point = None
@@ -216,6 +218,8 @@ class ControlNode:
                     self._motion_fault = fault if isinstance(fault, str) else None
                     moving = msg.get("moving")
                     self._arm_moving = moving if type(moving) is bool else None
+                    self._freedrive_active = msg.get('freedrive_active') is True
+                    self._freedrive_transition = msg.get('freedrive_transition') is True
                     linear = msg.get("arm_linear_speed_mm_s", DEFAULT_LINEAR_SPEED_MM_S)
                     if type(linear) in (int, float) and math.isfinite(linear) and linear > 0:
                         self.arm_linear_speed_m_s = linear / 1000.
@@ -378,7 +382,17 @@ class ControlNode:
 
     def _arm_ready(self):
         with self._lock:
-            return self.kin.ready and self._motion_fault is None and self._joint_state_fresh()
+            return (self.kin.ready and self._motion_fault is None and self._joint_state_fresh()
+                    and not self._freedrive_active and not self._freedrive_transition)
+
+    def prepare_freedrive(self):
+        with self._lock:
+            self._cancel_motion()
+            self._freedrive_transition = True
+            self._model_horizon_paused = True
+            self.arm_mode = 'linear'
+            self.rcm_enabled = False
+            self.rcm_world_point = self.rcm_ref_axis = self.rcm_ref_depth = None
 
     def _joint_state_fresh(self):
         return (self.joint_received
@@ -870,6 +884,8 @@ class ControlNode:
 
     # ---------- key state ----------
     def set_key(self, key, down):
+        if down and (self._freedrive_active or self._freedrive_transition):
+            return False
         if key in SPRAY_KEYS:
             if self.flex is None:
                 return False
@@ -976,6 +992,8 @@ class ControlNode:
             theta_total = min(self.flex_max_bend, eff*max(0., self.flex_curvature))
             state = {
                 'arm_mode': self.arm_mode,
+                'freedrive_active': self._freedrive_active,
+                'freedrive_transition': self._freedrive_transition,
                 'rcm_enabled': self.rcm_enabled,
                 'rcm_point': None if self.rcm_world_point is None else self.rcm_world_point.tolist(),
                 'rcm_ref_axis': None if self.rcm_ref_axis is None else self.rcm_ref_axis.tolist(),

@@ -27,7 +27,9 @@ body{display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;height:100dvh;pa
 .category-panel{grid-area:categories}
 .panel-scroll{overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
 .panel-scroll>.card:last-child{margin-bottom:0}
-.camera-panel{grid-area:camera;display:grid;grid-template-rows:auto minmax(0,1fr) auto auto;gap:8px}
+.robot-panel>.panel-scroll{display:flex;flex-direction:column;gap:10px}
+.robot-panel>.panel-scroll>*{flex-shrink:0;margin-block:0}
+.camera-panel{grid-area:camera;display:grid;grid-template-rows:auto minmax(0,1fr) auto auto auto;gap:8px}
 .camera-panel h2{margin-bottom:0}
 h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
 .card{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:12px;margin-bottom:10px}
@@ -38,6 +40,13 @@ h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
 .primary-actions button{padding-inline:6px;white-space:nowrap}
 .stop-actions{justify-content:flex-end;min-width:0}
 #procedure-status{grid-column:1/-1;margin:0}
+.shortcut-tips{display:flex;flex-wrap:wrap;gap:4px 10px;margin:10px 0 0;padding-top:7px;
+  border-top:1px solid var(--edge);color:var(--dim);font:11px/1.5 system-ui,sans-serif}
+.shortcut-tips>span{max-width:100%}
+.shortcut-tips kbd{display:inline-block;padding:0 4px;border:1px solid var(--edge);border-radius:3px;
+  background:var(--inset);color:var(--fg);font:10px/1.5 ui-monospace,Consolas,monospace;white-space:nowrap}
+.primary-actions .shortcut-tips{grid-column:1/-1;margin:0;padding-top:6px}
+.camera-panel>.shortcut-tips{justify-content:center;margin:0;padding-top:5px}
 button[data-activity="limited"],button[data-activity="waiting"]{background:var(--warning-fill);color:var(--on-warning)}
 button[data-activity="ready"],button[data-activity="moving"]{background:var(--ok-fill);color:var(--on-ok)}
 button[data-activity="complete"],button[data-activity="at_position"],button[data-activity="active"]{background:var(--ok-fill);color:var(--on-ok)}
@@ -45,6 +54,7 @@ button[data-activity]:disabled{opacity:.85}
 button[data-key][data-held="true"]{outline:2px solid var(--hi);background:var(--button-hover)}
 .control-settings{margin-top:8px;align-items:center}
 .device-actions{margin-inline-start:auto;justify-content:flex-end}
+#arm-freedrive[aria-pressed="true"]{background:var(--hi);color:var(--on-hi);border-color:var(--hi)}
 .limit-editor{display:flex;align-items:center;gap:5px;min-width:0}
 .limit-editor label{color:var(--dim);font-size:11px}
 .limit-editor input,.limit-editor select{padding:6px;border:1px solid var(--edge);border-radius:5px;
@@ -128,12 +138,17 @@ button.interrupt{background:var(--warning-fill);color:var(--on-warning)}button.i
 .status-chip[data-tone="warning"] dd{color:var(--gold)}
 .status-chip[data-tone="tracking"] dd{color:var(--hi)}
 .status-chip[data-tone="error"] dd{color:var(--bad)}
-.console{margin-top:10px}
-.console-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.robot-panel>.panel-scroll>.console{display:grid;grid-template-rows:auto minmax(84px,1fr) auto;
+  gap:6px;flex:1 0 220px;min-height:220px}
+.console-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .console-heading h3{margin:0}
+.console-heading h3,.recording-controls button{flex:none}
+.recording-controls{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex:1;min-width:0}
 #record[aria-pressed="true"]{background:var(--danger-fill);color:var(--on-danger);border-color:var(--bad)}
-#recording-status{font-size:10px}
-.console-output{height:clamp(84px,18dvh,210px);overflow:auto;padding:7px;border-radius:5px;
+#recording-status{font-size:10px;margin:0;min-width:0;text-align:right;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.console .shortcut-tips{margin:0;padding-top:5px}
+.console-output{min-height:84px;min-width:0;overflow:auto;padding:7px;border-radius:5px;
   background:var(--inset);font:11px/1.5 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
 .console-line+.console-line{margin-top:3px}
 .console-source{color:var(--dim);margin-right:6px}
@@ -142,11 +157,15 @@ button.interrupt{background:var(--warning-fill);color:var(--on-warning)}button.i
 .console-line[data-level="warning"],.status[data-level="warning"]{color:var(--gold)}
 .status[data-level="error"]{color:var(--bad)}
 .category-panel>h2{font-size:clamp(14px,1.2vw,18px);line-height:1.3}
+.task-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:8px}
+.task-heading h3{flex:none;margin:0}
 .task-help{font-size:11px;line-height:1.45;color:var(--dim);margin:0 0 9px}
 .task-options,.category-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
 .task-options button{min-width:0;min-height:42px;padding:6px 4px;font-size:11px;overflow-wrap:anywhere}
 .task-options button[aria-pressed="true"]{background:var(--hi);color:var(--on-hi);border-color:var(--hi)}
-#task-message{margin-top:9px;font-size:11px}
+#task-message{flex:1;min-width:0;margin:0;font-size:11px;text-align:right;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#task-message[data-level="error"]{white-space:normal}
 .category-options button{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:4px;min-width:0;min-height:42px;text-align:center;background:var(--inset);border-color:var(--edge);padding:5px;font-size:11px;overflow-wrap:anywhere}
 .category-options button:hover{background:var(--button)}
 .category-options button[aria-pressed="true"]{border-color:var(--hi);background:var(--selection)}

@@ -28,7 +28,7 @@ async function main() {
     return elements.get(id);
   };
   const leftIds = ['bird-eye', 'clean-lens', 'pull-out', 'stop', 'interrupt', 'record',
-    'arm-reset', 'arm-mode', 'arm-limit', 'arm-linear-speed', 'arm-apply',
+    'arm-reset', 'arm-freedrive', 'arm-mode', 'arm-limit', 'arm-linear-speed', 'arm-apply',
     'flex-limit', 'flex-speed', 'flex-apply', 'water-spray', 'gas-spray',
     'calibrate', 'flex-return-zero', 'flex-recheck', 'arm-up', 'flex-up'];
   const left = leftIds.map(get);
@@ -72,6 +72,8 @@ async function main() {
     let cameraZoom = 1;
     const categoryButtons = new Map();
     function stopZoom() {}
+    function stopTaskZoom() {}
+    function syncTaskZoom(task) { setCameraZoom(task.zoom); }
     function setCameraZoom(value) { cameraZoom = value; }
     function renderMeasurements() {}
     function renderStatusBar() {}
@@ -98,6 +100,51 @@ async function main() {
   assert.equal(get('calibrate').disabled, false);
   assert.equal(get('arm-up').disabled, false);
   assert.equal(get('record').disabled, false);
+
+  // Freedrive owns robot motion while STOP, INTERRUPT and its toggle remain usable.
+  assert.equal(get('arm-freedrive').disabled, false);
+  await vm.runInContext('toggleFreedrive()', context);
+  assert.ok(requests.some(item => item.url === '/api/cmd/freedrive' &&
+    item.body.enabled === true && typeof item.body.lease === 'string'));
+  context.state.freedrive_active = true;
+  vm.runInContext('renderState(state)', context);
+  assert.equal(get('arm-freedrive').attrs['aria-pressed'], 'true');
+  assert.equal(get('arm-freedrive').disabled, false);
+  for (const id of ['arm-up', 'arm-reset', 'arm-mode', 'arm-apply', 'flex-up', 'calibrate']) {
+    assert.equal(get(id).disabled, true, `${id} is locked during hand guiding`);
+  }
+  assert.equal(get('interrupt').disabled, false);
+  assert.equal(get('stop').disabled, false);
+  assert.ok(get('task-options').children.every(button => button.disabled));
+  const duringFreedrive = requests.length;
+  await vm.runInContext('selectTask(12)', context);
+  assert.equal(requests.length, duringFreedrive);
+  await vm.runInContext('toggleFreedrive()', context);
+  assert.equal(requests.at(-1).body.enabled, false);
+  context.state.freedrive_active = false;
+  context.state.freedrive_transition = true;
+  vm.runInContext('renderState(state)', context);
+  assert.equal(get('arm-freedrive').disabled, true, 'Wait for the exit handoff');
+  context.state.freedrive_transition = false;
+  vm.runInContext('renderState(state)', context);
+  assert.equal(get('arm-up').disabled, false);
+  assert.equal(get('arm-freedrive').attrs['aria-pressed'], 'false');
+
+  const html = fs.readFileSync(path.join(__dirname, '../src/static/index.html'), 'utf8');
+  const armCard = html.slice(html.indexOf('<h3>UR5</h3>'), html.indexOf('<h3 class="control-title">'));
+  assert.ok(armCard.indexOf('>APPLY<') < armCard.indexOf('id="arm-freedrive"'));
+  assert.ok(armCard.indexOf('id="arm-freedrive"') < armCard.indexOf('id="arm-reset"'));
+
+  // Releasing a keyboard hold before queued key releases complete cannot start Freedrive later.
+  const beforeQuickRelease = requests.length;
+  const quickHold = vm.runInContext('toggleFreedrive()', context);
+  vm.runInContext('releaseFreedrive()', context);
+  await quickHold;
+  assert.ok(!requests.slice(beforeQuickRelease).some(item =>
+    item.url === '/api/cmd/freedrive' && item.body.enabled === true));
+  assert.ok(requests.slice(beforeQuickRelease).some(item =>
+    item.url === '/api/cmd/freedrive' && item.body.enabled === false));
+  vm.runInContext('renderState(state)', context);
 
   // Pending selection locks immediately and releases a previously held input.
   vm.runInContext("held.set('arm_up', 1)", context);

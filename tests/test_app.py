@@ -138,6 +138,16 @@ class DashboardTests(unittest.TestCase):
             json.dumps({'id': 3, 'revision': task['revision']}))[0], 409)
         self.assertEqual(self.server.tasks.snapshot()['id'], 3)
 
+    def test_native_alt_t_can_cancel_active_tracking(self):
+        self.server.tasks.select(16)
+        with patch.object(self.server.keyboard, 'poll', return_value={
+                'available': True, 'commands': ['tracking']}) as poll:
+            status, _, body = self.request('POST', '/api/keyboard',
+                '{"client":"tracking-panel","enabled":true}')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['commands'], ['tracking'])
+        poll.assert_called_once_with('tracking-panel', True)
+
     def test_invalid_tasks_and_tracking_are_rejected(self):
         for task_id in (None, True, '1', 1.5, -1, 17):
             self.assertEqual(self.request('POST', '/api/task', json.dumps({'id': task_id}))[0], 400)

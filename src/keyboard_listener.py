@@ -1,7 +1,10 @@
-"""Deliver browser-reserved Ctrl shortcuts to the focused control panel on Windows.
+"""Deliver browser-reserved Alt shortcuts to the focused control panel on Windows.
 
-Only B/P/T/R with Ctrl are intercepted, while a dashboard owns a fresh focus
+Only B/P/T/R/M with Alt are intercepted, while a dashboard owns a fresh focus
 lease. The hook never moves hardware: the browser consumes queued button clicks.
+Captured Alt chords include a no-action key event so releasing Alt does not
+activate the browser menu after the command letter has been suppressed.
+Held Freedrive (Alt+Shift+F) and zoom use browser key events for immediate release.
 Win32 reference: https://learn.microsoft.com/windows/win32/winmsg/lowlevelkeyboardproc
 """
 
@@ -12,8 +15,45 @@ import threading
 import time
 from collections import deque
 
-COMMANDS = {ord('B'): 'bird-eye', ord('P'): 'pull-out', ord('T'): 'tracking', ord('R'): 'record'}
+COMMANDS = {ord('B'): 'bird-eye', ord('P'): 'pull-out', ord('T'): 'tracking',
+            ord('R'): 'record', ord('M'): 'arm-mode'}
+DASHBOARD_TITLE = 'ABML General Surgical Platform'
 FOCUS_LEASE_S = 1.
+MENU_MASK_KEY = 0xE8  # Unassigned VK: no text, modifier changes or app commands.
+
+
+class _KeyboardInput(ct.Structure):
+    _fields_ = [('vk', ct.c_uint16), ('scan', ct.c_uint16), ('flags', ct.c_uint32),
+                ('time', ct.c_uint32), ('extra', ct.c_size_t)]
+
+
+class _MouseInput(ct.Structure):
+    _fields_ = [('x', ct.c_int32), ('y', ct.c_int32), ('data', ct.c_uint32),
+                ('flags', ct.c_uint32), ('time', ct.c_uint32), ('extra', ct.c_size_t)]
+
+
+class _InputData(ct.Union):
+    # Include MOUSEINPUT to preserve the full Windows INPUT union size/alignment.
+    _fields_ = [('keyboard', _KeyboardInput), ('mouse', _MouseInput)]
+
+
+class _Input(ct.Structure):
+    _fields_ = [('type', ct.c_uint32), ('data', _InputData)]
+
+
+def mask_alt_menu(send_input):
+    """Mark a captured Alt chord as used without sending another shortcut.
+
+    The command letter never reaches the foreground window. Without an
+    intervening key, Windows treats the remaining Alt down/up as menu input.
+    Send a balanced unassigned key pair; never swallow Alt-up or refocus apps.
+    """
+    events = (_Input * 2)()
+    for event in events:
+        event.type = 1  # INPUT_KEYBOARD
+        event.data.keyboard.vk = MENU_MASK_KEY
+    events[1].data.keyboard.flags = 2  # KEYEVENTF_KEYUP
+    return send_input(2, events, ct.sizeof(_Input)) == 2
 
 
 class KeyboardListener:
@@ -44,7 +84,7 @@ class KeyboardListener:
                 self._commands.clear()
             return {'available': self.available, 'commands': commands}
 
-    def key(self, code, down, ctrl, foreground):
+    def key(self, code, down, alt, foreground, *, mask_menu=None):
         """Fast, testable hook logic; repeats never become a second command."""
         if code not in COMMANDS:
             return False
@@ -58,11 +98,15 @@ class KeyboardListener:
             if code in self._down:
                 return code in self._pressed
             self._down.add(code)
-            if code not in COMMANDS or not ctrl or not foreground or time.monotonic() >= self._lease:
+            if not alt or not foreground or time.monotonic() >= self._lease:
                 return False
             self._pressed.add(code)
             self._commands.append(COMMANDS[code])
-            return True
+        # Outside the state lock: injected events can re-enter the OS hook.
+        # Mask once for each captured press, never for repeats or unrelated keys.
+        if mask_menu is not None:
+            mask_menu()
+        return True
 
     def start(self):
         if os.name == 'nt':
@@ -102,11 +146,19 @@ class KeyboardListener:
         foreground = bind(user, 'GetForegroundWindow', wt.HWND)
         window_text = bind(user, 'GetWindowTextW', ct.c_int, wt.HWND, wt.LPWSTR, ct.c_int)
         key_state = bind(user, 'GetAsyncKeyState', ct.c_short, ct.c_int)
+        send_input = bind(user, 'SendInput', wt.UINT, wt.UINT, ct.POINTER(_Input), ct.c_int)
         module = bind(kernel, 'GetModuleHandleW', wt.HMODULE, wt.LPCWSTR)
         thread_id = bind(kernel, 'GetCurrentThreadId', wt.DWORD)
         get_message = bind(user, 'GetMessageW', ct.c_int, ct.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT)
         peek = bind(user, 'PeekMessageW', wt.BOOL, ct.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT, wt.UINT)
         hook = None
+        mask_warning_reported = False
+
+        def suppress_menu():
+            nonlocal mask_warning_reported
+            if not mask_alt_menu(send_input) and not mask_warning_reported:
+                mask_warning_reported = True
+                logging.getLogger(__name__).warning('Could not suppress the browser Alt menu for a control shortcut.')
 
         @callback_type
         def callback(code, message, pointer):
@@ -115,10 +167,12 @@ class KeyboardListener:
                 if key.vkCode in COMMANDS:
                     title = ct.create_unicode_buffer(512)
                     window_text(foreground(), title, len(title))
-                    focused = title.value.startswith('CRF Control')
-                    ctrl = bool(key_state(0x11) & 0x8000) and not any(
-                        key_state(vk) & 0x8000 for vk in (0x12, 0x10, 0x5B, 0x5C))
-                    if self.key(key.vkCode, message in (0x100, 0x104), ctrl, focused):
+                    focused = title.value.startswith(DASHBOARD_TITLE)
+                    # LLKHF_ALTDOWN is bit 5 of the hook event's flags.
+                    alt = bool(key.flags & 0x20) and not any(
+                        key_state(vk) & 0x8000 for vk in (0x11, 0x10, 0x5B, 0x5C))
+                    if self.key(key.vkCode, message in (0x100, 0x104), alt, focused,
+                                mask_menu=suppress_menu):
                         return 1
             return next_hook(None, code, message, pointer)
 

@@ -15,13 +15,7 @@ public:
     void open(bool boardReady, const std::wstring& port, double velocity) {
         velocity_ = velocity;
         if (simulated_) { waterReady_ = gasReady_ = true; return; }
-        long sts = 0;
-        waterReady_ = boardReady && GT_GetSts(6, &sts) == 0 && !(sts & 0x5f2);
-        if (waterReady_) {
-            waterTouched_ = true;
-            waterReady_ = GT_AxisOn(6) == 0;
-            waterReadyAt_ = GetTickCount64() + 200;
-        }
+        recheckWater(boardReady);
         // A missing gas controller does not prevent water or Flex motion.
         const std::wstring path = L"\\\\.\\" + port;
         serial_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
@@ -49,6 +43,32 @@ public:
         }
         std::printf("Spray hardware: water %s, gas %s.\n",
                     waterReady_ ? "ready" : "unavailable", gasReady_ ? "ready" : "unavailable");
+    }
+    bool recheckWater(bool boardReady) {
+        // Startup may have skipped axis 6 because a Flex drive had an input
+        // fault. Reinitialize only the water drive after an explicit recheck;
+        // reopening the gas port would disrupt the independent gas controller.
+        waterReady_ = false;
+        if (!boardReady) return false;
+        if (simulated_) { waterReady_ = true; return true; }
+        long sts = 0;
+        const short statusResult = GT_GetSts(6, &sts);
+        if (statusResult || (sts & 0x5f2)) {
+            std::fprintf(stderr, "Water pump unavailable: GTS axis 6 status 0x%lX (GT_GetSts returned %d). "
+                         "Check pump drive power, alarm and limit inputs.\n",
+                         static_cast<unsigned long>(sts), statusResult);
+            return false;
+        }
+        waterTouched_ = true;
+        const short enableResult = GT_AxisOn(6);
+        if (enableResult) {
+            std::fprintf(stderr, "Water pump unavailable: GT_AxisOn(6) returned %d.\n", enableResult);
+            return false;
+        }
+        waterReady_ = true;
+        waterReadyAt_ = GetTickCount64() + 200;
+        std::puts("Water pump axis 6 enabled. Waiting for the drive to settle.");
+        return true;
     }
     bool waterReady() const override { return waterReady_ && (simulated_ || GetTickCount64() >= waterReadyAt_); }
     bool gasReady() const override { return gasReady_; }

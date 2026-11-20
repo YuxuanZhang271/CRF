@@ -768,6 +768,7 @@ private:
                 motion_.canRecheckStartup()) {
                 recheckApp_ = cmd.app;
                 if (motion_.recheckStartup()) {
+                    sprayHardware_.recheckWater(true);
                     setupReference_ = motion_.profile();
                     setupEncoder_ = motion_.encoder();
                     acknowledge(cmd, Done);

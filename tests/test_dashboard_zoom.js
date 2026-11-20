@@ -158,4 +158,77 @@ check(1.0082);
 tick(2000);
 check(1.0282); // A delayed frame cannot cause a large jump.
 zoomIn.fire('pointerup');
-console.log('Zoom defaults, presets, slider, crop scale, holds, cancellation, keyboard and limits passed.');
+
+// Tasks receive server feedback at 5 Hz, but render the same 0.2x/s motion
+// as manual holds on every animation frame, without unlocking manual buttons.
+document.hidden = false;
+for (const [id, initial, direction] of [[3, 1.25, 1], [4, 1.75, -1]]) {
+  vm.runInContext(`syncTaskZoom({id:${id}, revision:${id}, zoom:${initial}, phase:'running'})`, context);
+  check(initial);
+  for (let poll = 1; poll <= 5; ++poll) {
+    const confirmed = initial + direction * .04 * poll;
+    const before = Number(slider.value);
+    vm.runInContext(`syncTaskZoom({id:${id}, revision:${id}, zoom:${confirmed}, phase:'running'})`, context);
+    check(before); // Receiving a sample must not jump directly to its zoom.
+    for (let frame = 0; frame < 10; ++frame) {
+      const previous = Number(slider.value);
+      tick(20);
+      const displayed = Number(slider.value);
+      assert.ok(direction * (displayed - previous) > 0);
+      assert.ok(Math.abs(displayed - previous) <= .00400001, 'Each frame stays small and smooth');
+      assert.ok(direction * (confirmed - displayed) >= -1e-9, 'Never extrapolate beyond server feedback');
+      assert.ok(zoomIn.disabled && zoomOut.disabled, 'Rendering must preserve task control locks');
+    }
+    check(confirmed);
+  }
+  const final = Number(slider.value);
+  vm.runInContext(`syncTaskZoom({id:${id}, revision:${id}, zoom:${final - direction * .04}, phase:'running'})`, context);
+  tick(200);
+  check(final); // Older feedback cannot reverse an active task.
+  tick(1000);
+  check(final); // Missing feedback cannot keep zooming.
+  vm.runInContext(`syncTaskZoom({id:0, revision:10, zoom:${final}, phase:'idle'})`, context);
+}
+
+// Updates received while a frame is pending must not restart or multiply timers.
+vm.runInContext("syncTaskZoom({id:3, revision:20, zoom:1.5, phase:'running'}); syncTaskZoom({id:3, revision:20, zoom:1.54, phase:'running'})", context);
+tick(20);
+check(1.504);
+vm.runInContext("syncTaskZoom({id:3, revision:20, zoom:1.58, phase:'running'})", context);
+assert.equal(timers.size, 1);
+tick(20);
+check(1.508);
+tick(2000);
+check(1.528); // Cap catch-up after a suspended or stalled animation frame.
+vm.runInContext('stopTaskZoom()', context);
+assert.equal(timers.size, 0);
+tick(200);
+check(1.528);
+
+// Pending transitions, hidden pages, errors and task exit stop visual work.
+vm.runInContext("syncTaskZoom({id:4, revision:21, zoom:1.5, phase:'running'}, false)", context);
+tick(100);
+check(1.528);
+vm.runInContext("syncTaskZoom({id:4, revision:21, zoom:1.48, phase:'running'})", context);
+tick(20);
+check(1.524);
+document.hidden = true;
+document.fire('visibilitychange');
+assert.equal(timers.size, 0);
+tick(200);
+check(1.524);
+document.hidden = false;
+vm.runInContext("syncTaskZoom({id:3, revision:22, zoom:1.98, phase:'running'}); syncTaskZoom({id:3, revision:22, zoom:2, phase:'limited'})", context);
+tick(100);
+check(2);
+assert.equal(timers.size, 0);
+vm.runInContext("syncTaskZoom({id:4, revision:23, zoom:1.01, phase:'running'}); syncTaskZoom({id:4, revision:23, zoom:1, phase:'limited'})", context);
+tick(100);
+check(1);
+vm.runInContext("syncTaskZoom({id:3, revision:24, zoom:1.5, phase:'running'}); syncTaskZoom({id:3, revision:24, zoom:1.54, phase:'running'})", context);
+vm.runInContext("syncTaskZoom({id:3, revision:25, zoom:1.52, error:'stopped'})", context);
+assert.equal(timers.size, 0);
+check(1.52);
+vm.runInContext("syncTaskZoom({id:0, revision:26, zoom:1.52, phase:'idle'})", context);
+assert.ok(!zoomIn.disabled && !zoomOut.disabled);
+console.log('Manual zoom and frame-smooth task zoom, server bounds, stale feedback, locks and cancellation passed.');

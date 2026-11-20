@@ -11,6 +11,12 @@ let currentTask = null;
 let taskPending = false;
 let remoteBusy = false;
 const taskButtons = new Map();
+let freedriveActive = false;
+let freedriveBusy = false;
+let freedrivePending = false;
+let freedriveOwned = false;
+let freedriveWanted = false;
+const freedriveLease = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 function manualControlsLocked() {
   return !stateFeedReady || taskPending || currentTask?.id !== 0 || Boolean(currentTask?.error) ||
@@ -19,28 +25,30 @@ function manualControlsLocked() {
 
 function applyTaskLock() {
   const locked = manualControlsLocked();
-  if (locked) {
+  if (locked || freedriveBusy || freedrivePending) {
     document.querySelectorAll('.robot-panel button, .robot-panel input, .robot-panel select').forEach(control => {
-      if (control.id !== 'interrupt') control.disabled = true;
+      if (!['interrupt', 'stop', 'record', 'arm-freedrive'].includes(control.id) || locked) control.disabled = true;
     });
   }
+  if (locked || freedrivePending) document.getElementById('arm-freedrive').disabled = true;
   document.getElementById('stop').disabled = locked;
   recordButton.disabled = locked || recordingPending || !recordingReady;
   document.getElementById('interrupt').disabled = interrupting || stopping || sessionStopped;
   taskButtons.forEach(button => {
-    button.disabled = !stateFeedReady || taskPending || remoteBusy || interrupting || stopping || sessionStopped || Boolean(currentTask?.error);
+    button.disabled = !stateFeedReady || taskPending || remoteBusy || interrupting || stopping || sessionStopped || Boolean(currentTask?.error) || freedriveBusy || freedrivePending;
   });
 }
 
 function renderTask(task) {
   if (!task || !Number.isInteger(task.id) || !Number.isInteger(task.revision)) {
+    stopTaskZoom();
     currentTask = null;
     setStatusChip('task-status', 'Unavailable', 'warning');
     return;
   }
   if (currentTask && task.revision < currentTask.revision) return;
   if (([3, 4].includes(task.id) || [3, 4].includes(currentTask?.id)) && Number.isFinite(task.zoom)) {
-    setCameraZoom(task.zoom);
+    syncTaskZoom(task, !taskPending && !interrupting && !stopping && !sessionStopped);
   }
   if (task.id !== 0 && currentTask?.id !== task.id) releaseKeys();
   currentTask = task;
@@ -55,13 +63,15 @@ function renderTask(task) {
     task.id === 0 ? '0 · Stop — manual controls available when devices are ready.' :
     `${task.id} · ${task.name} — ${task.message || 'Running; manual controls locked.'}`;
   message.dataset.level = task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'info';
+  message.title = message.textContent;
   reportStatus('task-state', 'TASK', `${task.id} · ${task.name} · ${task.error || task.message || ''}`, message.dataset.level);
 }
 
 async function selectTask(id) {
-  if (taskPending || !stateFeedReady || remoteBusy || interrupting || stopping || sessionStopped || currentTask?.error) return;
+  if (taskPending || !stateFeedReady || remoteBusy || interrupting || stopping || sessionStopped || currentTask?.error || freedriveBusy || freedrivePending) return;
   if (currentTask?.id === id) return;
   stopZoom();
+  stopTaskZoom();
   taskPending = true;
   releaseKeys();
   applyTaskLock();
@@ -141,7 +151,7 @@ function renderRecording(state) {
   recordingActive = state.active;
   recordButton.setAttribute('aria-pressed', String(recordingActive));
   recordButton.textContent = recordingActive ? 'RECORD ●' : 'RECORD';
-  recordButton.title = recordingActive ? 'Stop recording' : 'Start recording';
+  recordButton.title = recordingActive ? 'Stop recording · Alt+R' : 'Start recording · Alt+R';
   recordButton.disabled = recordingPending || manualControlsLocked();
   const label = document.getElementById('recording-status');
   recordingClock = {at: performance.now(), state};
@@ -225,7 +235,7 @@ function reportStatus(key, source, message, level) {
 async function post(path, body = {}, quiet = false) {
   const release = path === '/api/key' && body.down === false;
   if (!['/api/cmd/interrupt', '/api/cmd/stop'].includes(path) && !release && manualControlsLocked()) return false;
-  const timeout = path === '/api/cmd/stop' ? 12000 : path === '/api/cmd/interrupt' ? 4000 : 1000;
+  const timeout = path === '/api/cmd/stop' ? 12000 : ['/api/cmd/interrupt', '/api/cmd/freedrive'].includes(path) ? 4000 : 1000;
   try {
     const response = await fetch(path, {
       method: 'POST',
@@ -241,7 +251,7 @@ async function post(path, body = {}, quiet = false) {
     }
     return true;
   } catch (e) {
-    if (!quiet) writeOutput('CMD', e.message, 'error');
+    if (!quiet && !(path === '/api/cmd/freedrive' && !freedriveWanted)) writeOutput('CMD', e.message, 'error');
     return false;
   }
 }
@@ -251,6 +261,36 @@ let keyRequest = Promise.resolve();
 let interrupting = false;
 let stopping = false;
 let sessionStopped = false;
+
+async function toggleFreedrive() {
+  if (freedrivePending || manualControlsLocked()) return;
+  const enabled = !freedriveActive;
+  freedriveWanted = enabled;
+  freedrivePending = true;
+  releaseKeys();
+  applyTaskLock();
+  try {
+    await keyRequest;
+    if (enabled && !freedriveWanted) return;
+    const accepted = await post('/api/cmd/freedrive', {enabled, lease: freedriveLease});
+    freedriveOwned = accepted && enabled && freedriveWanted;
+    if (!accepted) freedriveWanted = false;
+    // Recheck state before enabling any controls after the mode change.
+    stateFeedReady = false;
+  } finally {
+    freedrivePending = false;
+    applyTaskLock();
+  }
+}
+
+function releaseFreedrive() {
+  if (!freedriveOwned && !freedriveWanted) return;
+  freedriveOwned = freedriveWanted = false;
+  fetch('/api/cmd/freedrive', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: false}), keepalive: true
+  }).catch(() => {}); // The relay also expires the lease if this cannot arrive.
+}
 
 function sendKey(key, down, pointerId) {
   keyRequest = keyRequest.then(() => {
@@ -313,6 +353,7 @@ function releaseKeys() {
 async function stopSession() {
   if (manualControlsLocked()) return;
   stopping = true;
+  stopTaskZoom();
   document.getElementById('stop').disabled = true;
   document.getElementById('interrupt').disabled = true;
   held.clear();
@@ -336,6 +377,7 @@ async function stopSession() {
 async function interruptMotion() {
   if (interrupting || stopping) return;
   interrupting = true;
+  stopTaskZoom();
   applyTaskLock();
   const button = document.getElementById('interrupt');
   button.disabled = true;
@@ -361,13 +403,19 @@ async function calibrateFlex() {
     if (await post('/api/flex/calibrate', {degrees})) delete field.dataset.dirty;
   }
 }
-window.addEventListener('blur', releaseKeys);
-window.addEventListener('pagehide', releaseKeys);
+window.addEventListener('blur', () => { releaseKeys(); releaseFreedrive(); });
+window.addEventListener('pagehide', () => { releaseKeys(); releaseFreedrive(); });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) releaseKeys();
+  if (document.hidden) { releaseKeys(); releaseFreedrive(); }
 });
 setInterval(() => {
   if (held.size) post('/api/key/heartbeat', {held: [...held.keys()]}, true);
+  if (freedriveOwned && stateFeedReady && !document.hidden && !stopping && !interrupting) {
+    fetch('/api/freedrive/heartbeat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({lease: freedriveLease}), signal: AbortSignal.timeout(1000)
+    }).then(response => { if (!response.ok) releaseFreedrive(); }).catch(releaseFreedrive);
+  }
 }, 250);
 
 async function pollState() {
@@ -382,6 +430,7 @@ async function pollState() {
     renderStatusBar({});
     renderTask(null);
     document.getElementById('task-message').textContent = 'Task status unavailable; manual controls locked.';
+    document.getElementById('task-message').title = 'Task status unavailable; manual controls locked.';
     syncDeviceLimits('arm', null, null, null, false, false);
     syncDeviceLimits('flex', null, null, null, false, false);
     pullOutButton.disabled = true;
@@ -390,6 +439,7 @@ async function pollState() {
       delete document.getElementById(id).dataset.activity;
     });
     releaseKeys();
+    releaseFreedrive();
     applyTaskLock();
     document.querySelectorAll('button[data-key]').forEach(button => { button.disabled = true; });
     if (!stopping) reportStatus('state-feed', 'APP', 'Control state unavailable.', 'error');
@@ -598,6 +648,8 @@ function renderStatusBar(s) {
   const flexStill = !flex || (flex.connected && !flexFault && flex.moving === false);
   if (sessionStopped) setStatusChip('motion-status', 'Stopped', 'ok');
   else if (stopping || s.stopping || interrupting || s.interrupting) setStatusChip('motion-status', 'Stopping', 'warning');
+  else if (s.freedrive_transition) setStatusChip('motion-status', 'Changing Freedrive', 'warning');
+  else if (s.freedrive_active) setStatusChip('motion-status', 'Freedrive', 'active');
   else if ([5, 6, 7, 8].includes(currentTask?.id) && flex?.tracking) setStatusChip('motion-status', 'Looking', 'active');
   else if (flex?.tracking || s.tracking) setStatusChip('motion-status', 'Tracking', 'tracking');
   else if (s.arm_moving === true || flex?.moving === true) setStatusChip('motion-status', 'Moving', 'active');
@@ -607,6 +659,9 @@ function renderStatusBar(s) {
 
 function renderState(s) {
   stateFeedReady = true;
+  freedriveActive = s.freedrive_active === true;
+  freedriveBusy = freedriveActive || s.freedrive_transition === true;
+  if (!freedriveBusy && !freedrivePending) freedriveOwned = freedriveWanted = false;
   remoteBusy = Boolean(s.stopping || s.interrupting);
   renderTask(s.task);
   renderMeasurements(s);
@@ -615,13 +670,22 @@ function renderState(s) {
   const hardware = Boolean(flex);
   document.getElementById('flex-model-controls').hidden = hardware;
   document.getElementById('flex-hardware-controls').hidden = !hardware;
+  document.getElementById('flex-roll-shortcut').hidden = !hardware;
   document.getElementById('flex-calibration').hidden = !hardware;
   const tracking = document.getElementById('tracking');
   const flexReady = hardware && flex.connected && flex.positioning_ready && !flex.fault;
   const armReady = s.relay_connected && s.joints_received && s.kinematics_ready && !s.motion_fault;
   const rcmReady = armReady && s.arm_mode === 'rcm' && s.rcm_enabled;
   const sprayBusy = Boolean(flex?.spray_busy);
-  const controlsAvailable = !manualControlsLocked() && !s.stopping && !s.interrupting;
+  const controlsAvailable = !manualControlsLocked() && !s.stopping && !s.interrupting && !freedriveBusy && !freedrivePending;
+  const freedriveButton = document.getElementById('arm-freedrive');
+  freedriveButton.setAttribute('aria-pressed', String(freedriveActive));
+  freedriveButton.title = freedriveActive ? 'Exit Freedrive and hold the current pose' : 'Enter hand guiding; hold Alt+Shift+F for keyboard Freedrive';
+  freedriveButton.disabled = manualControlsLocked() || freedrivePending || s.freedrive_transition === true ||
+    (!freedriveActive && (!s.arm_enabled || !armReady || s.arm_moving !== false || sprayBusy ||
+      s.pull_out_active || s.tracking || (hardware && (!flex.connected || flex.fault ||
+        flex.moving !== false || flex.busy || flex.tracking))));
+  reportStatus('freedrive', 'ARM', freedriveActive ? 'Freedrive active · hand guiding. Click FREEDRIVE again or INTERRUPT to exit.' : '');
   const limitEditable = controlsAvailable && !sprayBusy;
   document.querySelectorAll('button[data-key^="arm_"]').forEach(button => {
     button.disabled = !armReady || !limitEditable;
@@ -653,7 +717,7 @@ function renderState(s) {
   setActivity(pullOutButton, {preparing: 'moving', retracting: 'moving'}[s.pull_out_state] || s.pull_out_state);
   setActivity(tracking, flex?.tracking_indicator);
   const instruction = {preparing: 'Pull Out: moving to zero.',
-    ready: 'At zero. Verify straightness and a clear path; press PULL OUT or Ctrl+P again to withdraw.',
+    ready: 'At zero. Verify straightness and a clear path; press PULL OUT or Alt+P again to withdraw.',
     retracting: 'Pull Out: withdrawing.', complete: 'Pull Out complete.'}[s.pull_out_state] || '';
   document.getElementById('procedure-status').textContent =
     flex?.spray_action === 'clean lens' ? flex.spray_message : instruction;
@@ -706,11 +770,18 @@ function renderState(s) {
     const button = document.getElementById(id);
     const active = flex?.spray_action === action;
     button.disabled = !controlsAvailable || (!active && !(sprayReady && flex[capability]));
+    button.title = flex?.connected && !flex[capability] ?
+      (id === 'water-spray' ? 'Water pump unavailable (GTS axis 6). Check pump power and the driver console.' :
+        'Gas pump unavailable. Check the serial connection and the driver console.') :
+      (id === 'water-spray' ? 'Hold to spray water; release to stop' : 'Hold to spray gas; release to stop');
     button.setAttribute('aria-pressed', String(active));
     setActivity(button, active ? 'active' : '');
   });
   reportStatus('spray-message', 'SPRAY', flex?.spray_message || '');
   reportStatus('spray-error', 'SPRAY', flex?.spray_error || '', 'error');
+  reportStatus('water-unavailable', 'SPRAY', flex?.connected && !flex.fault && !flex.spray_error &&
+    !flex.water_ready && flex.gas_ready ?
+    'Water pump unavailable (GTS axis 6). Check pump power and the driver console.' : '', 'warning');
   applyTaskLock();
   const taskZoom = [3, 4].includes(currentTask?.id) || taskPending;
   zoomSlider.disabled = taskZoom;
@@ -740,6 +811,10 @@ const zoomPresets = document.querySelectorAll('[data-zoom]');
 let cameraZoom = 1;
 let zoomFrame = null;
 let zoomOwner = null;
+const ZOOM_RATE_PER_MS = 0.0002;
+let taskZoomFrame = null;
+let taskZoomTarget = null;
+let taskZoomKey = null;
 
 function stopZoom() {
   cancelAnimationFrame(zoomFrame);
@@ -747,7 +822,57 @@ function stopZoom() {
   zoomOwner = null;
 }
 
-function setCameraZoom(value) {
+function stopTaskZoom() {
+  cancelAnimationFrame(taskZoomFrame);
+  taskZoomFrame = null;
+  taskZoomTarget = null;
+  taskZoomKey = null;
+}
+
+function syncTaskZoom(task, animate = true) {
+  const active = [3, 4].includes(task.id);
+  if (!Number.isFinite(task.zoom)) { stopTaskZoom(); return; }
+  if (!active || task.error) {
+    stopTaskZoom();
+    setCameraZoom(task.zoom, active);
+    return;
+  }
+  if (document.hidden) { stopTaskZoom(); return; }
+  const key = `${task.id}:${task.revision}`;
+  if (taskZoomKey !== key) {
+    stopTaskZoom();
+    stopZoom();
+    taskZoomKey = key;
+    if (animate) setCameraZoom(task.zoom, true);
+    taskZoomTarget = Math.min(2, Math.max(1, task.zoom));
+  } else {
+    // A delayed HTTP response from this invocation must not reverse the view.
+    const confirmed = task.id === 3 ? Math.max(taskZoomTarget, task.zoom) : Math.min(taskZoomTarget, task.zoom);
+    taskZoomTarget = Math.min(2, Math.max(1, confirmed));
+  }
+  if (!animate || task.phase === 'starting') {
+    cancelAnimationFrame(taskZoomFrame);
+    taskZoomFrame = null;
+    return;
+  }
+  if (taskZoomFrame !== null || taskZoomTarget === cameraZoom) return;
+  let previousTime = performance.now();
+  const advance = time => {
+    taskZoomFrame = null;
+    if (taskZoomTarget === null || document.hidden) { stopTaskZoom(); return; }
+    const elapsed = Math.min(100, Math.max(0, time - previousTime));
+    previousTime = time;
+    const delta = taskZoomTarget - cameraZoom;
+    const step = Math.min(Math.abs(delta), elapsed * ZOOM_RATE_PER_MS);
+    // Animate only toward confirmed server feedback: no extrapolation during
+    // network stalls, and new polls do not restart an in-progress animation.
+    setCameraZoom(step === Math.abs(delta) ? taskZoomTarget : cameraZoom + Math.sign(delta) * step, true);
+    if (cameraZoom !== taskZoomTarget) taskZoomFrame = requestAnimationFrame(advance);
+  };
+  taskZoomFrame = requestAnimationFrame(advance);
+}
+
+function setCameraZoom(value, taskControlled = false) {
   if (!Number.isFinite(value)) return;
   cameraZoom = Math.min(2, Math.max(1, value));
   const label = `${Number(cameraZoom.toFixed(2))}x`;
@@ -756,12 +881,12 @@ function setCameraZoom(value) {
   zoomSlider.value = cameraZoom;
   zoomSlider.setAttribute('aria-valuetext', label);
   zoomRatio.value = label;
-  zoomIn.disabled = cameraZoom === 2;
-  zoomOut.disabled = cameraZoom === 1;
+  zoomIn.disabled = taskControlled || cameraZoom === 2;
+  zoomOut.disabled = taskControlled || cameraZoom === 1;
   zoomPresets.forEach(button => {
     button.setAttribute('aria-pressed', String(Number(button.dataset.zoom) === cameraZoom));
   });
-  if (zoomIn.disabled || zoomOut.disabled) stopZoom();
+  if (cameraZoom === 1 || cameraZoom === 2) stopZoom();
 }
 
 zoomSlider.addEventListener('input', () => {
@@ -773,28 +898,28 @@ zoomPresets.forEach(button => button.addEventListener('click', () => {
   setCameraZoom(Number(button.dataset.zoom));
 }));
 
-[[zoomIn, 1], [zoomOut, -1]].forEach(([button, direction]) => {
-  const start = owner => {
-    stopZoom();
-    zoomOwner = owner;
-    setCameraZoom(cameraZoom + direction * 0.005);
-    let previousTime = performance.now();
-    const advance = time => {
-      // 0.2x per second, with small frame updates and no jump after a stall.
-      const elapsed = Math.min(100, Math.max(0, time - previousTime));
-      previousTime = time;
-      setCameraZoom(cameraZoom + direction * elapsed * 0.0002);
-      if (zoomOwner !== null) zoomFrame = requestAnimationFrame(advance);
-    };
-    if (zoomOwner !== null) {
-      zoomFrame = requestAnimationFrame(advance);
-    }
+function startZoom(direction, owner) {
+  if ((direction > 0 ? zoomIn : zoomOut).disabled) return;
+  stopZoom();
+  zoomOwner = owner;
+  setCameraZoom(cameraZoom + direction * 0.005);
+  let previousTime = performance.now();
+  const advance = time => {
+    // 0.2x per second, with small frame updates and no jump after a stall.
+    const elapsed = Math.min(100, Math.max(0, time - previousTime));
+    previousTime = time;
+    setCameraZoom(cameraZoom + direction * elapsed * ZOOM_RATE_PER_MS);
+    if (zoomOwner !== null) zoomFrame = requestAnimationFrame(advance);
   };
+  if (zoomOwner !== null) zoomFrame = requestAnimationFrame(advance);
+}
+
+[[zoomIn, 1], [zoomOut, -1]].forEach(([button, direction]) => {
   button.addEventListener('pointerdown', event => {
     if (event.button !== 0 || button.disabled) return;
     event.preventDefault();
     button.setPointerCapture(event.pointerId);
-    start(event.pointerId);
+    startZoom(direction, event.pointerId);
   });
   ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(type => {
     button.addEventListener(type, event => {
@@ -804,7 +929,7 @@ zoomPresets.forEach(button => button.addEventListener('click', () => {
   button.addEventListener('keydown', event => {
     if (!['Space', 'Enter'].includes(event.code)) return;
     event.preventDefault();
-    if (!event.repeat && !button.disabled) start(event.code);
+    if (!event.repeat && !button.disabled) startZoom(direction, event.code);
   });
   button.addEventListener('blur', stopZoom);
   // Assistive technology and programmatic clicks have no pointer press.
@@ -818,9 +943,9 @@ zoomPresets.forEach(button => button.addEventListener('click', () => {
 document.addEventListener('keyup', event => {
   if (zoomOwner === event.code) stopZoom();
 });
-window.addEventListener('blur', stopZoom);
+window.addEventListener('blur', () => { stopZoom(); stopTaskZoom(); });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) stopZoom();
+  if (document.hidden) { stopZoom(); stopTaskZoom(); }
 });
 setCameraZoom(1);
 

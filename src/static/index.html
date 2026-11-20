@@ -16,15 +16,20 @@
 <div class="panel-scroll" tabindex="0" aria-label="Robot controls">
   <div class="card primary-actions">
     <div class="actions">
-      <button id="bird-eye" onclick="post('/api/cmd/bird_eye')" title="Bird-eye view · Ctrl+B" aria-keyshortcuts="Control+b">BIRD-EYE</button>
+      <button id="bird-eye" onclick="post('/api/cmd/bird_eye')" title="Bird-eye view · Alt+B" aria-keyshortcuts="Alt+b">BIRD-EYE</button>
       <button id="clean-lens" onclick="post('/api/cmd/clean_lens')" title="Water 3 seconds, then gas 3 seconds; click again to cancel" disabled>CLEAN LENS</button>
-      <button id="pull-out" title="Prepare zero pose, then press again to withdraw · Ctrl+P" aria-keyshortcuts="Control+p" disabled>PULL OUT</button>
+      <button id="pull-out" title="Prepare zero pose, then press again to withdraw · Alt+P" aria-keyshortcuts="Alt+p" disabled>PULL OUT</button>
     </div>
     <div class="actions stop-actions">
-      <button id="interrupt" class="interrupt" onclick="interruptMotion()" title="Cancel motion and keep the session open">INTERRUPT</button>
+      <button id="interrupt" class="interrupt" onclick="interruptMotion()" title="Cancel motion and keep the session open · I" aria-keyshortcuts="i">INTERRUPT</button>
       <button id="stop" class="estop" onclick="stopSession()" title="Stop motion and shut down the app">STOP</button>
     </div>
     <p id="procedure-status" class="status" role="status"></p>
+    <p class="shortcut-tips" aria-label="Procedure keyboard shortcuts">
+      <span><kbd>Alt</kbd>+<kbd>B</kbd> bird-eye</span>
+      <span><kbd>Alt</kbd>+<kbd>P</kbd> pull out</span>
+      <span><kbd>I</kbd> interrupt</span>
+    </p>
   </div>
 
     <div class="card"><h3>UR5</h3>
@@ -43,12 +48,13 @@
           <button type="submit" disabled>APPLY</button>
         </form>
         <div class="actions device-actions">
+          <button id="arm-freedrive" onclick="toggleFreedrive()" aria-label="Toggle UR5 Freedrive" aria-pressed="false" aria-keyshortcuts="Alt+Shift+f" title="Toggle hand guiding; hold Alt+Shift+F for keyboard Freedrive" disabled>FREEDRIVE</button>
           <button id="arm-reset" onclick="post('/api/cmd/reset')" aria-label="Reset arm">RESET</button>
         </div>
       </div>
       <h3 class="control-title">Arm controls</h3>
       <div class="command-grid">
-        <button id="arm-mode" class="control-mode" onclick="post('/api/mode/arm')" aria-label="Toggle arm mode" aria-pressed="false">Toggle mode</button>
+        <button id="arm-mode" class="control-mode" onclick="post('/api/mode/arm')" aria-label="Toggle arm mode" aria-pressed="false" aria-keyshortcuts="Alt+m" title="Toggle linear/RCM mode · Alt+M">Toggle mode</button>
         <button class="direction control-left" data-key="arm_left" aria-label="Arm left">←</button>
         <button class="direction control-up" data-key="arm_up" aria-label="Arm up">↑</button>
         <button class="direction control-down" data-key="arm_down" aria-label="Arm down">↓</button>
@@ -56,6 +62,12 @@
         <button class="control-forward" data-key="arm_fwd" aria-label="Arm forward">FWD</button>
         <button class="control-backward" data-key="arm_bwd" aria-label="Arm backward">BWD</button>
       </div>
+      <p class="shortcut-tips" aria-label="UR5 keyboard shortcuts">
+        <span>Hold <kbd>↑ ↓ ← →</kbd> to move</span>
+        <span><kbd>]</kbd> forward · <kbd>[</kbd> backward</span>
+        <span><kbd>Alt</kbd>+<kbd>M</kbd> mode</span>
+        <span>Hold <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> for Freedrive</span>
+      </p>
     </div>
 
     <div class="card"><h3>FlexEndo</h3>
@@ -107,6 +119,11 @@
         <button class="control-forward" data-key="flex_roll_plus" aria-label="Jog positive Flex roll" disabled>roll+</button>
         <button class="control-backward" data-key="flex_roll_minus" aria-label="Jog negative Flex roll" disabled>roll-</button>
       </div>
+      <p class="shortcut-tips" aria-label="FlexEndo keyboard shortcuts">
+        <span>Hold <kbd>W</kbd>/<kbd>S</kbd> to look up/down</span>
+        <span><kbd>A</kbd>/<kbd>D</kbd> left/right</span>
+        <span id="flex-roll-shortcut" hidden><kbd>R</kbd>/<kbd>F</kbd> roll +/−</span>
+      </p>
     </div>
 
     <div class="motion-plots">
@@ -130,10 +147,15 @@
     <section class="card console" aria-labelledby="console-heading">
       <div class="console-heading">
         <h3 id="console-heading">Console</h3>
-        <button id="record" type="button" aria-pressed="false" title="Record · Ctrl+R" aria-keyshortcuts="Control+r" disabled>RECORD</button>
+        <div class="recording-controls">
+          <div id="recording-status" class="status" role="status">Checking recording status…</div>
+          <button id="record" type="button" aria-pressed="false" title="Record · Alt+R" aria-keyshortcuts="Alt+r" disabled>RECORD</button>
+        </div>
       </div>
-      <div id="recording-status" class="status" role="status">Checking recording status…</div>
       <div class="console-output" id="console-output" role="log" aria-labelledby="console-heading" tabindex="0"></div>
+      <p class="shortcut-tips" aria-label="Recording keyboard shortcut">
+        <span><kbd>Alt</kbd>+<kbd>R</kbd> start/stop recording</span>
+      </p>
     </section>
   </div>
 </section>
@@ -156,8 +178,8 @@
       <input id="camera-zoom" type="range" min="1" max="2" step="0.001" value="1" aria-valuetext="1x">
     </div>
     <div class="zoom-actions">
-      <button id="zoom-in" type="button" title="Hold to zoom in">ZOOM IN</button>
-      <button id="zoom-out" type="button" title="Hold to zoom out" disabled>ZOOM OUT</button>
+      <button id="zoom-in" type="button" title="Hold to zoom in · =" aria-keyshortcuts="=">ZOOM IN</button>
+      <button id="zoom-out" type="button" title="Hold to zoom out · −" aria-keyshortcuts="-" disabled>ZOOM OUT</button>
     </div>
   </div>
   <dl class="status-bar" aria-label="Robot status">
@@ -166,21 +188,32 @@
     <div class="status-chip" id="motion-status"><dt>MOTION</dt><dd>Unavailable</dd></div>
     <div class="status-chip" id="task-status"><dt>TASK</dt><dd>Unavailable</dd></div>
   </dl>
+  <p class="shortcut-tips" aria-label="Camera keyboard shortcuts">
+    <span>Hold <kbd>=</kbd> to zoom in · <kbd>-</kbd> to zoom out</span>
+  </p>
 </section>
 
 <aside class="panel category-panel" aria-labelledby="categories-heading">
   <h2 id="categories-heading">Vision-Language Interaction</h2>
   <div class="panel-scroll">
     <section class="card" aria-labelledby="tasks-heading">
-      <h3 id="tasks-heading">Tasks</h3>
+      <div class="task-heading">
+        <h3 id="tasks-heading">Tasks</h3>
+        <p id="task-message" class="status" role="status" title="Waiting for task status…">Waiting for task status…</p>
+      </div>
       <p class="task-help">Select a task to execute. Spray water/air runs for 3 seconds. INTERRUPT stops.</p>
       <div class="task-options" id="task-options" role="group" aria-label="Tasks"></div>
-      <p id="task-message" class="status" role="status">Waiting for task status…</p>
+      <p class="shortcut-tips" aria-label="Task keyboard shortcut">
+        <span><kbd>I</kbd> interrupt the current task</span>
+      </p>
     </section>
     <section class="card" aria-labelledby="yolo-heading">
       <h3 id="yolo-heading">YOLO</h3>
-      <button id="tracking" type="button" aria-pressed="false" title="Task 16 · Track selected category · Ctrl+T" aria-keyshortcuts="Control+t" disabled>16 · TRACKING</button>
+      <button id="tracking" type="button" aria-pressed="false" title="Task 16 · Track selected category · Alt+T" aria-keyshortcuts="Alt+t" disabled>16 · TRACKING</button>
       <div class="category-options" id="category-options" role="group" aria-label="YOLO categories"></div>
+      <p class="shortcut-tips" aria-label="YOLO keyboard shortcut">
+        <span><kbd>Alt</kbd>+<kbd>T</kbd> start/stop tracking</span>
+      </p>
     </section>
   </div>
 </aside>

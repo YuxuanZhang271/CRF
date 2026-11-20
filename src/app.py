@@ -165,7 +165,10 @@ class _Handler(BaseHTTPRequestHandler):
             if (not isinstance(body.get('client'), str) or not 1 <= len(body['client']) <= 100
                     or type(body.get('enabled')) is not bool):
                 return self._json({'error': 'Expected keyboard client and enabled flag.'}, 400)
-            enabled = body['enabled'] and not self._task_locked()
+            task = self.server.tasks.snapshot()
+            tracking_cancel = (task['id'] == 16 and not task['error']
+                               and not self.server.stopping and not self.server.interrupting)
+            enabled = body['enabled'] and (not self._task_locked() or tracking_cancel)
             return self._json(self.server.keyboard.poll(body['client'], enabled))
         if self.path == '/api/recording/console':
             if (not all(isinstance(body.get(key), str) for key in ('source', 'message', 'level'))
@@ -199,6 +202,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({'error': str(error)}, 503)
 
     def _control_command(self, body):
+        if self.path == '/api/freedrive/heartbeat':
+            lease = body.get('lease')
+            if not isinstance(lease, str) or not 1 <= len(lease) <= 100:
+                return self._json({'error': 'Expected a Freedrive lease.'}, 400)
+            relay = self.server.relay
+            accepted = relay is not None and relay.refresh_freedrive(lease)
+            return self._json({'ok': accepted}, 200 if accepted else 409)
         if getattr(self.server, 'recorder', None) is not None:
             self._audit = {'id': uuid.uuid4().hex, 'path': self.path,
                            'command': COMMAND_NAMES.get(self.path, self.path), 'body': body}
@@ -208,6 +218,9 @@ class _Handler(BaseHTTPRequestHandler):
                 except TimeoutError as error:
                     self._audit['pose_at_request'] = {'error': str(error)}
             self.server.recorder.event('command', self._audit)
+
+        if self.path == '/api/cmd/freedrive':
+            return self._freedrive_command(body)
 
         if self.path == '/api/camera/category':
             if 'category' not in body:
@@ -276,6 +289,40 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.recorder.event('task', {**task, 'reason': reason})
         log.info('TASK %s · %s (%s)', task['id'], task['name'], reason)
 
+    def _freedrive_command(self, body):
+        enabled, lease = body.get('enabled'), body.get('lease')
+        if type(enabled) is not bool or (enabled and (
+                not isinstance(lease, str) or not 1 <= len(lease) <= 100)):
+            return self._json({'error': 'Expected enabled (boolean) and a Freedrive lease for entry.'}, 400)
+        node, relay = self.server.node, self.server.relay
+        with node.control_lock:
+            if relay is None:
+                return self._json({'error': 'The UR5 is disabled for this session.'}, 503)
+            if enabled and self._task_locked():
+                return self._json({'error': 'Freedrive requires TASK 0. Use INTERRUPT.'}, 409)
+            if self.server.stopping or self.server.interrupting:
+                return self._json({'error': 'Waiting for motion to stop.'}, 409)
+            if enabled:
+                flex = node.flex
+                if (not node._arm_ready() or node._arm_moving is not False
+                        or any(node._key_state.values()) or node._teleop_servo_active
+                        or node.pull_out_active or (flex and (
+                            not flex.ready(calibrated=False) or flex.status.moving
+                            or flex.snapshot()['busy'] or flex.tracking or flex.spray_busy))):
+                    return self._json({'error': 'Stop motion and release the controls before entering Freedrive.'}, 409)
+            try:
+                result = relay.request_freedrive(enabled, lease)
+            except ValueError as error:
+                return self._json({'error': str(error)}, 409)
+            if enabled:
+                node.prepare_freedrive()
+        try:
+            failure = result.result(timeout=ARM_INTERRUPT_CONFIRM_TIMEOUT_S)
+        except FutureTimeoutError:
+            relay.submit('stop')
+            return self._json({'error': 'The UR5 did not confirm the Freedrive change. Stop requested.'}, 504)
+        return self._json({'ok': not bool(failure), 'error': failure}, 503 if failure else 200)
+
     def _interrupt_motion(self, task_id=0, zoom=None):
         node = self.server.node
         started = False
@@ -291,6 +338,8 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._json({'ok': True, 'pending': True, 'task': task}, 202)
                 if self.server.stopping or self.server.interrupting:
                     return self._json({'error': 'A stop request is already in progress.'}, 409)
+                if task_id and self.server.relay is not None and self.server.relay.freedrive_busy() is True:
+                    return self._json({'error': 'Exit Freedrive before starting a task.'}, 409)
                 self.server.interrupting = started = True
                 self.server.executor.cancel()
                 # Lock out manual inputs before clearing keys or talking to devices.
@@ -388,6 +437,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, body):
         node = self.server.node
         flex = node.flex
+        release = self.path == '/api/key' and body.get('down') is False
+        if (self.server.relay is not None and self.server.relay.freedrive_busy() is True
+                and not release):
+            raise ValueError('Exit Freedrive before moving or changing robot settings.')
         if self.path == '/api/cmd/clean_lens':
             if flex is None:
                 raise ValueError('The Flex hardware interface is disabled.')

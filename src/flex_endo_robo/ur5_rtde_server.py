@@ -30,6 +30,9 @@ JOG_PERIODS = {"jog_linear": LINEAR_JOG_PERIOD, "jog_tip": TIP_JOG_PERIOD}
 SERVO_LOOKAHEAD = 0.05
 SERVO_GAIN = 300.0
 MOTION_STALE_S = 0.3
+FREEDRIVE_LEASE_S = 1.5
+WATCHDOG_HZ = 2.0
+WATCHDOG_KICK_S = 0.1
 STOP_TIMEOUT_S = 1.0
 STATIONARY_RAD_S = 1e-3
 MAX_LINE_BYTES = 4096
@@ -154,6 +157,61 @@ class Relay:
         self.move_target = None
         self.move_tolerance = 0.
         self.linear_speed_limit_mm_s = DEFAULT_LINEAR_SPEED_MM_S
+        self.freedrive_request = None
+        self.freedrive_lease = None
+        self.freedrive_deadline = float('-inf')
+        self.freedrive_exiting = False
+        self.watchdog_enabled = False
+        self.watchdog_kicked_at = float('-inf')
+
+    def freedrive_state(self):
+        with self.lock:
+            return {'freedrive_active': self.mode == 'freedrive',
+                    'freedrive_transition': self.freedrive_request is not None or self.freedrive_exiting}
+
+    def freedrive_busy(self):
+        return any(self.freedrive_state().values())
+
+    def request_freedrive(self, enabled, lease):
+        """Queue mode changes on the RTDE worker, which owns all control calls."""
+        with self.lock:
+            if self.closed or self.fault or self.pending_stop or self.interrupt_result:
+                raise ValueError('The UR5 is unavailable for Freedrive. Check diagnostics.')
+            if enabled and (self.freedrive_request is not None or self.freedrive_exiting):
+                raise ValueError('Wait for the Freedrive transition to finish.')
+            if not enabled and self.freedrive_request is not None:
+                if not self.freedrive_request[0]:
+                    return self.freedrive_request[1]
+                self.freedrive_request[1].set_result('Freedrive entry cancelled.')
+            if enabled:
+                sample = self.telemetry
+                if (self.mode or self.handoff_deadline or self.pending_move or self.servo_target
+                        or sample is None or time.monotonic() - sample[0] > MOTION_STALE_S
+                        or max(map(abs, sample[2])) >= STATIONARY_RAD_S):
+                    raise ValueError('Wait for the UR5 to stop and release its controls before entering Freedrive.')
+                self.freedrive_lease = lease
+                self.freedrive_deadline = time.monotonic() + FREEDRIVE_LEASE_S
+            result = Future()
+            self.freedrive_request = (enabled, result)
+            return result
+
+    def refresh_freedrive(self, lease):
+        with self.lock:
+            now = time.monotonic()
+            if (lease != self.freedrive_lease or now >= self.freedrive_deadline
+                    or self.closed or self.fault or self.pending_stop or self.freedrive_exiting
+                    or (self.mode != 'freedrive' and self.freedrive_request is None)):
+                return False
+            self.freedrive_deadline = now + FREEDRIVE_LEASE_S
+            return True
+
+    def _finish_freedrive(self, error=None, *, expected=None):
+        with self.lock:
+            if expected is not None and self.freedrive_request is not expected:
+                return
+            request, self.freedrive_request = self.freedrive_request, None
+            if request is not None:
+                request[1].set_result(error)
 
     def set_speed_limit(self, value):
         if type(value) not in (int, float) or value not in LINEAR_SPEED_PRESETS_MM_S:
@@ -161,6 +219,7 @@ class Relay:
         with self.lock:
             sample = self.telemetry
             if (self.closed or self.fault or self.pending_stop or self.mode or self.handoff_deadline
+                    or self.freedrive_request or self.freedrive_exiting
                     or self.pending_move or self.servo_target or sample is None
                     or time.monotonic() - sample[0] > MOTION_STALE_S
                     or max(map(abs, sample[2])) >= STATIONARY_RAD_S):
@@ -190,7 +249,9 @@ class Relay:
                     if self.interrupt_result is None:
                         self.interrupt_result = Future()
                     return self.interrupt_result
-            elif self.fault is not None or self.interrupt_result is not None:
+            elif (self.fault is not None or self.interrupt_result is not None
+                  or self.mode == 'freedrive' or self.freedrive_request is not None
+                  or self.freedrive_exiting):
                 return
             elif kind in ("move_joint", "reset_joint"):
                 self.servo_target = None
@@ -311,6 +372,8 @@ class Relay:
                 return None
             sample_at, message, _ = self.telemetry
             return sample_at, dict(message, motion_fault=self.fault,
+                                   freedrive_active=self.mode == 'freedrive',
+                                   freedrive_transition=self.freedrive_request is not None or self.freedrive_exiting,
                                    arm_linear_speed_mm_s=self.linear_speed_limit_mm_s)
 
     def receive_loop(self, shutdown):
@@ -338,7 +401,14 @@ class Relay:
             shutdown.wait(max(0, started + PERIOD - time.monotonic()))
 
     def _stop_motion(self):
-        if self.mode == "servo":
+        if self.mode == 'freedrive':
+            # ur_rtde's freedriveMode/endFreedriveMode script handlers are
+            # gated to PolyScope >= 5.10. The legacy pair works on CB3 3.15.
+            if not self.control.endTeachMode():
+                raise RuntimeError('endTeachMode was rejected; Freedrive exit unconfirmed')
+            self.freedrive_exiting = True
+            self.freedrive_lease = None
+        elif self.mode == "servo":
             if self.control.servoStop(3.0) is False:
                 raise RuntimeError("servoStop was rejected")
         elif self.mode == "move":
@@ -381,12 +451,14 @@ class Relay:
             failure = f"Dashboard Stop failed: {error}"
             with self.lock:
                 self.fault = failure
-                self.dashboard_result.set_result(failure)
+                if self.dashboard_result is not None and not self.dashboard_result.done():
+                    self.dashboard_result.set_result(failure)
         else:
             self.mode = None
             with self.lock:
                 self.fault = "PolyScope confirmed Dashboard Stop. Check the robot before restarting the app."
-                self.dashboard_result.set_result(None)
+                if self.dashboard_result is not None and not self.dashboard_result.done():
+                    self.dashboard_result.set_result(None)
             log.warning("Dashboard confirmed the program stopped")
 
     def _finish_interrupt(self, result, error):
@@ -403,20 +475,30 @@ class Relay:
             sample = self.telemetry
             interrupt = self.interrupt_result
             linear = self.linear_speed_limit_mm_s / 1000.
+            freedrive = self.freedrive_request
 
         if stop == "estop":
+            self._finish_freedrive('STOP cancelled the Freedrive request.')
             self._finish_interrupt(interrupt, "STOP took over the UR5 shutdown.")
             self._execute_dashboard_stop()
             return
         elif stop == "stop":
+            self._finish_freedrive('Motion stop cancelled the Freedrive request.')
             self._stop_motion()
             if interrupt is not None and self.handoff_deadline is None:
                 self.handoff_deadline = time.monotonic() + STOP_TIMEOUT_S
                 self.quiet_sample = None
 
+        if (not self.fault and self.watchdog_enabled
+                and time.monotonic() - self.watchdog_kicked_at >= WATCHDOG_KICK_S):
+            if not self.control.kickWatchdog():
+                raise RuntimeError('RTDE watchdog keepalive was rejected')
+            self.watchdog_kicked_at = time.monotonic()
+
         if interrupt is not None:
             self._update_handoff(sample)
             if self.handoff_deadline is None:
+                self.freedrive_exiting = False
                 self._finish_interrupt(interrupt, None)
             return
         if stop or self.fault:
@@ -424,7 +506,13 @@ class Relay:
 
         now = time.monotonic()
         self._update_handoff(sample)
+        if self.freedrive_exiting and self.handoff_deadline is None:
+            self.freedrive_exiting = False
+            self._finish_freedrive()
+            return
         if sample is None or now - sample[0] > MOTION_STALE_S:
+            if freedrive is not None:
+                raise RuntimeError('RTDE feedback timed out during Freedrive transition')
             if self.mode is not None:
                 raise RuntimeError("RTDE feedback timed out during motion")
             return
@@ -434,6 +522,34 @@ class Relay:
             return
         measured = np.asarray(sample[1]["joints"])
         stationary = max(map(abs, sample[2])) < STATIONARY_RAD_S
+        if self.mode == 'freedrive':
+            if (now >= self.freedrive_deadline or (freedrive is not None and not freedrive[0])):
+                self._stop_motion()
+            return
+        if freedrive is not None:
+            if not freedrive[0]:
+                self._finish_freedrive()
+                return
+            if now >= self.freedrive_deadline:
+                self._finish_freedrive('Freedrive request expired. Try again with the dashboard focused.', expected=freedrive)
+                return
+            if not stationary or self.mode is not None:
+                raise RuntimeError('The UR5 moved before Freedrive could start')
+            if not self.watchdog_enabled:
+                if not self.control.setWatchdog(WATCHDOG_HZ):
+                    raise RuntimeError('Could not enable the RTDE watchdog for Freedrive')
+                self.watchdog_enabled = True
+                self.watchdog_kicked_at = time.monotonic()
+            # Mark first so cleanup also attempts exit after an ambiguous failure.
+            with self.lock:
+                if self.pending_stop or self.freedrive_request is not freedrive:
+                    return
+                self.mode = 'freedrive'
+            if not self.control.teachMode():
+                raise RuntimeError('teachMode was rejected; Freedrive entry unconfirmed')
+            self._finish_freedrive(expected=freedrive)
+            log.info('Freedrive enabled (CB3 teachMode)')
+            return
         if (self.mode == "move" and stationary
                 and np.max(np.abs(measured - self.move_target)) < self.move_tolerance
                 and not self.control.getAsyncOperationProgressEx().isAsyncOperationRunning()):
@@ -535,6 +651,7 @@ class Relay:
                 try:
                     self._tick()
                 except Exception as error:
+                    self._finish_freedrive(f'UR5 Freedrive failed: {error}')
                     with self.lock:
                         first_fault = self.fault is None
                         if first_fault:
@@ -549,6 +666,8 @@ class Relay:
                             self._stop_motion()
                         except Exception:
                             log.exception("RTDE stop failed")
+                            if self.mode == 'freedrive':
+                                self._execute_dashboard_stop()
                     else:
                         log.exception("RTDE operation failed after motion was disabled")
                 next_tick = max(next_tick + PERIOD, time.monotonic())
@@ -559,6 +678,7 @@ class Relay:
                 dashboard_pending = self.pending_stop == "estop"
                 self.pending_stop = None
                 interrupt = self.interrupt_result
+            self._finish_freedrive('UR5 relay stopped during Freedrive.')
             self._finish_interrupt(interrupt, "UR5 relay stopped during INTERRUPT.")
             if dashboard_pending:
                 try:
@@ -569,6 +689,8 @@ class Relay:
                 self._stop_motion()
             except Exception:
                 log.exception("RTDE stop during shutdown failed")
+                if self.mode == 'freedrive':
+                    self._execute_dashboard_stop()
 
 def handle_client(conn, relay, shutdown):
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
