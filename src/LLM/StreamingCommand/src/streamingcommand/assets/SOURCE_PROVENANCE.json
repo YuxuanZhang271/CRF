@@ -1,0 +1,439 @@
+[
+  {
+    "source": "RealtimeTranscriptDemo/asr_codeswitch_boundary.py",
+    "destination": "_runtime/asr_codeswitch_boundary.py",
+    "source_sha256": "d680e2381b38721ea7e255383e6d29fb1415789ba5decb476ed8066d5147758e"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/__init__.py",
+    "destination": "_runtime/__init__.py",
+    "source_sha256": "46dcc391c7cd427412dedaa71b65f87c5b1f8d95e1b9891c1ea31f625a736d39"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/temporal_stream_asr.py",
+    "destination": "_runtime/temporal_stream_asr.py",
+    "source_sha256": "4b7c131b5e0af76406895bdb1d9e2e9b10f20be4b7d3945cb1ee9467fd267241"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_canto_blend.py",
+    "destination": "_runtime/asr_canto_blend.py",
+    "source_sha256": "1fb85c0c7f84e8b89d67ed1ed2ba70a0d2557aa569d442c73239bea2f3fb8b8c"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_codeswitch.py",
+    "destination": "_runtime/asr_codeswitch.py",
+    "source_sha256": "4cbb6174aabf0f66560e361507e05f48a8404b7e4a7069565bfe4a0a57384806"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/command_models.py",
+    "destination": "_runtime/command_models.py",
+    "source_sha256": "dda570dd69b5b79daad69ceb9e60b160b6cf6291c420b73166ad2af1babe94d4"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/endpoint_continuation.py",
+    "destination": "_runtime/endpoint_continuation.py",
+    "source_sha256": "b160d29faeaaa4d95f4ddf735c51feeab42b023113905501868a74e431c0aafc"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/decoding.py",
+    "destination": "_runtime/decoding.py",
+    "source_sha256": "c2aceb4578bfaa18012ef877f4a6c085498a0d2aa118b7ed94e303b601743913"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_yue_precision.py",
+    "destination": "_runtime/asr_yue_precision.py",
+    "source_sha256": "5e7309086c741423d1cf084906a04cafb87082da062f4f49d772ddf80b8cad48"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_codeswitch_verbs.py",
+    "destination": "_runtime/asr_codeswitch_verbs.py",
+    "source_sha256": "a297306badd5e7f1351d0844cbf3797844d0a1e986977c3b084a24f203051fd1"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_codeswitch_bias.py",
+    "destination": "_runtime/asr_codeswitch_bias.py",
+    "source_sha256": "06b704e977f5206368984d33d66e8598ef2f364cd8758b0be83d09adec95836f"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/acoustic_speech.py",
+    "destination": "_runtime/acoustic_speech.py",
+    "source_sha256": "6f9fbd2e9d980c9c8d3dd287889fbaddc28279400082580ada7f711c4c7b2615"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_profiles.py",
+    "destination": "_runtime/asr_profiles.py",
+    "source_sha256": "0f8601063932728c368c078803d2b073ec351ab3b0cecd5e37bffaaa44ffae36"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/endpoint_commit.py",
+    "destination": "_runtime/endpoint_commit.py",
+    "source_sha256": "3c97d0ef06f96bedd371f7198e0be07b2c988c3be7af87e0e82c17ce4b3762bc"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/candidate_configs.py",
+    "destination": "_runtime/candidate_configs.py",
+    "source_sha256": "b3fc17f7652255441354b57b5ce28bc174c51816c3e4620c143d0a6adfb67c22"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_codeswitch_calibrated.py",
+    "destination": "_runtime/asr_codeswitch_calibrated.py",
+    "source_sha256": "3e5043ac593daf94abf7b9ad2c0a7f8a51efda5a4cc2e75647c06263a14254a3"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/endpoint_yue_continuation.py",
+    "destination": "_runtime/endpoint_yue_continuation.py",
+    "source_sha256": "40eb5471c930c6917d8e553295d43548fca5164cdd253ddde73efe4576df3264"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/streaming.py",
+    "destination": "_runtime/streaming.py",
+    "source_sha256": "408115ecc529936e22321dea837af62a050a3163fd8e77a48730d5e80c278a94"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_codeswitch_banks.py",
+    "destination": "_runtime/asr_codeswitch_banks.py",
+    "source_sha256": "d61c8eb01549cad95aa345cecf373061b0fcb89944c773064a87004012161999"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/acoustic_continuity.py",
+    "destination": "_runtime/acoustic_continuity.py",
+    "source_sha256": "e06c8600b40d7e4c38a2b2fc0d3fe39ae292ed8b7de7c95e08f14ab76f480c10"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_canto_continuity.py",
+    "destination": "_runtime/asr_canto_continuity.py",
+    "source_sha256": "a888e9f672a489083b8b753837b9d9d3ca08f2c7568285f7f3a1c1052c81f161"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_backend.py",
+    "destination": "_runtime/asr_backend.py",
+    "source_sha256": "d3f246bd8b67c5d90b997fe3cb8a775db542c7246ee45d9599f8e029bf4a408b"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/continuity_asr.py",
+    "destination": "_runtime/continuity_asr.py",
+    "source_sha256": "688523dd631d07dcf16830fdbea48f2cc86442b8f73c728ec57ecc85c13de7fc"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/acoustic_vad.py",
+    "destination": "_runtime/acoustic_vad.py",
+    "source_sha256": "f0e1c96f82435eaa5407396a0d383f09f72c7a8166e8fd2113b2284cb292a2dc"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/semantic_pair.py",
+    "destination": "_runtime/semantic_pair.py",
+    "source_sha256": "c48f8d242d1eb26535600a9cc8b588c5644b0fba5558092c12e09abde66c9cdd"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_canto_fusion.py",
+    "destination": "_runtime/asr_canto_fusion.py",
+    "source_sha256": "d43552c39dae70e33e53316935967c373495758b2b650ea09a41c50831fbb10b"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/temporal_language.py",
+    "destination": "_runtime/temporal_language.py",
+    "source_sha256": "8c43dbed560c7ccf1f0cf2ec69decd3ec89b3999bfbb05958ed11ba134c99e6d"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/pooled_acoustic_language.py",
+    "destination": "_runtime/pooled_acoustic_language.py",
+    "source_sha256": "fdc15457a18b58678306b45b2d4ea4b6bf81cbfe1bbf3be9a0b3eb757f542495"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/acoustic_span.py",
+    "destination": "_runtime/acoustic_span.py",
+    "source_sha256": "b42e99358daab7a402a9f8c893fa9c480e4d623b2d2af80fcc272679f75f3bd2"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/endpoint_commit_bounded.py",
+    "destination": "_runtime/endpoint_commit_bounded.py",
+    "source_sha256": "07401cf89182df818d5b242790625abe8b6c92a07db61e636241b8753658d103"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/shared_asr.py",
+    "destination": "_runtime/shared_asr.py",
+    "source_sha256": "0101faacda35c16bdf7fdb4190c0a7ead2c8d3f919ac8285fa19c59d37e9d17a"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_codeswitch_eos.py",
+    "destination": "_runtime/asr_codeswitch_eos.py",
+    "source_sha256": "42e1c97acf10925e4036d549d0a745387e8dc008961d09a75ff60506dc752eec"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/command_backend.py",
+    "destination": "_runtime/command_backend.py",
+    "source_sha256": "c34e17d4a41a33758914bc1b96b450e75da3663a4df214370f525e8f3edfd75d"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/selectable_commands.py",
+    "destination": "_runtime/selectable_commands.py",
+    "source_sha256": "cbf9d21bdf68a27447e7789655dbc00868bed5833f733e2195d1d83e35dfe558"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/session_profiles.py",
+    "destination": "_runtime/session_profiles.py",
+    "source_sha256": "974782d0d8f05bc017879fca6afa9f516416ead17ab47bacbc8fc2c3fe94b7c3"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/temporal_asr.py",
+    "destination": "_runtime/temporal_asr.py",
+    "source_sha256": "37b34011ae81b4596b620bd5fc78219c55e7047543bcda661786548b318737ba"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_codeswitch_prior6.py",
+    "destination": "_runtime/asr_codeswitch_prior6.py",
+    "source_sha256": "29d8954211cc080b20f01f8f26e2836badb6f15c7cb58095a17436af0b4d46ac"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/asr_defaults.py",
+    "destination": "_runtime/asr_defaults.py",
+    "source_sha256": "39fb4d408fc166567f7e1e110c6b0531eaab81c0bcc35dd0749388c1742ae86e"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/acoustic_language.py",
+    "destination": "_runtime/acoustic_language.py",
+    "source_sha256": "e8a97956a5f730ef1f13f93862845e41a7f30152e715308f56bc9e7ca7077430"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/command_stream.py",
+    "destination": "_runtime/command_stream.py",
+    "source_sha256": "03b83ba633ff68ca50a9123ea94705722de70cfaf66dd546513935ab78dec1b4"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/realtime_asr.py",
+    "destination": "_runtime/realtime_asr.py",
+    "source_sha256": "d1e0cae0fa1d397b1c2d451062c1eecff103d1e31365d473ef68eca50def4d72"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/language_query_worker.py",
+    "destination": "_runtime/language_query_worker.py",
+    "source_sha256": "d13598e711728cba3621e9cf6cdc64675f55bc6e75f211d7a71884a55d5194c4"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_safe_stream_server.py",
+    "destination": "workers/qwen_native_safe_stream_server.py",
+    "source_sha256": "d1651015621919881f5e50a49683fdc5d9cbec25f87b5404692f53070870fa92"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_word_bias.py",
+    "destination": "workers/asr_word_bias.py",
+    "source_sha256": "b544a7184c6ccc1e3045c2d62857a9afeb5633f7b961746a16c8d6a7aa260cb5"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_supported_margins_v3_worker.py",
+    "destination": "workers/qwen_native_supported_margins_v3_worker.py",
+    "source_sha256": "3095e16bfb2da07a4b39583e04a9ea5847c17471cf630175d508f87aece7860c"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_supported_margins_v3.py",
+    "destination": "workers/asr_supported_margins_v3.py",
+    "source_sha256": "b90719457e95495f863c0000b5c0407c5b5714b4760572c5a71d9956ef717221"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_consistent_features.py",
+    "destination": "workers/asr_consistent_features.py",
+    "source_sha256": "eb6dd350b60981b770fcd6ccf289692f2bcd28188cab29d1c14b632e094e1db9"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_graph_stream_server.py",
+    "destination": "workers/qwen_native_graph_stream_server.py",
+    "source_sha256": "385a4be75db3866a738759c39391cfab447bb35623956571575553c592c9a892"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_gpu1_benchmark_worker.py",
+    "destination": "workers/qwen_native_gpu1_benchmark_worker.py",
+    "source_sha256": "e2e31018d39c2a524a7d4adae02f3fbb89bfe058b0773f188afb44c9c13bf90d"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_shared_continuity_worker.py",
+    "destination": "workers/qwen_native_shared_continuity_worker.py",
+    "source_sha256": "46d4d1133196b9a5f20c19f923fe1b8286e4644cac1809c4fcd31a00af51b40d"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_prefix_final_stream_server.py",
+    "destination": "workers/qwen_native_prefix_final_stream_server.py",
+    "source_sha256": "75e5706141c3c1a4b2cc13c98614d0ed705c7973bbdb3d818ddd5fd0b5330b54"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_shared_weight_bank.py",
+    "destination": "workers/asr_shared_weight_bank.py",
+    "source_sha256": "139aaedefb1f40e56ad22b4f864bfa8772c6edb0ca6ff41303a00483ee3fde7b"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_acoustic_prefix_worker.py",
+    "destination": "workers/qwen_native_acoustic_prefix_worker.py",
+    "source_sha256": "02410e780c06f7dde23130e6ff63bc16478575c2b24f47000bf7f631b6b876ba"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_complete_update_worker.py",
+    "destination": "workers/qwen_native_complete_update_worker.py",
+    "source_sha256": "ff6db01915c4528e96a1cc23432456f0011bcdfa40215c39c5551e2029c07060"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_stream_complete_update.py",
+    "destination": "workers/asr_stream_complete_update.py",
+    "source_sha256": "2b00d718e9e65d6dae460f1d2806c2c910b64cf3017cf24679c83ec1c20eb8b8"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_canto_fusion_worker.py",
+    "destination": "workers/qwen_native_canto_fusion_worker.py",
+    "source_sha256": "56d39b398d2f19b37d69d24cd26e102b8a0672e258194c2db99cf845f428f2b1"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_fusion_priors.py",
+    "destination": "workers/asr_fusion_priors.py",
+    "source_sha256": "17f495ec289dfa1a4850cedb1653410dd4fc6d7a89e5fe2f1b2207dacac6f3eb"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_blended_weight_bank.py",
+    "destination": "workers/asr_blended_weight_bank.py",
+    "source_sha256": "a940f461759f574bdec823b1854336419cb61d2fa7230ab383388d2a55c008fa"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_codeswitch_bias_worker.py",
+    "destination": "workers/qwen_native_codeswitch_bias_worker.py",
+    "source_sha256": "8398667e872859cee775d5ef7838853d5c879bc7dcd2390e25d8123246fc0227"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_codeswitch_boundary_worker.py",
+    "destination": "workers/qwen_native_codeswitch_boundary_worker.py",
+    "source_sha256": "f5b1eb4bd8d550066df0c61822d59705d1e3a252555f1d0240e86be31dae951e"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_boundary_prior_guard.py",
+    "destination": "workers/asr_boundary_prior_guard.py",
+    "source_sha256": "bbb953b4617ef938e7d263bf43692e1ca048f8688e431782c1cb447b50976ce6"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_codeswitch_eos_worker.py",
+    "destination": "workers/qwen_native_codeswitch_eos_worker.py",
+    "source_sha256": "01b608018691a86eb3b3bee1450a1c61ffbea1a2410b455b0d009a74f71e1694"
+  },
+  {
+    "source": "WhisperHotword/scripts/asr_eos_prior_guard.py",
+    "destination": "workers/asr_eos_prior_guard.py",
+    "source_sha256": "a88503b64288cf358e6860fadb7f3f405ea133f25cf2691015126d0b85582ed9"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_codeswitch_prior6_worker.py",
+    "destination": "workers/qwen_native_codeswitch_prior6_worker.py",
+    "source_sha256": "5ee016fee43b04abc1193898fb58a9db9658291442aa4d90222be439b218c1fe"
+  },
+  {
+    "source": "WhisperHotword/scripts/qwen_native_canto_precision_worker.py",
+    "destination": "workers/qwen_native_canto_precision_worker.py",
+    "source_sha256": "dd433a41cba5b0162d2aef01dfed5e795df90e81c9bf32d487b976a5820dc03e"
+  },
+  {
+    "source": "WhisperHotword/results/asr_portable_acceleration_gpu1_20261023/portable_reference/asr_windows_native.py",
+    "destination": "workers/asr_windows_native.py",
+    "source_sha256": "0adbf5a9ef7fd56828a7d7e8c2a914fc79419288ad1acad3921548d3cec30446"
+  },
+  {
+    "source": "WhisperHotword/results/asr_portable_acceleration_gpu1_20261023/portable_reference/asr_output.py",
+    "destination": "workers/asr_output.py",
+    "source_sha256": "6fe0615b092a4fe6e31a08d0d3236bed7a5ec6653e1cbc5911550fdc9c9e24aa"
+  },
+  {
+    "source": "WhisperHotword/results/asr_portable_acceleration_gpu1_20261023/portable_reference/asr_consistent_features.py",
+    "destination": "workers/asr_consistent_features.py",
+    "source_sha256": "eb6dd350b60981b770fcd6ccf289692f2bcd28188cab29d1c14b632e094e1db9"
+  },
+  {
+    "source": "WhisperHotword/results/asr_portable_acceleration_gpu1_20261023/portable_reference/asr_cuda_graph.py",
+    "destination": "workers/asr_cuda_graph.py",
+    "source_sha256": "d0cb4b034f3f38d9f3c0ff2f863cc1b49141aef0d5692aefd1fe8b77388e5f6e"
+  },
+  {
+    "source": "WhisperHotword/results/asr_portable_acceleration_gpu1_20261023/portable_reference/model_compatibility.py",
+    "destination": "workers/model_compatibility.py",
+    "source_sha256": "0f144acfc49e01abbe66a78ead73c9e5912dd20839266aa47c9e3c81794079ed"
+  },
+  {
+    "source": "WhisperHotword/results/asr_portable_acceleration_gpu1_20261023/portable_reference/LICENSE",
+    "destination": "assets/QWEN_LICENSE",
+    "source_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+  },
+  {
+    "source": "WhisperHotword/results/asr_portable_acceleration_gpu1_20261023/portable_reference/NOTICE",
+    "destination": "assets/QWEN_NOTICE",
+    "source_sha256": "03b21ab36b47ea959768cbc3a9603d34c003709e19abc6ef73719ffb51b80937"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/config/command_candidates.json",
+    "destination": "assets/config/command_candidates.json",
+    "source_sha256": "f6ce2b1604a46f0e88cec1750768273eb19bef0835d60cdf668ee7b2d4d81f04"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/config/candidate_profiles.json",
+    "destination": "assets/config/candidate_profiles.json",
+    "source_sha256": "7907e685f8b005b4f393bf9bfded8cef855b7002141538fd807af60bb5336e5a"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/config/candidate_profiles/endoscope-new.json",
+    "destination": "assets/config/candidate_profiles/endoscope-new.json",
+    "source_sha256": "0e6d0cd86edc892517f009b77c6f142f77c3c1366ed1006bb524d7714bc7fa36"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/config/candidate_profiles/endoscope-legacy.json",
+    "destination": "assets/config/candidate_profiles/endoscope-legacy.json",
+    "source_sha256": "f6ce2b1604a46f0e88cec1750768273eb19bef0835d60cdf668ee7b2d4d81f04"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/config/candidate_profiles/scrub-nurse.json",
+    "destination": "assets/config/candidate_profiles/scrub-nurse.json",
+    "source_sha256": "ccc49fc77573be2e2a6b01a32ddbae1bb6ac6cd25c12889946b3ca7844585536"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/single_command_runtime.py",
+    "destination": "_runtime/single_command_runtime.py",
+    "source_sha256": "3ae1be82f9ebf733fbdc4ef8f15481f3d42cd45a4a4c9fd0a689ade815bee87b"
+  },
+  {
+    "source": "RealtimeTranscriptDemo/command_worker.py",
+    "destination": "_runtime/command_worker.py",
+    "source_sha256": "e5831ecd7b995f5559eb63bc2b7259a6c6b0f0b9f9b82ffb7bbd1f320902eed2"
+  },
+  {
+    "source": "HuggingFaceTransfer/windows_vllm_repair_20261025/patched/endo_agent/streaming_voice/reference/asr/qwen_asr_backend/__init__.py",
+    "destination": "workers/qwen_asr_backend/__init__.py",
+    "source_sha256": "6de5cac018e0c994e04e855ef7fe9ed142383e88ffdcdf80463cbc7d5028b21d",
+    "note": "Transformers5 compatibility patches from the prior Windows handoff; upstream Apache-2.0 notices retained"
+  },
+  {
+    "source": "HuggingFaceTransfer/windows_vllm_repair_20261025/patched/endo_agent/streaming_voice/reference/asr/qwen_asr_backend/modeling_qwen3_asr.py",
+    "destination": "workers/qwen_asr_backend/modeling_qwen3_asr.py",
+    "source_sha256": "b1895ebd61818b221457fa6c6ddce5806b82abdbb741a888c679f77f5d9a6497",
+    "note": "Transformers5 compatibility patches from the prior Windows handoff; upstream Apache-2.0 notices retained"
+  },
+  {
+    "source": "HuggingFaceTransfer/windows_vllm_repair_20261025/patched/endo_agent/streaming_voice/reference/asr/qwen_asr_backend/processing_qwen3_asr.py",
+    "destination": "workers/qwen_asr_backend/processing_qwen3_asr.py",
+    "source_sha256": "a61f1fbfc06e3dfc63a2b8d15e3b29e98b032792c3fb7d0e01c04ca9c2181ffb",
+    "note": "Transformers5 compatibility patches from the prior Windows handoff; upstream Apache-2.0 notices retained"
+  },
+  {
+    "source": "HuggingFaceTransfer/windows_vllm_repair_20261025/patched/endo_agent/streaming_voice/reference/asr/qwen_asr_backend/configuration_qwen3_asr.py",
+    "destination": "workers/qwen_asr_backend/configuration_qwen3_asr.py",
+    "source_sha256": "1f8abd8f90bbf0ac3b5bead1c74cd32f4b08583dae950fc39c8ae43f75a591e3",
+    "note": "Transformers5 compatibility patches from the prior Windows handoff; upstream Apache-2.0 notices retained"
+  },
+  {
+    "source": "HuggingFaceTransfer/windows_vllm_repair_20261025/patched/endo_agent/streaming_voice/r17/vllm_weight_bank.py",
+    "destination": "workers/asr_modern_weight_bank.py",
+    "source_sha256": "289f6a3bed73c251921ab3b4a4c0267acce596899cc90d4e0012cc2da2fac6a5",
+    "note": "Inference-only extraction / portable adaptation; no training entry points"
+  },
+  {
+    "source": "notebooks/experiments/dynamic_candidate_prefill.py",
+    "destination": "_runtime/llm_ranker.py",
+    "source_sha256": "fcc5d7ff1170688eb07c458b5c0cc958021903f5652618a9350e62b35cc16fb2",
+    "note": "Inference-only extraction / portable adaptation; no training entry points"
+  },
+  {
+    "source": "notebooks/experiments/single_model_clarification_20261107.py",
+    "destination": "_runtime/llm_core.py",
+    "source_sha256": "f14a3620866f120ee5da734dce7203a40b34b25c5c6d56305c5604ec43e5effd",
+    "note": "Inference-only extraction / portable adaptation; no training entry points"
+  }
+]

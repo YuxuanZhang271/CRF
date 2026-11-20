@@ -1,0 +1,83 @@
+{
+  "asr": {
+    "backend": "native",
+    "device": "auto",
+    "profile": "v17-yue-precision"
+  },
+  "command": {
+    "model": "clarification-hybrid",
+    "device": "auto",
+    "recognition_logic": "semantic-pair",
+    "candidates": {
+      "I": [
+        "track",
+        "bend",
+        "self rotate",
+        "stop",
+        "bird view",
+        "reset",
+        "move",
+        "clean lens",
+        "zoom in",
+        "zoom out",
+        "spray water",
+        "spray air"
+      ],
+      "T": [
+        "liver",
+        "pancreas",
+        "stomach",
+        "organ",
+        "all",
+        "ligasure",
+        "straight grasper",
+        "duodenal stump",
+        "grasper",
+        "gallbladder",
+        "curved grasper",
+        "instrument",
+        "knife",
+        "none",
+        "scissor",
+        "harmonic scalpel"
+      ],
+      "P": [
+        "forward",
+        "left",
+        "up",
+        "backward",
+        "right",
+        "none",
+        "down"
+      ]
+    }
+  },
+  "models": {
+    "asr": {
+      "source": "local",
+      "path": "/home/zihan/data/code/PhonoCommandDialogue/WhisperHotword/results/model_data_diagnostic_v15_gpu1_20261016/candidate_model"
+    },
+    "asr-base": {
+      "source": "local",
+      "path": "/home/zihan/data/code/PhonoCommandDialogue/WhisperHotword/.model-cache/qwen3-asr-1.7b"
+    },
+    "speech": {
+      "source": "local",
+      "path": "/home/zihan/data/code/PhonoCommandDialogue/WhisperHotword/.model-cache/silero-vad-onnx"
+    },
+    "language": {
+      "source": "local",
+      "path": "/home/zihan/data/code/PhonoCommandDialogue/WhisperHotword/.model-cache/sensevoice-small"
+    },
+    "llm-base": {
+      "source": "local",
+      "path": "/home/zihan/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17"
+    },
+    "clarification-hybrid": {
+      "source": "local",
+      "expected_step": 1392,
+      "path": "/home/zihan/data/code/PhonoCommandDialogue/notebooks/outputs/single_model_clarification/20261119_hybrid_voice_stratified20_gpu0/best"
+    }
+  },
+  "offline": true
+}

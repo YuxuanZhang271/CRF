@@ -1,0 +1,19 @@
+{
+  "tag": "v0.29.0",
+  "filename": "vllm-0.29.0+cu132-cp312-cp312-win_amd64.whl",
+  "url": "https://github.com/SystemPanic/vllm-windows/releases/download/v0.29.0/vllm-0.29.0%2Bcu132-cp312-cp312-win_amd64.whl",
+  "sha256": "736a53ff6cbb976735afb73b998c151c2afe69b08ab1546e1e5954d6e4454beb",
+  "bytes": 259104853,
+  "optional_dependency_audit_note": {
+    "humming-kernels": "Unused quantized GEMM backend; selected path is FP16 Qwen-ASR, no Humming quantization. Its declared Windows dependency is a Git source build."
+  },
+  "python_abi": "cp312-win_amd64",
+  "transformers_preserved": "5.15.1",
+  "torch": "2.11.0+cu130",
+  "gpu_architectures": [
+    "Ampere",
+    "Ada",
+    "Blackwell"
+  ],
+  "actual_windows_gpu_test": false
+}

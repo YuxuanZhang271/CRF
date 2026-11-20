@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "defaults": {
+    "phonocommand-llm-0.8b": "endoscope-legacy.json",
+    "clarification-new": "endoscope-new.json",
+    "clarification-latest": "endoscope-new.json",
+    "clarification-current": "endoscope-legacy.json",
+    "clarification-single": "endoscope-legacy.json",
+    "clarification-back": "endoscope-legacy.json",
+    "legacy": "endoscope-legacy.json",
+    "clarification-hybrid": "endoscope-hybrid.json"
+  }
+}

@@ -1,0 +1,2 @@
+# Checkpoint integrity manifests hash the original file bytes.
+src/streamingcommand/assets/models/** -text

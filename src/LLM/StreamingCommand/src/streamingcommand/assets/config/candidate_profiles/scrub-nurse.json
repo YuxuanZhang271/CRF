@@ -1,0 +1,18 @@
+{
+  "I": ["give", "stop", "reset"],
+  "T": [
+    "scissor",
+    "grasper",
+    "cotton swab",
+    "gauze",
+    "syringe",
+    "needle holder",
+    "retractor",
+    "scalpel",
+    "suction tube",
+    "specimen bag",
+    "suture",
+    "surgical clip"
+  ],
+  "P": []
+}
