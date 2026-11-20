@@ -1,162 +1,170 @@
-# CRF (Currently flexible endoscopic robot only)
+# CRF
 
-CRF is an integrated surgical agentic system for gastrectomy. 
+CRF is an integrated surgical agentic system for gastrectomy. This repository currently implements the flexible endoscopic robot subsystem, combining UR5 arm control, a tendon-driven flexible endoscope, and camera-based perception in a browser dashboard.
 
-![System architecture](imgs/system_architecture.jpg)
+[Demo](#demo) · [System overview](#system-overview) · [Configuration](#configuration)
 
-- [CRF (Currently flexible endoscopic robot only)](#crf-currently-flexible-endoscopic-robot-only)
-  - [Prerequisites](#prerequisites)
-  - [Quick start](#quick-start)
-  - [Recording viewer](#recording-viewer)
-  - [Architecture](#architecture)
-    - [Thread ownership](#thread-ownership)
-  - [File reference](#file-reference)
-    - [Application](#application)
-    - [Native Flex driver](#native-flex-driver)
-    - [Repository and verification](#repository-and-verification)
-    - [Bundled KDL parser dependency](#bundled-kdl-parser-dependency)
+## Demo
 
-
-
-## Prerequisites
-
-Due to control card driver supported system, the device system has to be ***Windows***. Hopefully we can use ***RTDE*** to control the UR5 robot arm, skipping the ROS2 bridge so there's no requirements for a second Ubuntu device. For an alternative, you may use a Jetson connecting to PC as a virtual network card. 
-
-![Alternative System Architecture](imgs/system_architecture_alt.jpg)
-
-
-
-## Quick start
-
-Run from the repository root:
+Use **Windows** with the UR5, GTS controller, and camera connected. For the first run, [build the native driver](#build-the-native-driver). Then run the following commands in PowerShell from the repository root:
 
 ```powershell
-# Config python env
 conda env create -f environment.yaml
 conda activate crf
-
-# Run the WebUI and control system in one-click
 .\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1
 ```
 
-Open [the control panel](http://127.0.0.1:8080). 
+The launcher starts the Flex driver, UR5 RTDE relay, camera, and web dashboard together. Open the [control dashboard](http://127.0.0.1:8080) to access robot controls, live perception, and recording. See [keyboard shortcuts](keyboard_shortcuts.md) for motion and command mappings. Press `Ctrl+C` in the terminal to end the session.
 
-![WebUI Dark](imgs/dark_webui.png)
-![WebUI Light](imgs/light_webui.png)
+The default UR5 address is `192.168.1.10`, and Flex uses `Planned` feedback with physical motors. See [configuration](#configuration) to change the robot address, feedback mode, or other settings.
 
+![CRF control dashboard in dark mode](imgs/dark_webui.png)
 
+<details>
+<summary>Light mode</summary>
 
-## Recording viewer
+![CRF control dashboard in light mode](imgs/light_webui.png)
 
-Run the viewer in the `crf` environment (Matplotlib, NumPy, and Pillow are already
-included). It reads files only and never connects to the arm, Flex, or camera.
-The viewer and exported plots use the matching dark palette, with purple
-playback cursors, gold command markers, and distinct colors for the traces.
+</details>
+
+## System overview
+
+![CRF system architecture](imgs/system_architecture.jpg)
+
+The system integrates three components:
+
+- **Robot control:** a UR5 arm controlled through RTDE and a native C++ Flex driver connected to the vendor GTS controller. Python coordinates remote center of motion (RCM) control, endoscope bending and roll, horizon leveling, and motion procedures.
+- **Visual perception:** separate camera capture and YOLO inference workers provide live preview, object detections, and target observations for tracking. Inference processes the latest frame to avoid accumulating a backlog.
+- **Interaction and recording:** the web dashboard provides manual controls, task execution, device status, and session recording. Timestamped state, commands, detections, and camera frames are stored in five-minute JSONL/MJPEG segments for replay and analysis.
+
+The control coordinator requests a 125 Hz update rate and publishes dashboard snapshots at 20 Hz. Flex IPC, RTDE motion and telemetry, camera capture, inference, and HTTP handling run independently.
+
+The supported deployment uses a Windows PC for the GTS driver and DirectShow camera capture. The UR5 connects directly through RTDE, so a separate ROS 2 bridge or Ubuntu machine is unnecessary for this setup.
+
+<details>
+<summary>Alternative deployment architecture</summary>
+
+![Alternative system architecture with a Jetson](imgs/system_architecture_alt.jpg)
+
+</details>
+
+## Configuration
+
+### Build the native driver
+
+The simulated and physical Flex modes require the native driver. Install Visual Studio 2022 with **Desktop development with C++**, the **MSVC v143** toolset, and a **Windows SDK**. Open:
+
+```text
+src/flex_endo_robo/flex_endo/FlexEndoscopeDriver.sln
+```
+
+Select **Debug | x86** and build the solution. The launcher expects:
+
+```text
+src/flex_endo_robo/flex_endo/build/Win32/Debug/FlexEndoscopeDriver.exe
+```
+
+The build links the bundled x86 GTS library and copies `gts.dll` and `GTS800.cfg` beside the executable. If you build **Release | x86**, pass `-Configuration Release` to the launcher.
+
+### Connect the full system
+
+Connect the UR5, GTS controller, and camera to the Windows PC. Activate the `crf` environment, then launch with your UR5 IP address:
+
+```powershell
+.\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -RobotIp 192.168.1.10 -Feedback Encoder
+```
+
+This starts the Flex driver, RTDE relay, camera, and dashboard. The launcher defaults to full-system mode. Choose the feedback mode explicitly: **Planned also controls physical motors**, using planned positions without encoder verification; **Encoder** uses encoder feedback; **Simulated** simulates only the Flex hardware. Use `-FlexOnly -Feedback Simulated` together for the Flex demo without a UR5 connection.
+
+Common launcher settings:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `-RobotIp` | `192.168.1.10` | UR5 network address in full-system mode. |
+| `-Feedback` | `Planned` | `Planned`, `Encoder`, or `Simulated` Flex feedback. |
+| `-FlexOnly` | Off | Run Flex controls without opening RTDE. |
+| `-Configuration` | `Debug` | Select the `Debug` or `Release` driver build. |
+| `-Port` | `8080` | Dashboard HTTP port. |
+| `-CameraRollOffsetDeg` | `0` | Measured camera roll relative to the modeled Flex camera, from -180 to 180 degrees. |
+| `-GasPort` | `COM4` | Serial port for the gas controller. |
+| `-WaterVelocity` | `30` | Signed water pump velocity; nonzero, from -30 to 30. |
+
+For example, to change the dashboard and gas controller ports:
+
+```powershell
+.\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -RobotIp 192.168.1.10 -Feedback Encoder -Port 8081 -GasPort COM5
+```
+
+### Simulated Flex control
+
+To try Flex controls without motor hardware, first [build the native driver](#build-the-native-driver), then run in the activated `crf` environment:
+
+```powershell
+.\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -FlexOnly -Feedback Simulated
+```
+
+The launcher starts the simulated Flex driver and dashboard together. `-FlexOnly` disables the UR5 connection; `-Feedback Simulated` simulates the Flex motors. The camera feed still uses a real camera. This mode supports Flex jogging and calibration; procedures requiring a connected UR5, such as tracking, require the full system.
+
+Open the dashboard, use **CALIBRATE** to establish a Flex zero position, and try the Flex controls. See [keyboard shortcuts](keyboard_shortcuts.md) for motion and command mappings. Stop this session before starting another demo or hardware session.
+
+### Camera, model, and geometry
+
+For a camera-only demo, run `python src/app.py --camera-only` in the activated `crf` environment. This starts the camera preview and dashboard without connecting to the UR5 or Flex driver.
+
+Additional settings are available through `src/app.py`. For example, to preview another camera with custom YOLO weights:
+
+```powershell
+python src/app.py --camera-only --camera-index 1 --model path/to/weights.pt --port-web 8081
+```
+
+| Python option | Default | Purpose |
+| --- | --- | --- |
+| `--camera-index` | `0` | DirectShow camera device index. |
+| `--model` | `src/scope/yolov8n.pt` | YOLO weights file. |
+| `--host-web` / `--port-web` | `127.0.0.1` / `8080` | Dashboard bind address and port. |
+| `--robot-ip` / `--relay-port` | `192.168.1.10` / `9000` | UR5 address and local RTDE relay port. |
+| `--urdf` | `src/flex_endo_robo/ur5_endo_flex.urdf` | Robot and endoscope geometry. |
+| `--rcm-local` | `0 0 -0.30` | Local RCM coordinates in meters. |
+| `--tip-local` | `0 0 0.20195` | Local tip coordinates in meters. |
+| `--camera-roll-offset-deg` | `0` | Optical roll offset in degrees. |
+| `--jog-speed-scale` | `10` | Manual arm speed factor; choices: `3`, `5`, `10`, `15`. |
+| `--recordings-dir` | Repository `recordings/` | Session output directory. |
+
+Run `python src/app.py --help` for all options. The mutually exclusive `--camera-only`, `--flex-only`, and `--arm-only` modes select passive preview, Flex control, or UR5 control with modeled Flex, respectively. Running without a mode flag selects the full system. Direct Python launches using Flex require a separately running native driver; the PowerShell launcher manages that driver but exposes only the options in the launcher table.
+
+The bundled YOLO model uses the categories defined in `src/scope/yolo.py`: person, bottle, cup, banana, and chair. When using a custom model, update `CATEGORIES` and `COLORS` in that file to match its class IDs and labels. Camera capture defaults (resolution and frame rate) are defined in `src/scope/camera.py`.
+
+During a session, use the dashboard to set arm/Flex speed and motion limits, calibrate Flex, select a detection category, and control recording. Launch settings and runtime configuration changes are retained with the recordings.
+
+### Replay a recording
+
+Use **RECORD** in the dashboard to save a session under `recordings/`. The viewer reads saved files without connecting to the robot or camera. Replace `SESSION_ID` below with your session directory name:
 
 ```powershell
 # Inspect the first five minutes of a saved session.
-python src/recording_viewer.py recordings/<session-id>
+python src/recording_viewer.py recordings/SESSION_ID
 
-# Export a static plot or a JSON activity/configuration summary.
-python src/recording_viewer.py recordings/<session-id> --output activity.png
-python src/recording_viewer.py recordings/<session-id> --summary
+# Export a plot or print an activity/configuration summary.
+python src/recording_viewer.py recordings/SESSION_ID --output activity.png
+python src/recording_viewer.py recordings/SESSION_ID --summary
+
+# Follow the latest recording while it is being written.
+python src/recording_viewer.py recordings --live
 ```
 
-![Recording Viewer](imgs/recording_viewer.png)
+![Recording viewer with activity traces and camera replay](imgs/recording_viewer.png)
 
+### Code layout
 
-
-## Architecture
-
-### Thread ownership
-
-| Worker | Responsibility |
+| Path | Role |
 | --- | --- |
-| Control coordinator | Steps motion procedures at a requested 125 Hz and publishes UI snapshots at 20 Hz. Uses an interruptible wait between ticks. |
-| Flex IPC | Reads native feedback and writes the latest complete command/vision snapshots; retries short mutex contention independently of motion calculations. |
-| RTDE motion | Sole owner of UR5 motion calls, including reset and stop. |
-| RTDE receive and TCP receiver | Acquire and deliver arm telemetry independently of motion calculations. |
-| Camera capture/preview | Reads the camera, encodes JPEGs, and publishes frames without waiting for inference. |
-| YOLO inference | Processes the newest available raw frame; skips superseded frames instead of growing a queue. |
-| HTTP request handlers | Serve controls, cached state, and MJPEG streams. State requests do not acquire the motion lock; stale control snapshots return HTTP 503. |
+| `src/app.py`, `src/static/` | Application entry point, HTTP API, and dashboard. |
+| `src/flex_endo_robo/` | Control coordinator, RTDE relay, kinematics, and URDF. |
+| `src/flex_endo_robo/flex_endo/` | Python Flex interface, native driver, and launcher. |
+| `src/scope/` | Camera capture and YOLO perception. |
+| `src/status.py`, `src/recording_viewer.py` | Session recording and replay. |
+| `src/tasks.py`, `tasks.md` | Task execution and task reference. |
+| `tests/` | Hardware-free Python checks and native driver tests with mocked GTS calls. |
+| `environment.yaml` | Pinned Windows Conda environment. |
 
-
-
-## File reference
-
-### Application
-
-| File | Functionality |
-| --- | --- |
-| `src/app.py` | Entry point, CLI options, HTTP API, dashboard asset serving, camera streaming, and coordinated stop/shutdown handling. |
-| `src/status.py` | Recording schema/configuration collection, independent status sampling, timestamped events, bounded queue, and five-minute JSONL/MJPEG storage. |
-| `src/tasks.py` | Shared task definitions/state and nonblocking execution, completion, limit, and failure handling on the coordinator. |
-| `src/keyboard_listener.py` | Windows focus-gated bridge for browser-reserved Ctrl command shortcuts. |
-| `src/recording_viewer.py` | Offline/live activity plots, time-slider inspection, camera/YOLO replay, PNG/PDF export, and JSON summary. |
-| `src/static/index.html` | Dashboard structure: device controls, camera preview, category selector, status displays, and console. |
-| `src/static/dashboard.css` | Dashboard colors, responsive layout, controls, and motion plot styling. |
-| `src/static/dashboard.js` | Browser input handling, held-key heartbeats, API requests, state polling, category selection, and display updates. |
-| `src/static/keyboard.js` | Keyboard motion/command mappings, repeat/editing guards, and native shortcut polling. |
-| `src/flex_endo_robo/control_node.py` | 125 Hz coordinator, relay connection, input expiry, RCM capture, arm commands, modeled Flex, Bird-eye/Pull Out procedures, and state snapshots. |
-| `src/flex_endo_robo/kinematics.py` | KDL chain construction, forward kinematics, camera/shaft geometry, RCM angle conversions, horizon leveling, and wrist-constrained inverse kinematics. |
-| `src/flex_endo_robo/ur5_rtde_server.py` | RTDE relay, command validation, speed/RCM constraints, telemetry, watchdogs, interrupt handling, and Dashboard Stop. Also supports standalone relay execution. |
-| `src/flex_endo_robo/ur5_endo_flex.urdf` | Robot description: UR5, endoscope mount, flexible section, camera frames, and visualization geometry. |
-| `src/flex_endo_robo/flex_endo/flex_control.py` | Physical Flex state machine: calibration, jogging, horizon correction, camera tracking with arm assistance, positioning, return to zero, and withdrawal. |
-| `src/flex_endo_robo/flex_endo/flex_ipc.py` | Dedicated shared-memory I/O worker, immutable feedback snapshots, bounded latest-intent publication, session ownership, and reconnection. |
-| `src/flex_endo_robo/flex_endo/Start-FlexControl.ps1` | Launches the driver and app, selects feedback mode, and passes runtime options. |
-| `src/scope/camera.py` | Separate DirectShow capture/preview and inference workers, latest-frame handoff, category revisions, timestamped observations, and JPEG streaming. |
-| `src/scope/yolo.py` | YOLO inference wrapper, categories/colors, detection and observation records, target selection, centering error, and overlays. |
-| `src/scope/yolov8n.pt` | Bundled YOLO model weights. |
-
-### Native Flex driver
-
-Paths below are relative to `src/flex_endo_robo/flex_endo/`.
-
-| File | Functionality |
-| --- | --- |
-| `FlexEndoscopeDriver.sln` | Visual Studio solution with Debug and Release x86 configurations. |
-| `FlexEndoscopeDriver/FlexEndoscopeDriver.vcxproj` | C++17 build settings, SDK linkage, output directories, and runtime/config copying. |
-| `FlexEndoscopeDriver/FlexEndoscopeDriver.vcxproj.filters` | Source and header grouping in Visual Studio. |
-| `FlexEndoscopeDriver/FlexEndoscopeDriver.cpp` | Native motion owner for tendon axes 1–4 and roll axis 5; GTS calls, simulation, calibration references, limits, watchdogs, and command execution. |
-| `FlexEndoscopeDriver/flex_protocol.h` | Message layouts, actions, results, flags, session names, timeouts, and ABI assertions. Must match `flex_ipc.py`. |
-| `FlexEndoscopeDriver/GTS800.cfg` | Vendor controller configuration loaded during hardware initialization. |
-| `FlexEndoscopeDriver/gts.h` | Vendor GTS SDK declarations. |
-| `FlexEndoscopeDriver/gts.lib` | Vendor x86 import library used when linking the driver. |
-| `FlexEndoscopeDriver/gts.dll` | Vendor runtime library copied beside the driver executable. |
-
-### Repository and verification
-
-| File | Functionality |
-| --- | --- |
-| `README.md` | Setup, launch instructions, architecture, and file reference. |
-| `environment.yaml` | Pinned Windows Conda environment and pip dependencies. |
-| `.gitignore` | Excludes caches, build outputs, logs, editor files, and local configuration. |
-| `.gitmodules` | Defines the upstream KDL parser submodule. |
-| `src/flex_endo_robo/flex_endo/.gitignore` | Excludes local Visual Studio settings. |
-| `imgs/sys_architecture.jpg` | System architecture illustration. |
-| `tests/test_app.py` | Hardware-free HTTP checks for dashboard assets, state/config routes, and invalid requests. |
-| `tests/test_controls.py` | Hardware-free checks for modeled Flex, cancellation, camera tracking setup, kinematics, and IPC layouts. |
-| `tests/test_threads.py` | Worker isolation, slow inference, frame skipping, category/failure invalidation, IPC contention, and stale command/vision timestamp checks. |
-| `tests/test_flex_motion.cpp` | Native profile/completion checks using mocked GTS calls: bounded residual correction, unequal-axis ramps, synchronized timing, speed caps, SDK rejection, encoder checks, and saved zero. Never opens hardware. |
-
-### Bundled KDL parser dependency
-
-`dependencies/kdl_parser` is third-party source. The environment installs
-`kdl-parser-jvytee`; the submodule provides an upstream reference or a source
-for local installation. Its implementation and license are maintained separately
-from the application.
-
-| File within `dependencies/kdl_parser/` | Functionality |
-| --- | --- |
-| `README.md` | Upstream description and installation instructions. |
-| `LICENSE` | Upstream license terms. |
-| `setup.py` | Python package metadata and installation configuration. |
-| `kdl_parser/__init__.py` | KDL parser package marker. |
-| `kdl_parser/urdf.py` | Converts URDF descriptions into PyKDL trees. |
-| `kdl_parser/scripts/display_urdf` | Command-line utility for inspecting URDF/KDL structure. |
-| `kdl_parser/urdf_parser_py/__init__.py` | Bundled URDF parser package marker. |
-| `kdl_parser/urdf_parser_py/urdf.py` | URDF element models and XML serialization/parsing. |
-| `kdl_parser/urdf_parser_py/sdf.py` | SDF element models and XML serialization/parsing. |
-| `kdl_parser/urdf_parser_py/xml_reflection/__init__.py` | XML reflection package exports. |
-| `kdl_parser/urdf_parser_py/xml_reflection/basics.py` | Basic XML value conversion and helpers. |
-| `kdl_parser/urdf_parser_py/xml_reflection/core.py` | XML reflection types, attributes, aggregates, and serialization machinery. |
+The environment installs `kdl-parser-jvytee`. The `dependencies/kdl_parser` submodule is an upstream source reference with its own [documentation](dependencies/kdl_parser/README.md) and [license](dependencies/kdl_parser/LICENSE).
