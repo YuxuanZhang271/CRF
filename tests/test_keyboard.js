@@ -168,3 +168,11 @@ windowListeners.blur();
 assert.equal(held.get('arm_left'), 99);
 assert.deepEqual(sent.at(-1), {key:'arm_up', down:false});
 console.log('Alt commands, arm mode, held Freedrive, zoom, repeats, modifiers, focus cleanup and pointer ownership passed.');
+
+// Listening stays reachable during a task and ignores repeats and editable inputs.
+vm.runInContext('taskLocked = true', context);
+key('keydown', 'KeyL', {altKey: true});
+key('keydown', 'KeyL', {altKey: true, repeat: true});
+key('keydown', 'KeyL', {altKey: true, target: editable});
+assert.equal(element('listen').clicks, 1);
+vm.runInContext('taskLocked = false', context);

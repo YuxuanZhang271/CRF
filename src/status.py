@@ -110,6 +110,9 @@ class Status:
                   'flex': {key: state.get('flex_hardware', {}).get(key)
                            for key in FLEX_CONFIG_FIELDS},
                   'camera': {'category': camera['category'], 'revision': camera['revision']}}
+        llm = getattr(self.server, 'llm', None)
+        if llm is not None:
+            config['llm'] = {'config_path': str(llm.config), 'microphone': llm.device}
         return {'config': config, 'robot': state, 'camera': camera}
 
 
@@ -119,6 +122,8 @@ class _LogHandler(logging.Handler):
         self.recorder = recorder
 
     def emit(self, record):
+        if getattr(record, 'from_dashboard', False):
+            return  # The HTTP route already recorded this exact browser message.
         self.recorder.event('console', {'source': record.name, 'level': record.levelname,
                                        'message': self.format(record),
                                        'origin': 'python', 'created_unix_s': record.created})

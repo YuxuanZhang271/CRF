@@ -29,6 +29,10 @@ body{display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;height:100dvh;pa
 .panel-scroll>.card:last-child{margin-bottom:0}
 .robot-panel>.panel-scroll{display:flex;flex-direction:column;gap:10px}
 .robot-panel>.panel-scroll>*{flex-shrink:0;margin-block:0}
+.category-panel>.panel-scroll{display:flex;flex-direction:column;gap:10px}
+.category-panel>.panel-scroll>.card{flex-shrink:0;margin-block:0}
+.category-panel>.panel-scroll>.llm-card{display:grid;grid-template-rows:auto minmax(84px,1fr) auto;gap:6px;flex:1 0 220px;min-height:220px}
+.llm-card .task-heading,.llm-card .shortcut-tips{margin:0}
 .camera-panel{grid-area:camera;display:grid;grid-template-rows:auto minmax(0,1fr) auto auto auto;gap:8px}
 .camera-panel h2{margin-bottom:0}
 h1,h2{font-size:18px;margin:0 0 12px;color:var(--fg);font-weight:650}
@@ -67,6 +71,17 @@ button[data-key][data-held="true"]{outline:2px solid var(--hi);background:var(--
 .limit-editor input:disabled,.limit-editor select:disabled{opacity:.45}
 .limit-editor button{padding-inline:6px}
 [hidden]{display:none!important}
+.llm-output{min-height:84px;min-width:0;overflow:auto;background:var(--inset);border:1px solid var(--edge);border-radius:6px;padding:8px;font:12px/1.6 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.llm-message{padding:5px 0;border-bottom:1px solid var(--edge);color:var(--dim)}
+.llm-message[data-level="error"]{color:var(--bad)}
+.llm-message[data-level="warning"]{color:var(--gold)}
+.llm-line{margin-bottom:7px;padding:3px 5px;border-left:2px solid transparent}
+.llm-line[data-partial="true"]{color:var(--dim)}
+.llm-line[data-command="true"]{border-left-color:var(--hi);background:var(--button-hover);color:var(--hi)}
+.llm-detail{display:block;color:var(--dim);font:11px/1.5 system-ui,sans-serif}
+#listen[aria-pressed="true"]{background:var(--hi);color:var(--on-hi)}
+.llm-heading{align-items:center;gap:8px}
+#listen{flex:none}
 button{background:var(--button);color:var(--fg);border:1px solid transparent;border-radius:6px;padding:8px 10px;cursor:pointer;font:600 12px system-ui,sans-serif}
 button:hover{background:var(--button-hover)}
 button:focus-visible{outline:2px solid var(--hi);outline-offset:2px}
@@ -152,6 +167,7 @@ button.interrupt{background:var(--warning-fill);color:var(--on-warning)}button.i
   background:var(--inset);font:11px/1.5 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
 .console-line+.console-line{margin-top:3px}
 .console-source{color:var(--dim);margin-right:6px}
+.console-line{white-space:pre-wrap;user-select:text}
 .console-line[data-level="error"]{color:var(--bad)}
 .console-line[data-level="success"]{color:var(--ok)}
 .console-line[data-level="warning"],.status[data-level="warning"]{color:var(--gold)}
@@ -163,9 +179,6 @@ button.interrupt{background:var(--warning-fill);color:var(--on-warning)}button.i
 .task-options,.category-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
 .task-options button{min-width:0;min-height:42px;padding:6px 4px;font-size:11px;overflow-wrap:anywhere}
 .task-options button[aria-pressed="true"]{background:var(--hi);color:var(--on-hi);border-color:var(--hi)}
-#task-message{flex:1;min-width:0;margin:0;font-size:11px;text-align:right;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#task-message[data-level="error"]{white-space:normal}
 .category-options button{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:4px;min-width:0;min-height:42px;text-align:center;background:var(--inset);border-color:var(--edge);padding:5px;font-size:11px;overflow-wrap:anywhere}
 .category-options button:hover{background:var(--button)}
 .category-options button[aria-pressed="true"]{border-color:var(--hi);background:var(--selection)}

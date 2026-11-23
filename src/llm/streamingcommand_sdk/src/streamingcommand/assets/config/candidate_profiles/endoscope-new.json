@@ -1,0 +1,39 @@
+{
+  "I": [
+    "track",
+    "bend",
+    "self rotate",
+    "stop",
+    "bird view",
+    "reset",
+    "move",
+    "clean lens"
+  ],
+  "T": [
+    "liver",
+    "pancreas",
+    "stomach",
+    "organ",
+    "all",
+    "ligasure",
+    "straight grasper",
+    "duodenal stump",
+    "grasper",
+    "gallbladder",
+    "curved grasper",
+    "instrument",
+    "knife",
+    "none",
+    "scissor",
+    "harmonic scalpel"
+  ],
+  "P": [
+    "forward",
+    "left",
+    "up",
+    "backward",
+    "right",
+    "none",
+    "down"
+  ]
+}

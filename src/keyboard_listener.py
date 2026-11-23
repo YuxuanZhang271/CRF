@@ -1,6 +1,6 @@
 """Deliver browser-reserved Alt shortcuts to the focused control panel on Windows.
 
-Only B/P/T/R/M with Alt are intercepted, while a dashboard owns a fresh focus
+Only B/P/T/R/M/L with Alt are intercepted, while a dashboard owns a fresh focus
 lease. The hook never moves hardware: the browser consumes queued button clicks.
 Captured Alt chords include a no-action key event so releasing Alt does not
 activate the browser menu after the command letter has been suppressed.
@@ -16,7 +16,7 @@ import time
 from collections import deque
 
 COMMANDS = {ord('B'): 'bird-eye', ord('P'): 'pull-out', ord('T'): 'tracking',
-            ord('R'): 'record', ord('M'): 'arm-mode'}
+            ord('R'): 'record', ord('M'): 'arm-mode', ord('L'): 'listen'}
 DASHBOARD_TITLE = 'ABML General Surgical Platform'
 FOCUS_LEASE_S = 1.
 MENU_MASK_KEY = 0xE8  # Unassigned VK: no text, modifier changes or app commands.

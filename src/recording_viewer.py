@@ -135,7 +135,7 @@ class RecordingData:
             self.frames.append((stamp, data))
         elif kind == 'yolo':
             self.yolo.append((stamp, data))
-        elif (kind == 'console' or kind == 'state_error' or kind == 'session_stop'
+        elif (kind in ('console', 'state_error', 'session_stop', 'task', 'llm')
               or kind == 'config' or
               (kind in ('command', 'command_result') and data.get('path') != '/api/key/heartbeat')):
             self.events.append((stamp, kind, data))
@@ -187,6 +187,12 @@ class RecordingData:
 
 
 def event_label(kind, data):
+    if kind == 'task':
+        return f"TASK {data.get('id')} · {data.get('name')} · {data.get('reason', '')}"
+    if kind == 'llm':
+        if data.get('type') == 'command.dispatch':
+            return f"LLM → TASK {data.get('task_id')} · {data.get('result', {}).get('error') or 'accepted'}"
+        return f"LLM {data.get('type', '')} · {data.get('text') or data.get('message') or data.get('status', '')}"
     if kind == 'console':
         return f"{data.get('source', '')}: {data.get('message', '')}"
     if kind == 'command_result':

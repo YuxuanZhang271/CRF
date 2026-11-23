@@ -88,6 +88,34 @@ class CameraFeed:
         with self._condition:
             return self._observation
 
+    def wait_for_observation(self, revision, category, *, timeout=2., cancelled=None):
+        """Wait for inference for one exact selection, without holding any motion lock.
+
+        Target visibility is not required: tracking can remain in Waiting for target.
+        Cancellation is checked outside the camera lock to preserve lock ordering.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancelled is not None and cancelled():
+                return None
+            with self._condition:
+                if self._closed:
+                    raise ValueError('Camera closed while preparing tracking.')
+                if self._error or self._detection_error:
+                    raise ValueError(f'Camera unavailable for tracking: {self._error or self._detection_error}')
+                if category is None:
+                    raise ValueError('Select one YOLO category before tracking.')
+                if (revision, category) != (self._revision, self._category):
+                    raise ValueError('YOLO category changed while preparing tracking.')
+                obs = self._observation
+                if (obs is not None and (obs.revision, obs.category) == (revision, category)
+                        and 0 <= time.monotonic() - obs.captured_at <= DETECTION_MAX_AGE_S):
+                    return obs
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError(f'Timed out waiting for a fresh YOLO observation for {CATEGORIES[category]}.')
+                self._condition.wait(min(.05, remaining))
+
     def _status(self):
         return {"category": self._category, "revision": self._revision,
                 "ready": self._latest is not None, "error": self._error,
@@ -193,3 +221,4 @@ class CameraFeed:
             with self._condition:
                 self._detection_error = str(error) or type(error).__name__
                 self._observation = self._detections = None
+                self._condition.notify_all()

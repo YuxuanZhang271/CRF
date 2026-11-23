@@ -28,6 +28,14 @@ class KeyboardListenerTests(unittest.TestCase):
         self.assertEqual(listener.poll('panel', True)['commands'], ['bird-eye', 'pull-out', 'tracking', 'record', 'arm-mode'])
         self.assertEqual(listener.poll('panel', True)['commands'], [])
 
+    def test_alt_l_is_captured_once_for_listening(self):
+        listener = KeyboardListener()
+        listener.poll('panel', True)
+        self.assertTrue(listener.key(ord('L'), True, True, True))
+        self.assertTrue(listener.key(ord('L'), True, True, True))
+        self.assertTrue(listener.key(ord('L'), False, True, True))
+        self.assertEqual(listener.poll('panel', True)['commands'], ['listen'])
+
     def test_focus_changes_and_expired_leases_discard_commands(self):
         listener = KeyboardListener()
         with patch('keyboard_listener.time.monotonic', return_value=10.):

@@ -1,6 +1,7 @@
 """Shared task state and execution on the existing control coordinator."""
 
 import logging
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import math
 import threading
 import time
@@ -18,6 +19,8 @@ TASK_NAMES = (
 )
 LOOK_DIRECTIONS = {5: (0., -1.), 6: (0., 1.), 7: (-1., 0.), 8: (1., 0.)}
 log = logging.getLogger('Tasks')
+ARM_INTERRUPT_CONFIRM_TIMEOUT_S = 2.0
+FLEX_STOP_CONFIRM_TIMEOUT_S = 1.0
 
 
 class TaskState:
@@ -189,10 +192,12 @@ class TaskExecutor:
         return s.result == ipc.DONE and not s.moving and not s.spray_phase
 
     def _finish(self):
+        task_id = self.active['id']
         self.active = None
         self.node._flex_slew_target = None
         self.server.tasks.select(0)
         self._event('completed')
+        log.info('TASK %s · %s completed; ready.', task_id, TASK_NAMES[task_id])
 
     def _rcm_reset_aligned(self, a):
         n = self.node
@@ -355,3 +360,122 @@ class TaskExecutor:
             n._send_servo_stop()
             a['limited'] = True
             self._note('Flex and UR5 cannot advance farther; holding.', 'limited')
+
+
+class TaskCoordinator:
+    """Shared task entry for HTTP and voice; hardware acknowledgements precede activation."""
+
+    def __init__(self, server):
+        self.server = server
+
+    @staticmethod
+    def _result(body, code=200):
+        return body, code
+
+    def _task_event(self, task, reason):
+        self.server.recorder.event('task', {**task, 'reason': reason})
+        log.info('TASK %s · %s (%s)', task['id'], task['name'], reason)
+
+    def select(self, task_id=0, zoom=None, *, valid=None, expected_revision=None, prepare=None):
+        node = self.server.node
+        started = False
+        error = None
+        arm_failure = None
+        preparation_error = None
+        try:
+            with node.control_lock:
+                if valid is not None and not valid():
+                    return self._result({'error': 'Voice command expired.'}, 409)
+                if expected_revision is not None and self.server.tasks.snapshot()['revision'] != expected_revision:
+                    return self._result({'error': 'Task changed after the voice command started.'}, 409)
+                if self.server.interrupting and not task_id and not self.server.stopping:
+                    # Task 0 takes precedence over a task whose entry stop is in flight.
+                    task = self.server.tasks.select(0)
+                    self.server.executor.cancel()
+                    self._task_event(task, 'interrupt requested')
+                    return self._result({'ok': True, 'pending': True, 'task': task}, 202)
+                if self.server.stopping or self.server.interrupting:
+                    return self._result({'error': 'A stop request is already in progress.'}, 409)
+                if task_id and self.server.relay is not None and self.server.relay.freedrive_busy() is True:
+                    return self._result({'error': 'Exit Freedrive before starting a task.'}, 409)
+                self.server.interrupting = started = True
+                self.server.executor.cancel()
+                # Lock out manual inputs before clearing keys or talking to devices.
+                if task_id:
+                    task = self.server.tasks.select(task_id)
+                    revision = task['revision']
+                    if zoom is not None:
+                        self.server.tasks.update(zoom=float(zoom))
+                    self._task_event(self.server.tasks.snapshot(), 'selected')
+                arm_result = node.cmd_interrupt(self.server.relay is not None)
+                flex_request = node.flex.stop_request if node.flex_stop_delivered else None
+            flex = self._wait_for_flex_stop(flex_request, idle=bool(task_id))
+            if arm_result is not None:
+                try:
+                    arm_failure = arm_result.result(timeout=ARM_INTERRUPT_CONFIRM_TIMEOUT_S)
+                except FutureTimeoutError:
+                    arm_failure = 'The UR5 did not confirm that motion stopped.'
+            error = ' '.join(filter(None, [arm_failure,
+                'Flex did not confirm that motion stopped.' if flex == 'unconfirmed' else None]))
+            if not error and task_id and prepare is not None:
+                with node.control_lock:
+                    current = (self.server.tasks.snapshot()['revision'] == revision
+                               and (valid is None or valid()))
+                    if current:
+                        self.server.tasks.update(message='Waiting for a fresh camera observation.')
+                        self._task_event(self.server.tasks.snapshot(), 'waiting for camera')
+                if current:
+                    preparation_error = 'Camera preparation did not complete.'
+                    try:
+                        if prepare(revision):
+                            preparation_error = None
+                        else:
+                            preparation_error = 'Task canceled while waiting for the camera.'
+                    except (ValueError, RuntimeError, OSError) as failure:
+                        preparation_error = str(failure)
+                else:
+                    preparation_error = 'Task canceled before camera preparation.'
+        except (OSError, RuntimeError) as failure:
+            error = str(failure)
+            flex, arm_result = 'unconfirmed', None
+        finally:
+            if started:
+                with node.control_lock:
+                    if error:
+                        self._task_event(self.server.tasks.fail(error), 'stop failed')
+                    elif not task_id:
+                        self._task_event(self.server.tasks.select(0), 'interrupted')
+                    elif self.server.tasks.snapshot()['revision'] == revision:
+                        if valid is not None and not valid():
+                            self._task_event(self.server.tasks.select(0), 'voice command expired')
+                            error = 'Voice command expired.'
+                        elif preparation_error:
+                            error = preparation_error
+                            self._task_event(self.server.tasks.fail(error), 'camera preparation failed')
+                            log.warning('Task was not started: %s', error)
+                        else:
+                            try:
+                                self.server.executor.activate(task_id, revision)
+                            except (ValueError, RuntimeError, OSError) as failure:
+                                error = str(failure)
+                                self.server.executor.fail(error)
+                    if preparation_error and not error:
+                        error = preparation_error
+                    self.server.interrupting = False
+        arm = 'disabled' if arm_result is None else 'unconfirmed' if arm_failure else 'confirmed'
+        return self._result({'ok': not bool(error), 'error': error, 'arm': arm, 'flex': flex,
+                    'task': self.server.tasks.snapshot()}, 503 if error else 200)
+
+    def _wait_for_flex_stop(self, flex_request, *, idle=False):
+        flex = self.server.node.flex
+        if flex is None:
+            return 'disabled'
+        if flex_request is not None:
+            deadline = time.monotonic() + FLEX_STOP_CONFIRM_TIMEOUT_S
+            while time.monotonic() < deadline:
+                with self.server.node.control_lock:
+                    if (flex.stop_acknowledged(flex_request) and
+                            (not idle or (flex.status.action == 0 and flex.stop_request is None))):
+                        return 'confirmed'
+                time.sleep(0.01)
+        return 'unconfirmed'

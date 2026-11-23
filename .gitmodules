@@ -1,3 +1,7 @@
+# Optional upstream source reference; the runtime uses kdl-parser-jvytee
+# from environment.yaml. Updates check out the commit recorded by CRF.
 [submodule "dependencies/kdl_parser"]
 	path = dependencies/kdl_parser
 	url = https://github.com/jvytee/kdl_parser.git
+	update = checkout
+# src/llm/streamingcommand_sdk is vendored source, not a Git submodule.

@@ -41,6 +41,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 cover/
 
 # Jupyter / notebooks
@@ -51,6 +53,7 @@ cover/
 venv/
 ENV/
 env/
+.conda/
 .python-version
 
 # ---------------------------------------------------------
@@ -94,17 +97,31 @@ $RECYCLE.BIN/
 *~
 .\#*
 \#*\#
-.\#*
 
 # Sublime
 *.sublime-project
 *.sublime-workspace
 
 # ---------------------------------------------------------
+# Native driver / Visual Studio
+# ---------------------------------------------------------
+.vs/
+*.vcxproj.user
+*.suo
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.pch
+*.ipch
+*.tlog/
+*.lastbuildstate
+# Keep the bundled GTS SDK gts.dll and gts.lib in source control.
+
+# ---------------------------------------------------------
 # ROS / Robotics
 # ---------------------------------------------------------
 # Catkin / colcon build artifacts
-build/
 devel/
 install/
 log/
@@ -125,9 +142,12 @@ recordings/
 *.pid
 
 # ---------------------------------------------------------
-# Submodules (uncomment if you don't want to commit them)
+# Downloaded model weights / local caches
 # ---------------------------------------------------------
-# dependencies/kdl_parser/
+models/
+.huggingface/
+# The bundled src/scope/yolov8n.pt and SDK assets/models.json stay tracked.
+# Keep submodule worktrees and vendored SDK source visible to Git.
 
 # ---------------------------------------------------------
 # Secrets / local config

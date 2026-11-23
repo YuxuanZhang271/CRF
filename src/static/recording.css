@@ -1,0 +1,17 @@
+html{overflow:auto}
+body{height:auto;min-height:100vh;overflow:auto;padding:22px;background:var(--bg);color:var(--fg)}
+.replay-header{display:flex;justify-content:space-between;align-items:center;max-width:1600px;margin:0 auto 18px}
+.replay-header p{color:var(--dim);margin:0;font-size:13px}.replay-header h1{margin-bottom:5px}
+.replay-layout{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(260px,1fr);gap:14px;max-width:1600px;margin:auto;height:auto;padding:0}
+.replay-layout .card{margin:0;min-width:0}.replay-controls{grid-column:1/-1;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.replay-controls label{font-size:12px;color:var(--dim)}select{background:var(--inset);border:1px solid var(--edge);border-radius:6px;color:var(--fg);padding:8px;max-width:100%}
+#seek,.replay-controls .status{flex-basis:100%;width:100%;margin:0}#clock{margin-left:auto;font:13px ui-monospace,Consolas,monospace}
+.replay-image{position:relative;height:420px;background:#101014;display:flex;align-items:center;justify-content:center;border-radius:6px}
+.replay-image img{width:100%;height:100%;object-fit:contain}.replay-image p{position:absolute;color:#b9b2c1;pointer-events:none}
+.replay-summary dl{display:grid;grid-template-columns:1fr 1fr;font:12px/1.7 ui-monospace,Consolas,monospace;margin:0 0 15px;gap:3px 12px}
+.replay-summary dt{color:var(--dim)}.replay-summary dd{margin:0;text-align:right;overflow-wrap:anywhere}
+.replay-charts{grid-row:span 2}.replay-charts canvas{display:block;width:100%;height:160px;margin-bottom:12px}
+#events,#speech{height:220px;overflow:auto;font:12px/1.6 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.replay-event{padding:5px;border-bottom:1px solid var(--edge)}.replay-event[data-kind="task"],.replay-event[data-command="true"]{color:var(--hi);background:var(--button-hover)}
+.replay-event time{color:var(--dim);margin-right:10px}.replay-config{grid-column:1/-1}.replay-config pre{font-size:12px;overflow:auto;max-height:380px}
+@media(max-width:850px){body{padding:10px}.replay-layout{grid-template-columns:1fr}.replay-charts{grid-row:auto}.replay-image{height:320px}#clock{margin-left:0}}

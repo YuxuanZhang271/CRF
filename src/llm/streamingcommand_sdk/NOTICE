@@ -1,0 +1,5 @@
+PhonoCommand inference reference, Apache-2.0.
+qwen_asr_backend/* and asr_output.py derive from Qwen3-ASR SDK 0.0.6, Alibaba Qwen team, Apache-2.0.
+https://github.com/QwenLM/Qwen3-ASR
+Official model/config/processor files retain their copyright headers.
+asr_output.py extracts unchanged parser/repetition functions; chunk/prompt adaptation is in asr_windows_native.py.

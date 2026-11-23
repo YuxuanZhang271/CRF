@@ -34,12 +34,16 @@ from scope.camera import CAMERA_INDEX, CameraFeed
 from scope.yolo import CATEGORIES, COLORS, MODEL_PATH
 from status import COMMAND_NAMES, RECORDINGS_DIR, Recorder, Status, app_state
 from keyboard_listener import KeyboardListener
-from tasks import TASK_NAMES, TaskExecutor, TaskState
+from tasks import (
+    ARM_INTERRUPT_CONFIRM_TIMEOUT_S, FLEX_STOP_CONFIRM_TIMEOUT_S,
+    TASK_NAMES, TaskCoordinator, TaskExecutor, TaskState,
+)
+from llm import LLMService
+from recording_web import RecordingArchive, serve_recording
+from diagnostics import DiagnosticLog, RunLog
 
 log = logging.getLogger("WindowsApp")
 DASHBOARD_CONFIRM_TIMEOUT_S = 10.0
-FLEX_STOP_CONFIRM_TIMEOUT_S = 1.0
-ARM_INTERRUPT_CONFIRM_TIMEOUT_S = 2.0
 STATIC_DIR = Path(__file__).with_name("static")
 STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -47,6 +51,7 @@ STATIC_ROUTES = {
     "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/static/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
     "/static/keyboard.js": ("keyboard.js", "text/javascript; charset=utf-8"),
+    "/static/llm.js": ("llm.js", "text/javascript; charset=utf-8"),
     "/imgs/ABML_logo.png": (Path(__file__).resolve().parents[1] / "imgs" / "ABML_logo.png", "image/png"),
 }
 
@@ -90,6 +95,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
+        archive = getattr(self.server, 'archive', None)
+        if archive is not None and serve_recording(self, url, archive):
+            return
         asset = STATIC_ROUTES.get(url.path)
         if asset is not None:
             filename, content_type = asset
@@ -102,6 +110,20 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(state)
         elif url.path == '/api/recording':
             self._json(self.server.recorder.status())
+        elif url.path in ('/api/llm', '/api/diagnostics'):
+            try:
+                after = int(parse_qs(url.query).get('after', ['0'])[0])
+                if after < 0:
+                    raise ValueError()
+            except ValueError:
+                return self._json({'error': 'Expected a nonnegative event cursor.'}, 400)
+            if url.path == '/api/diagnostics':
+                diagnostics = getattr(self.server, 'diagnostics', None)
+                return self._json(diagnostics.snapshot(after) if diagnostics else {'sequence': 0, 'messages': []})
+            service = getattr(self.server, 'llm', None)
+            self._json(service.snapshot(after) if service else {
+                'enabled': False, 'phase': 'unavailable', 'error': 'LLM service unavailable.',
+                'sequence': 0, 'events': []})
         elif url.path == '/api/config':
             self._json({
                 'tasks': [{'id': i, 'label': name}
@@ -155,6 +177,12 @@ class _Handler(BaseHTTPRequestHandler):
         if origin is not None and origin != f"http://{self.headers.get('Host')}":
             return self._json({'error': 'Request must come from the control panel'}, 403)
 
+        if self.path == '/api/llm/listen':
+            try:
+                return self._json(self.server.llm.set_enabled(body.get('enabled')))
+            except (ValueError, RuntimeError) as error:
+                return self._json({'error': str(error)}, 409)
+
         if self.path in ('/api/recording/start', '/api/recording/stop'):
             # Serialize recording changes with task entry, including direct API calls.
             with self.server.node.control_lock:
@@ -168,13 +196,20 @@ class _Handler(BaseHTTPRequestHandler):
             task = self.server.tasks.snapshot()
             tracking_cancel = (task['id'] == 16 and not task['error']
                                and not self.server.stopping and not self.server.interrupting)
-            enabled = body['enabled'] and (not self._task_locked() or tracking_cancel)
-            return self._json(self.server.keyboard.poll(body['client'], enabled))
+            state = self.server.keyboard.poll(body['client'], body['enabled'])
+            if self._task_locked() and not tracking_cancel:
+                state['commands'] = [c for c in state['commands'] if c == 'listen']
+            elif tracking_cancel:
+                state['commands'] = [c for c in state['commands'] if c in ('listen', 'tracking')]
+            return self._json(state)
         if self.path == '/api/recording/console':
             if (not all(isinstance(body.get(key), str) for key in ('source', 'message', 'level'))
                     or len(body['message']) > 3000):
                 return self._json({'error': 'Expected a console source, message and level.'}, 400)
             self.server.recorder.event('console', {**body, 'origin': 'dashboard'})
+            level = {'error': logging.ERROR, 'warning': logging.WARNING}.get(body['level'], logging.INFO)
+            log.log(level, '[%s] %s', body['source'][:80], body['message'],
+                    extra={'from_dashboard': True})
             return self._json({'ok': True})
 
         self._control_command(body)
@@ -324,61 +359,8 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json({'ok': not bool(failure), 'error': failure}, 503 if failure else 200)
 
     def _interrupt_motion(self, task_id=0, zoom=None):
-        node = self.server.node
-        started = False
-        error = None
-        arm_failure = None
-        try:
-            with node.control_lock:
-                if self.server.interrupting and not task_id and not self.server.stopping:
-                    # Task 0 takes precedence over a task whose entry stop is in flight.
-                    task = self.server.tasks.select(0)
-                    self.server.executor.cancel()
-                    self._task_event(task, 'interrupt requested')
-                    return self._json({'ok': True, 'pending': True, 'task': task}, 202)
-                if self.server.stopping or self.server.interrupting:
-                    return self._json({'error': 'A stop request is already in progress.'}, 409)
-                if task_id and self.server.relay is not None and self.server.relay.freedrive_busy() is True:
-                    return self._json({'error': 'Exit Freedrive before starting a task.'}, 409)
-                self.server.interrupting = started = True
-                self.server.executor.cancel()
-                # Lock out manual inputs before clearing keys or talking to devices.
-                if task_id:
-                    task = self.server.tasks.select(task_id)
-                    revision = task['revision']
-                    if zoom is not None:
-                        self.server.tasks.update(zoom=float(zoom))
-                    self._task_event(self.server.tasks.snapshot(), 'selected')
-                arm_result = node.cmd_interrupt(self.server.relay is not None)
-                flex_request = node.flex.stop_request if node.flex_stop_delivered else None
-            flex = self._wait_for_flex_stop(flex_request, idle=bool(task_id))
-            if arm_result is not None:
-                try:
-                    arm_failure = arm_result.result(timeout=ARM_INTERRUPT_CONFIRM_TIMEOUT_S)
-                except FutureTimeoutError:
-                    arm_failure = 'The UR5 did not confirm that motion stopped.'
-            error = ' '.join(filter(None, [arm_failure,
-                'Flex did not confirm that motion stopped.' if flex == 'unconfirmed' else None]))
-        except (OSError, RuntimeError) as failure:
-            error = str(failure)
-            flex, arm_result = 'unconfirmed', None
-        finally:
-            if started:
-                with node.control_lock:
-                    if error:
-                        self._task_event(self.server.tasks.fail(error), 'stop failed')
-                    elif not task_id:
-                        self._task_event(self.server.tasks.select(0), 'interrupted')
-                    elif self.server.tasks.snapshot()['revision'] == revision:
-                        try:
-                            self.server.executor.activate(task_id, revision)
-                        except (ValueError, RuntimeError, OSError) as failure:
-                            error = str(failure)
-                            self.server.executor.fail(error)
-                    self.server.interrupting = False
-        arm = 'disabled' if arm_result is None else 'unconfirmed' if arm_failure else 'confirmed'
-        self._json({'ok': not bool(error), 'error': error, 'arm': arm, 'flex': flex,
-                    'task': self.server.tasks.snapshot()}, 503 if error else 200)
+        body, code = TaskCoordinator(self.server).select(task_id, zoom)
+        self._json(body, code)
 
     def _stop_session(self):
         node = self.server.node
@@ -521,6 +503,18 @@ class _Handler(BaseHTTPRequestHandler):
 def main():
     logging.basicConfig(level=logging.INFO,
                         format='[Windows] %(asctime)s - %(message)s')
+    with RunLog(Path(__file__).resolve().parents[1] / 'logs') as run_log:
+        log.info('Run warnings/errors log: %s', run_log.path)
+        try:
+            return _run_app()
+        except KeyboardInterrupt:
+            return 0
+        except Exception:
+            log.exception('Windows app failed')
+            return 1
+
+
+def _run_app():
 
     ap = argparse.ArgumentParser()
     ap.add_argument('--urdf', default=Path(__file__).with_name('flex_endo_robo') / 'ur5_endo_flex.urdf',
@@ -540,6 +534,8 @@ def main():
     ap.add_argument('--model', type=Path, default=MODEL_PATH, help='Path to YOLO weights')
     ap.add_argument('--recordings-dir', type=Path, default=RECORDINGS_DIR,
                     help='Session recording output directory (default: recordings in repository root)')
+    ap.add_argument('--llm-config', type=Path, default=Path(__file__).with_name('llm') / 'settings.json')
+    ap.add_argument('--microphone', help='Input device name; default: system microphone')
     run_mode = ap.add_mutually_exclusive_group()
     run_mode.add_argument('--camera-only', action='store_true', help='Passive camera preview')
     run_mode.add_argument('--flex-only', action='store_true', help='Connect Flex hardware without opening RTDE')
@@ -551,9 +547,12 @@ def main():
     try:
         with ExitStack() as resources:
             srv = resources.enter_context(ThreadingHTTPServer((args.host_web, args.port_web), _Handler))
+            srv.diagnostics = DiagnosticLog().start()
+            resources.callback(srv.diagnostics.close)
             srv.stopping = False
             srv.interrupting = False
             srv.tasks = TaskState()
+            srv.archive = RecordingArchive(args.recordings_dir)
             srv.relay = None
             relay_port = args.relay_port
             if not (args.camera_only or args.flex_only):
@@ -591,7 +590,10 @@ def main():
                 resources.callback(relay_thread.join)
                 resources.callback(relay_shutdown.set)
             resources.callback(srv.node.stop)
+            srv.llm = LLMService(srv, args.llm_config, args.microphone)
+            resources.callback(srv.llm.close)
             srv.node.start(connect_arm=srv.relay is not None)
+            srv.llm.start()
             log.info("Web panel: http://%s:%d", args.host_web, srv.server_port)
             try:
                 srv.serve_forever()
@@ -600,7 +602,7 @@ def main():
     except KeyboardInterrupt:
         pass
     except (OSError, RuntimeError, OverflowError) as error:
-        log.error("Windows app failed: %s", error)
+        log.exception("Windows app failed: %s", error)
         return 1
     return 0
 

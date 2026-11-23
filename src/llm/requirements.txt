@@ -1,0 +1,18 @@
+# Run from the CRF repository root with crf activated.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.11.0+cu130
+torchvision==0.26.0+cu130
+torchaudio==2.11.0+cu130
+transformers==5.23.0
+peft==0.22.0
+huggingface-hub==1.33.0
+sounddevice==0.5.6
+soundfile==0.14.0
+soxr==1.1.0
+webrtcvad-wheels==2.0.14
+onnxruntime==1.32.0
+funasr==1.4.27
+accelerate==1.16.0
+safetensors==0.8.0
+platformdirs==4.14.7
+-e ./src/llm/streamingcommand_sdk

@@ -52,19 +52,19 @@ function renderTask(task) {
   }
   if (task.id !== 0 && currentTask?.id !== task.id) releaseKeys();
   currentTask = task;
-  setStatusChip('task-status', `${task.id} · ${task.name}`, task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'ok');
+  const phase = task.error ? 'Error' : ({idle: 'Ready', starting: 'Starting', running: 'Running', limited: 'Limited', error: 'Error'}[task.phase] || (task.id ? 'Running' : 'Ready'));
+  setStatusChip('task-status', task.id ? `${task.id} · ${phase}` : phase,
+    task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'ok');
   taskButtons.forEach((button, id) => {
     const active = id === task.id;
     button.setAttribute('aria-pressed', String(active));
     button.title = `Execute task ${id}: ${button.dataset.label}`;
   });
-  const message = document.getElementById('task-message');
-  message.textContent = task.error ? `${task.error} Use INTERRUPT to retry stopping.` :
-    task.id === 0 ? '0 · Stop — manual controls available when devices are ready.' :
-    `${task.id} · ${task.name} — ${task.message || 'Running; manual controls locked.'}`;
-  message.dataset.level = task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'info';
-  message.title = message.textContent;
-  reportStatus('task-state', 'TASK', `${task.id} · ${task.name} · ${task.error || task.message || ''}`, message.dataset.level);
+  const level = task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'info';
+  const detail = task.error ? `${task.error} Use INTERRUPT to retry stopping.` :
+    task.message || (task.id ? 'Running; manual controls locked.' : 'Manual controls available when devices are ready.');
+  document.getElementById('task-status').title = `${task.id} · ${task.name} · ${phase}`;
+  reportStatus('task-state', 'TASK', `${task.id} · ${task.name} · ${detail}`, level, false);
 }
 
 async function selectTask(id) {
@@ -125,7 +125,7 @@ function writeOutput(source, message, level = 'info', record = true) {
   consoleOutput.append(line);
   if (consoleOutput.childElementCount > 120) consoleOutput.firstElementChild.remove();
   if (atEnd) consoleOutput.scrollTop = consoleOutput.scrollHeight;
-  if (recordingActive && record) {
+  if (record) {
     const request = fetch('/api/recording/console', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({source, message: message.slice(0, 3000), level,
@@ -226,10 +226,10 @@ async function pollRecording() {
   if (!sessionStopped) setTimeout(pollRecording, 1000);
 }
 
-function reportStatus(key, source, message, level) {
+function reportStatus(key, source, message, level, forward = true) {
   if (reportedStatus.get(key) === message) return;
   reportedStatus.set(key, message);
-  if (message) writeOutput(source, message, level);
+  if (message) writeOutput(source, message, level, forward);
 }
 
 async function post(path, body = {}, quiet = false) {
@@ -1048,7 +1048,25 @@ function renderCategoryButtons(categories) {
   }
 }
 
+let diagnosticCursor = 0;
+let diagnosticFailure = false;
+async function pollDiagnostics() {
+  try {
+    const response = await fetch(`/api/diagnostics?after=${diagnosticCursor}`, {signal: AbortSignal.timeout(3000)});
+    if (!response.ok) throw new Error('Server diagnostics unavailable.');
+    const result = await response.json();
+    for (const row of result.messages || []) writeOutput(row.source, row.message, row.level, false);
+    diagnosticCursor = result.sequence;
+    diagnosticFailure = false;
+  } catch (error) {
+    if (!diagnosticFailure) writeOutput('APP', error.message, 'warning', false);
+    diagnosticFailure = true;
+  }
+  if (!sessionStopped) setTimeout(pollDiagnostics, 500);
+}
+
 async function init() {
+  pollDiagnostics();
   pollRecording();
   const cfg = await (await fetch('/api/config')).json();
   renderTaskButtons(cfg.tasks);

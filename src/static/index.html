@@ -155,6 +155,7 @@
       <div class="console-output" id="console-output" role="log" aria-labelledby="console-heading" tabindex="0"></div>
       <p class="shortcut-tips" aria-label="Recording keyboard shortcut">
         <span><kbd>Alt</kbd>+<kbd>R</kbd> start/stop recording</span>
+        <span><a href="/viewer" target="_blank" rel="noopener">Open recording viewer</a></span>
       </p>
     </section>
   </div>
@@ -182,11 +183,12 @@
       <button id="zoom-out" type="button" title="Hold to zoom out · −" aria-keyshortcuts="-" disabled>ZOOM OUT</button>
     </div>
   </div>
-  <dl class="status-bar" aria-label="Robot status">
+  <dl class="status-bar" aria-label="System status">
     <div class="status-chip" id="arm-status"><dt>ARM</dt><dd>Disconnected</dd></div>
     <div class="status-chip" id="flex-connection"><dt>FLEX</dt><dd>Disconnected</dd></div>
     <div class="status-chip" id="motion-status"><dt>MOTION</dt><dd>Unavailable</dd></div>
-    <div class="status-chip" id="task-status"><dt>TASK</dt><dd>Unavailable</dd></div>
+    <div class="status-chip" id="task-status" role="status"><dt>TASK</dt><dd>Unavailable</dd></div>
+    <div class="status-chip" id="llm-status" role="status"><dt>LLM</dt><dd>Loading</dd></div>
   </dl>
   <p class="shortcut-tips" aria-label="Camera keyboard shortcuts">
     <span>Hold <kbd>=</kbd> to zoom in · <kbd>-</kbd> to zoom out</span>
@@ -196,10 +198,17 @@
 <aside class="panel category-panel" aria-labelledby="categories-heading">
   <h2 id="categories-heading">Vision-Language Interaction</h2>
   <div class="panel-scroll">
+    <section class="card llm-card" aria-labelledby="llm-heading">
+      <div class="task-heading llm-heading">
+        <h3 id="llm-heading">LLM</h3>
+        <button id="listen" type="button" aria-pressed="false" aria-keyshortcuts="Alt+l" title="Toggle speech task triggering · Alt+L">LISTEN</button>
+      </div>
+      <div id="llm-output" class="llm-output" role="log" aria-label="Speech recognition" tabindex="0"></div>
+      <p class="shortcut-tips"><span><kbd>Alt</kbd>+<kbd>L</kbd> toggle listening</span></p>
+    </section>
     <section class="card" aria-labelledby="tasks-heading">
       <div class="task-heading">
         <h3 id="tasks-heading">Tasks</h3>
-        <p id="task-message" class="status" role="status" title="Waiting for task status…">Waiting for task status…</p>
       </div>
       <p class="task-help">Select a task to execute. Spray water/air runs for 3 seconds. INTERRUPT stops.</p>
       <div class="task-options" id="task-options" role="group" aria-label="Tasks"></div>
@@ -220,4 +229,5 @@
 </main>
 
 <script src="/static/dashboard.js"></script>
+<script src="/static/llm.js"></script>
 <script src="/static/keyboard.js"></script></body></html>

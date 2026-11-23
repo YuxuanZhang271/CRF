@@ -1,0 +1,96 @@
+{
+  "asr": {
+    "backend": "native",
+    "device": "auto",
+    "profile": "v17-yue-precision"
+  },
+  "command": {
+    "model": "clarification-hybrid",
+    "device": "auto",
+    "recognition_logic": "original",
+    "candidates": {
+      "I": [
+        "track",
+        "bend",
+        "self rotate",
+        "stop",
+        "bird view",
+        "reset",
+        "move",
+        "clean lens",
+        "zoom in",
+        "zoom out",
+        "spray water",
+        "spray air"
+      ],
+      "T": [
+        "liver",
+        "pancreas",
+        "stomach",
+        "organ",
+        "all",
+        "ligasure",
+        "straight grasper",
+        "duodenal stump",
+        "grasper",
+        "gallbladder",
+        "curved grasper",
+        "instrument",
+        "knife",
+        "none",
+        "scissor",
+        "harmonic scalpel",
+        "person",
+        "bottle",
+        "cup",
+        "banana",
+        "chair"
+      ],
+      "P": [
+        "forward",
+        "left",
+        "up",
+        "backward",
+        "right",
+        "none",
+        "down"
+      ]
+    },
+    "use_cuda_graphs": false
+  },
+  "models": {
+    "asr": {
+      "source": "huggingface",
+      "url": "https://huggingface.co/humoiww/PhonoCommand-ASR",
+      "revision": "ff8daaafd4a7fd4b396c2ffcab8da230d3c17a4f"
+    },
+    "asr-base": {
+      "source": "huggingface",
+      "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B",
+      "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5"
+    },
+    "language": {
+      "source": "huggingface",
+      "url": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall",
+      "revision": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7"
+    },
+    "speech": {
+      "source": "huggingface",
+      "url": "https://huggingface.co/humoiww/PhonoCommand-ASR",
+      "revision": "ff8daaafd4a7fd4b396c2ffcab8da230d3c17a4f",
+      "subfolder": "silero_vad"
+    },
+    "llm-base": {
+      "source": "huggingface",
+      "url": "https://huggingface.co/Qwen/Qwen3.5-0.8B",
+      "revision": "2fc06364715b967f1860aea9cf38778875588b17"
+    },
+    "clarification-hybrid": {
+      "source": "huggingface",
+      "url": "https://huggingface.co/humoiww/PhonoCommand-LLM-0.8B",
+      "revision": "d5217d0c486933822da027600d7ceb9ed2d9bfb7",
+      "subfolder": "clarification-hybrid",
+      "expected_step": 1392
+    }
+  }
+}

@@ -1,5 +1,5 @@
 // Commands share button handlers; held motion shares the pointer heartbeat and expiry path.
-const shortcutCommands = {KeyB: 'bird-eye', KeyP: 'pull-out', KeyT: 'tracking', KeyR: 'record', KeyM: 'arm-mode'};
+const shortcutCommands = {KeyB: 'bird-eye', KeyP: 'pull-out', KeyT: 'tracking', KeyR: 'record', KeyM: 'arm-mode', KeyL: 'listen'};
 const armShortcuts = {ArrowUp: 'arm_up', ArrowDown: 'arm_down', ArrowLeft: 'arm_left',
   ArrowRight: 'arm_right', BracketRight: 'arm_fwd', BracketLeft: 'arm_bwd'};
 const flexShortcuts = {KeyW: ['flex_w', 'flex_up'], KeyS: ['flex_s', 'flex_down'],
@@ -16,7 +16,7 @@ function editing(element) {
 }
 
 function clickShortcut(id) {
-  if (!['interrupt', 'tracking'].includes(id) && manualControlsLocked()) return;
+  if (!['interrupt', 'tracking', 'listen'].includes(id) && manualControlsLocked()) return;
   const button = document.getElementById(id);
   if (button && !button.disabled && !stopping && !sessionStopped) button.click();
 }
@@ -139,8 +139,7 @@ document.addEventListener('focusin', event => {
 });
 
 async function pollNativeShortcuts() {
-  const enabled = document.hasFocus() && !document.hidden && !editing(document.activeElement) &&
-    (!manualControlsLocked() || currentTask?.id === 16);
+  const enabled = document.hasFocus() && !document.hidden && !editing(document.activeElement);
   try {
     const response = await fetch('/api/keyboard', {
       method: 'POST', headers: {'Content-Type': 'application/json'},

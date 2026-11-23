@@ -1,6 +1,7 @@
 """Exercise HTTP routes without starting any camera or robot workers."""
 
 import io
+import logging
 import json
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from flex_endo_robo.control_node import ControlNode
 from status import Recorder, Status
 from keyboard_listener import KeyboardListener
 from tasks import TaskExecutor, TaskState
+from diagnostics import DiagnosticLog
 
 
 class DashboardTests(unittest.TestCase):
@@ -79,6 +81,25 @@ class DashboardTests(unittest.TestCase):
         for path in ("/static/../app.py", "/static/app.py", "/missing"):
             with self.subTest(path=path):
                 self.assertEqual(self.request("GET", path)[0], 404)
+
+    def test_diagnostic_feed_and_browser_terminal_forwarding(self):
+        feed = DiagnosticLog()
+        try:
+            feed.emit(logging.LogRecord('Tasks', logging.ERROR, __file__, 1, 'Full task failure', (), None))
+            with patch.object(self.server, 'diagnostics', feed, create=True):
+                status, _, body = self.request('GET', '/api/diagnostics?after=0')
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)['messages'][0]['message'], 'Full task failure')
+                self.assertEqual(json.loads(self.request('GET', '/api/diagnostics?after=1')[2])['messages'], [])
+                self.assertEqual(self.request('GET', '/api/diagnostics?after=bad')[0], 400)
+            with self.assertLogs('WindowsApp', level='INFO') as logs:
+                status, _, _ = self.request('POST', '/api/recording/console',
+                    json.dumps({'source': 'APP', 'level': 'info', 'message': 'Browser message without recording'}))
+            self.assertEqual(status, 200)
+            self.assertIn('Browser message without recording', logs.output[0])
+            self.assertTrue(logs.records[0].from_dashboard)
+        finally:
+            feed.close()
 
     def test_state_and_config_remain_available(self):
         status, _, body = self.request("GET", "/api/state")
@@ -154,6 +175,16 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.request('POST', '/api/flex/tracking', '{"enabled":true}')[0], 503)
         self.assertEqual(self.server.tasks.snapshot()['id'], 16)
         self.assertIsNotNone(self.server.tasks.snapshot()['error'])
+
+    def test_listen_shortcut_remains_available_during_tasks(self):
+        self.server.tasks.select(3)
+        with patch.object(self.server.keyboard, 'poll', return_value={
+                'available': True, 'commands': ['record', 'listen', 'tracking']}) as poll:
+            status, _, body = self.request('POST', '/api/keyboard',
+                '{"client":"voice-panel","enabled":true}')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['commands'], ['listen'])
+        poll.assert_called_once_with('voice-panel', True)
 
     def test_failed_stop_keeps_task_locked_until_successful_interrupt(self):
         failure = Future()

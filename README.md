@@ -1,178 +1,239 @@
 # CRF
 
-CRF is an integrated surgical agentic system for gastrectomy. This repository currently implements the flexible endoscopic robot subsystem, combining UR5 arm control, a tendon-driven flexible endoscope, and camera-based perception in a browser dashboard.
+CRF is an integrated surgical agentic system for gastrectomy. This repository provides its flexible endoscopic robot subsystem: a UR5 arm, a tendon-driven flexible endoscope, camera perception, and voice commands, operated from one browser dashboard.
 
-[Demo](#demo) · [System overview](#system-overview) · [Configuration](#configuration)
+[Setup](#setup) · [Run](#run) · [Configure](#configure) · [Operate](#operate) · [Keyboard shortcuts](#keyboard-shortcuts) · [Tasks](#tasks) · [Record and replay](#record-and-replay)
 
-## Demo
+![CRF control dashboard](imgs/dark_webui.png)
 
-Use **Windows** with the UR5, GTS controller, and camera connected. For the first run, [build the native driver](#build-the-native-driver). Then run the following commands in PowerShell from the repository root:
+## Setup
+
+Use a **Windows PC** with Conda. The full system also needs a connected UR5, GTS controller, and camera. Run the commands below in PowerShell from the repository root.
+
+### 1. Create the environment
 
 ```powershell
 conda env create -f environment.yaml
 conda activate crf
-.\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1
 ```
 
-The launcher starts the Flex driver, UR5 RTDE relay, camera, and web dashboard together. Open the [control dashboard](http://127.0.0.1:8080) to access robot controls, live perception, and recording. See [keyboard shortcuts](keyboard_shortcuts.md) for motion and command mappings. Press `Ctrl+C` in the terminal to end the session.
+For an existing `crf` environment, install the latest voice dependencies with:
 
-The default UR5 address is `192.168.1.10`, and Flex uses `Planned` feedback with physical motors. See [configuration](#configuration) to change the robot address, feedback mode, or other settings.
+```powershell
+python -m pip install -r src/llm/requirements.txt
+```
 
-![CRF control dashboard in dark mode](imgs/dark_webui.png)
+### 2. Prepare the speech models
 
-<details>
-<summary>Light mode</summary>
+```powershell
+python -m streamingcommand.cli --config src/llm/settings.json doctor
+python -m streamingcommand.cli --config src/llm/settings.json download
+```
 
-![CRF control dashboard in light mode](imgs/light_webui.png)
+Download the models once before starting the app; allow approximately 11.5 GB of storage. The app loads cached models and opens the server PC's microphone at startup, including in camera-only and simulated Flex modes. Voice task triggering starts off. See [voice setup](src/llm/README.md) for GPU dependencies, model settings, and microphone configuration.
 
-</details>
+### 3. Build the Flex driver
 
-## System overview
-
-![CRF system architecture](imgs/system_architecture.jpg)
-
-The system integrates three components:
-
-- **Robot control:** a UR5 arm controlled through RTDE and a native C++ Flex driver connected to the vendor GTS controller. Python coordinates remote center of motion (RCM) control, endoscope bending and roll, horizon leveling, and motion procedures.
-- **Visual perception:** separate camera capture and YOLO inference workers provide live preview, object detections, and target observations for tracking. Inference processes the latest frame to avoid accumulating a backlog.
-- **Interaction and recording:** the web dashboard provides manual controls, task execution, device status, and session recording. Timestamped state, commands, detections, and camera frames are stored in five-minute JSONL/MJPEG segments for replay and analysis.
-
-The control coordinator requests a 125 Hz update rate and publishes dashboard snapshots at 20 Hz. Flex IPC, RTDE motion and telemetry, camera capture, inference, and HTTP handling run independently.
-
-The supported deployment uses a Windows PC for the GTS driver and DirectShow camera capture. The UR5 connects directly through RTDE, so a separate ROS 2 bridge or Ubuntu machine is unnecessary for this setup.
-
-<details>
-<summary>Alternative deployment architecture</summary>
-
-![Alternative system architecture with a Jetson](imgs/system_architecture_alt.jpg)
-
-</details>
-
-## Configuration
-
-### Build the native driver
-
-The simulated and physical Flex modes require the native driver. Install Visual Studio 2022 with **Desktop development with C++**, the **MSVC v143** toolset, and a **Windows SDK**. Open:
+Physical and simulated Flex control both require the native driver. Install Visual Studio 2022 with **Desktop development with C++**, **MSVC v143**, and a **Windows SDK**. Open:
 
 ```text
 src/flex_endo_robo/flex_endo/FlexEndoscopeDriver.sln
 ```
 
-Select **Debug | x86** and build the solution. The launcher expects:
+Build **Debug | x86**. The launcher expects:
 
 ```text
 src/flex_endo_robo/flex_endo/build/Win32/Debug/FlexEndoscopeDriver.exe
 ```
 
-The build links the bundled x86 GTS library and copies `gts.dll` and `GTS800.cfg` beside the executable. If you build **Release | x86**, pass `-Configuration Release` to the launcher.
+The build copies `gts.dll` and `GTS800.cfg` beside the executable. If you build **Release | x86**, add `-Configuration Release` when launching. Camera-only mode does not need this driver.
 
-### Connect the full system
+## Run
 
-Connect the UR5, GTS controller, and camera to the Windows PC. Activate the `crf` environment, then launch with your UR5 IP address:
+Activate `crf` before each session. Choose one mode and stop the current session before launching another.
+
+### Full system
+
+Connect the UR5, GTS controller, and camera, then launch with your robot's address:
 
 ```powershell
+conda activate crf
 .\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -RobotIp 192.168.1.10 -Feedback Encoder
 ```
 
-This starts the Flex driver, RTDE relay, camera, and dashboard. The launcher defaults to full-system mode. Choose the feedback mode explicitly: **Planned also controls physical motors**, using planned positions without encoder verification; **Encoder** uses encoder feedback; **Simulated** simulates only the Flex hardware. Use `-FlexOnly -Feedback Simulated` together for the Flex demo without a UR5 connection.
+Open the [control dashboard](http://127.0.0.1:8080). The launcher starts the Flex driver, UR5 connection, camera, and dashboard together.
 
-Common launcher settings:
+**Choose feedback explicitly:** `Encoder` uses encoder feedback; `Planned` moves physical motors using planned positions without encoder verification; `Simulated` simulates Flex motors only. The launcher defaults to `Planned`. A full-system launch with `Simulated` still connects to the real UR5.
 
-| Option | Default | Purpose |
-| --- | --- | --- |
-| `-RobotIp` | `192.168.1.10` | UR5 network address in full-system mode. |
-| `-Feedback` | `Planned` | `Planned`, `Encoder`, or `Simulated` Flex feedback. |
-| `-FlexOnly` | Off | Run Flex controls without opening RTDE. |
-| `-Configuration` | `Debug` | Select the `Debug` or `Release` driver build. |
-| `-Port` | `8080` | Dashboard HTTP port. |
-| `-CameraRollOffsetDeg` | `0` | Measured camera roll relative to the modeled Flex camera, from -180 to 180 degrees. |
-| `-GasPort` | `COM4` | Serial port for the gas controller. |
-| `-WaterVelocity` | `30` | Signed water pump velocity; nonzero, from -30 to 30. |
-
-For example, to change the dashboard and gas controller ports:
-
-```powershell
-.\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -RobotIp 192.168.1.10 -Feedback Encoder -Port 8081 -GasPort COM5
-```
-
-### UR5 Freedrive (PolyScope 3.15 / CB3)
-
-In the **UR5** section, click **FREEDRIVE** between **APPLY** and **RESET** to enter hand guiding. The arm and Flex must be stationary, controls released, and TASK 0 selected. The button highlights while active. Click it again to hold the current pose; **INTERRUPT** also exits without ending the session. Robot motion controls and tasks are blocked during hand guiding and the exit transition.
-
-You can also hold **Alt+Shift+F** for Freedrive and release F, Alt, or Shift to request exit immediately. Keep the dashboard focused while guiding. Losing focus, hiding or closing the page, or losing its heartbeat ends Freedrive (the heartbeat lease expires after 1.5 seconds). A controller RTDE watchdog stops the program if the relay stops communicating. Entry clears the old RCM pivot and queued targets; after repositioning, select RCM mode again to capture a new pivot. Verify the installed tool's payload and center of gravity on the pendant before hand guiding.
-
-PolyScope 3.15 supports the no-argument URScript functions `freedrive_mode()` and `end_freedrive_mode()` ([UR release notes](https://www.universal-robots.com/articles/ur/release-notes/release-note-software-version-31xx/)). This app uses the installed `ur_rtde` library's `teachMode()` / `endTeachMode()` compatibility API: its control script retains these CB3 handlers, whereas its newer `freedriveMode()` / `endFreedriveMode()` handlers are gated to PolyScope 5.10 and later ([upstream control script](https://gitlab.com/sdurobotics/ur_rtde/-/blob/master/scripts/rtde_control.script)). The legacy names are intentional for this controller; no ROS or PolyScope X SDK is required.
-
-### Simulated Flex control
-
-To try Flex controls without motor hardware, first [build the native driver](#build-the-native-driver), then run in the activated `crf` environment:
+### Simulated Flex
 
 ```powershell
 .\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -FlexOnly -Feedback Simulated
 ```
 
-The launcher starts the simulated Flex driver and dashboard together. `-FlexOnly` disables the UR5 connection; `-Feedback Simulated` simulates the Flex motors. The camera feed still uses a real camera. This mode supports Flex jogging and calibration; procedures requiring a connected UR5, such as tracking, require the full system.
+This runs Flex control without a UR5 connection or physical Flex motion. The camera still uses a real device. Use **CALIBRATE** to establish Flex zero, then try jogging and Flex-only tasks. Tracking requires the full system.
 
-Open the dashboard, use **CALIBRATE** to establish a Flex zero position, and try the Flex controls. See [keyboard shortcuts](keyboard_shortcuts.md) for motion and command mappings. Stop this session before starting another demo or hardware session.
+### Camera only
 
-### Camera, model, and geometry
+```powershell
+python src/app.py --camera-only
+```
 
-For a camera-only demo, run `python src/app.py --camera-only` in the activated `crf` environment. This starts the camera preview and dashboard without connecting to the UR5 or Flex driver.
+Use this for live preview, detections, recording, and digital zoom without connecting to the UR5 or Flex driver.
 
-Additional settings are available through `src/app.py`. For example, to preview another camera with custom YOLO weights:
+### End a session
+
+Use **INTERRUPT** or `I` to stop motion or a task while keeping the app open. Press `Ctrl+C` in the launcher terminal to end the session.
+
+## Configure
+
+Common PowerShell launcher settings:
+
+| Option | Default | Use |
+| --- | --- | --- |
+| `-RobotIp` | `192.168.1.10` | UR5 network address. |
+| `-Feedback` | `Planned` | Choose `Encoder`, `Planned`, or `Simulated`. |
+| `-FlexOnly` | Off | Run without the UR5 connection. |
+| `-Configuration` | `Debug` | Select the `Debug` or `Release` driver build. |
+| `-Port` | `8080` | Dashboard port. |
+| `-CameraRollOffsetDeg` | `0` | Camera roll relative to the modeled camera, from −180° to 180°. |
+| `-GasPort` | `COM4` | Gas controller serial port. |
+| `-WaterVelocity` | `30` | Signed water pump velocity; nonzero, from −30 to 30. |
+
+For example, to use another dashboard port and gas controller port:
+
+```powershell
+.\src\flex_endo_robo\flex_endo\Start-FlexControl.ps1 -RobotIp 192.168.1.10 -Feedback Encoder -Port 8081 -GasPort COM5
+```
+
+For another camera or YOLO model in camera-only mode:
 
 ```powershell
 python src/app.py --camera-only --camera-index 1 --model path/to/weights.pt --port-web 8081
 ```
 
-| Python option | Default | Purpose |
+The bundled detector supports **person, bottle, cup, banana, and chair**. Custom models need matching class labels in `src/scope/yolo.py`. During operation, set arm/Flex speed and motion limits in the dashboard and click **APPLY**.
+
+See [advanced configuration](docs/DEVELOPMENT.md#advanced-configuration) for geometry, microphone, model settings, output directories, and direct Python launch options.
+
+## Operate
+
+1. Open the dashboard and check the device status and console. Wait for the required devices to become ready.
+2. Set motion limits and speeds. Calibrate Flex to save its intended zero position.
+3. Choose **Linear** for arm translation or **RCM** for motion about a captured remote center of motion. Select RCM before coordinated look tasks, tracking, or an RCM tip reset.
+4. Hold the dashboard direction buttons or motion keys to jog; release to stop. Select a task for continuous movement or a procedure.
+5. Use **INTERRUPT** whenever you need to stop a task. If TASK shows Error, inspect the console and use INTERRUPT before retrying.
+
+Shortcuts work while the dashboard has focus. Editing a form suspends them. Leaving the page or switching applications releases held motion, zoom, and keyboard Freedrive.
+
+### Hand guiding
+
+With devices stationary, controls released, and Task 0 selected, click **FREEDRIVE** to guide the UR5 by hand. Click it again to hold the current pose, or use INTERRUPT. Alternatively, hold `Alt+Shift+F`; releasing `F`, `Alt`, or `Shift` requests exit.
+
+Check the installed tool's payload and center of gravity on the pendant before hand guiding. Keep the dashboard focused; losing focus or its heartbeat ends Freedrive. After repositioning, select RCM again to capture a new pivot.
+
+### Bird-eye view and withdrawal
+
+**BIRD-EYE** moves to a level view looking 30° downward. Its button is yellow while moving and green at the target pose.
+
+**PULL OUT** uses two presses: the first prepares the zero pose; once the button turns sky blue, verify scope straightness and the withdrawal path, then press again within 30 seconds to withdraw. The button is yellow while moving and green when complete. Active RCM and ready devices are required.
+
+### Tracking
+
+Select a detection category, calibrate Flex, and enable UR5 RCM. Press **TRACKING** or `Alt+T` to start Task 16. The button is green while tracking, sky blue while waiting for a target, and yellow when motion is limited. Press the same command again or INTERRUPT to stop.
+
+### Voice commands
+
+The app recognizes speech in the background. Press **LISTEN** or `Alt+L` to enable task triggering, then speak a command such as “move forward,” “look left,” “zoom in,” or “track the bottle.” Check the transcript and task result in the LLM panel.
+
+With LISTEN enabled, the standalone English word **stop** triggers Task 0 as soon as it appears in recognition. Turning LISTEN off leaves an already-running task active; use INTERRUPT or `I` to stop it. Voice tracking supports the five detector categories above; a tracking command without a named target uses the selected category. Surgical target names are not supported by the bundled detector.
+
+## Keyboard shortcuts
+
+Hold motion, zoom, and Freedrive keys. Press other shortcuts once; key repeat does not repeat a command.
+
+| Action | Keys |
+| --- | --- |
+| UR5 up / down / left / right | `Up` / `Down` / `Left` / `Right` |
+| UR5 forward / backward | `]` / `[` |
+| Flex look up / down / left / right | `W` / `S` / `A` / `D` |
+| Flex roll clockwise (+) / counterclockwise (−) | `R` / `F` |
+| BIRD-EYE | `Alt+B` |
+| PULL OUT (prepare, then confirm) | `Alt+P` |
+| INTERRUPT | `I` |
+| Toggle TRACKING | `Alt+T` |
+| Toggle RECORD | `Alt+R` |
+| Toggle Linear / RCM | `Alt+M` |
+| Hold FREEDRIVE | `Alt+Shift+F` |
+| Zoom in / out | `=` / `-` |
+| Toggle LISTEN | `Alt+L` |
+
+Zoom ranges from 1× to 2×; `Shift+=` and numpad `+` / `-` also work. Manual zoom is locked while Tasks 3 or 4 control it. Flex roll keys apply to the physical or simulated driver; in arm-only modeled mode, use the on-screen arc controls.
+
+## Tasks
+
+The Tasks card offers Tasks 1–15. INTERRUPT selects Task 0; TRACKING selects Task 16. Voice commands use the same tasks and device requirements.
+
+| ID | Task | What it does |
 | --- | --- | --- |
-| `--camera-index` | `0` | DirectShow camera device index. |
-| `--model` | `src/scope/yolov8n.pt` | YOLO weights file. |
-| `--host-web` / `--port-web` | `127.0.0.1` / `8080` | Dashboard bind address and port. |
-| `--robot-ip` / `--relay-port` | `192.168.1.10` / `9000` | UR5 address and local RTDE relay port. |
-| `--urdf` | `src/flex_endo_robo/ur5_endo_flex.urdf` | Robot and endoscope geometry. |
-| `--rcm-local` | `0 0 -0.30` | Local RCM coordinates in meters. |
-| `--tip-local` | `0 0 0.20195` | Local tip coordinates in meters. |
-| `--camera-roll-offset-deg` | `0` | Optical roll offset in degrees. |
-| `--jog-speed-scale` | `10` | Manual arm speed factor; choices: `3`, `5`, `10`, `15`. |
-| `--recordings-dir` | Repository `recordings/` | Session output directory. |
+| 0 | Stop | Cancel the current task and stop motion. |
+| 1 | Go forward | Continuously advance the UR5 tip. |
+| 2 | Go backward | Continuously retract the UR5 tip. |
+| 3 | Zoom in | Increase digital zoom to 2×, then hold. |
+| 4 | Zoom out | Decrease digital zoom to 1×, then hold. |
+| 5 | Look up | Bend Flex upward first, then use UR5 assistance at the Flex limit. |
+| 6 | Look down | Apply the same Flex-first movement downward. |
+| 7 | Look left | Apply the same Flex-first movement leftward. |
+| 8 | Look right | Apply the same Flex-first movement rightward. |
+| 9 | Rotate left | Roll the camera counterclockwise; hold at the limit. |
+| 10 | Rotate right | Roll the camera clockwise; hold at the limit. |
+| 11 | Bird-eye view | Move to a level view looking 30° downward. |
+| 12 | Reset | Reset Flex to saved zero; in RCM, also restore UR5 tip tilt while preserving the pivot and insertion depth. |
+| 13 | Clean lens | Run the lens-cleaning sequence. |
+| 14 | Spray water | Spray water for three seconds. |
+| 15 | Spray air | Spray air for three seconds. |
+| 16 | Tracking | Follow the selected detection category using Flex and UR5 assistance. |
 
-Run `python src/app.py --help` for all options. The mutually exclusive `--camera-only`, `--flex-only`, and `--arm-only` modes select passive preview, Flex control, or UR5 control with modeled Flex, respectively. Running without a mode flag selects the full system. Direct Python launches using Flex require a separately running native driver; the PowerShell launcher manages that driver but exposes only the options in the launcher table.
+Tasks lock manual robot controls. Continuous Tasks 1–10 and 16 stay selected until stopped, replaced, or failed, including when holding at a limit. Tasks 11–15 return to Stop after confirmed completion. Use INTERRUPT to regain manual control.
 
-The bundled YOLO model uses the categories defined in `src/scope/yolo.py`: person, bottle, cup, banana, and chair. When using a custom model, update `CATEGORIES` and `COLORS` in that file to match its class IDs and labels. Camera capture defaults (resolution and frame rate) are defined in `src/scope/camera.py`.
+Look Tasks 5–8 and Reset require active RCM when the UR5 is connected. Tracking also requires calibrated Flex and fresh camera observations. Flex-only mode omits UR5 assistance and cannot run Tasks 1, 2, 11, or 16. Camera-only mode supports zoom Tasks 3 and 4; arm-only modeled mode cannot run Tasks 13–16. Pump tasks require the Flex driver and ready outputs.
 
-During a session, use the dashboard to set arm/Flex speed and motion limits, calibrate Flex, select a detection category, and control recording. Launch settings and runtime configuration changes are retained with the recordings.
+## Record and replay
 
-### Replay a recording
+Press **RECORD** or `Alt+R` to start or stop recording. Sessions are saved under `recordings/` in five-minute slices; the slice index starts at `00000` and the timer resets for each slice. Recordings include camera frames, robot state, commands, task events, and speech results. Raw microphone audio is not saved.
 
-Use **RECORD** in the dashboard to save a session under `recordings/`. The viewer reads saved files without connecting to the robot or camera. Replace `SESSION_ID` below with your session directory name:
+Click **Open recording viewer** beside the recording controls, or open [the dashboard viewer](http://127.0.0.1:8080/viewer). Select a session and use play/pause, seek, and playback speed to inspect the camera, motion charts, and event timeline.
+
+To replay without starting cameras or robot connections:
 
 ```powershell
-# Inspect the first five minutes of a saved session.
-python src/recording_viewer.py recordings/SESSION_ID
-
-# Export a plot or print an activity/configuration summary.
-python src/recording_viewer.py recordings/SESSION_ID --output activity.png
-python src/recording_viewer.py recordings/SESSION_ID --summary
-
-# Follow the latest recording while it is being written.
-python src/recording_viewer.py recordings --live
+conda activate crf
+python src/recording_web.py
+# Or show one session:
+python src/recording_web.py recordings/SESSION_ID --port 8081
 ```
 
-![Recording viewer with activity traces and camera replay](imgs/recording_viewer.png)
+Open [the standalone viewer](http://127.0.0.1:8081/viewer). Use **REFRESH** to reload the session list.
 
-### Code layout
+For desktop playback or plot export:
 
-| Path | Role |
+```powershell
+python src/recording_viewer.py recordings/SESSION_ID
+python src/recording_viewer.py recordings/SESSION_ID --output activity.png
+python src/recording_viewer.py recordings/SESSION_ID --summary
+```
+
+## Troubleshooting
+
+| Symptom | What to check |
 | --- | --- |
-| `src/app.py`, `src/static/` | Application entry point, HTTP API, and dashboard. |
-| `src/flex_endo_robo/` | Control coordinator, RTDE relay, kinematics, and URDF. |
-| `src/flex_endo_robo/flex_endo/` | Python Flex interface, native driver, and launcher. |
-| `src/scope/` | Camera capture and YOLO perception. |
-| `src/status.py`, `src/recording_viewer.py` | Session recording and replay. |
-| `src/tasks.py`, `tasks.md` | Task execution and task reference. |
-| `tests/` | Hardware-free Python checks and native driver tests with mocked GTS calls. |
-| `environment.yaml` | Pinned Windows Conda environment. |
+| Driver executable missing | Build the selected Debug/Release x86 configuration and check the path in [setup](#3-build-the-flex-driver). |
+| Launcher asks for the environment | Run `conda activate crf` in the same terminal. |
+| Driver already running | End the previous control session before relaunching. |
+| Camera unavailable | Check the connection and camera index; try camera-only mode. |
+| Speech models unavailable | Run the model `doctor` and `download` commands in [setup](#2-prepare-the-speech-models). |
+| Task refused or controls locked | Read the console, check device readiness, calibration and RCM requirements, exit Freedrive, then INTERRUPT before retrying. |
 
-The environment installs `kdl-parser-jvytee`. The `dependencies/kdl_parser` submodule is an upstream source reference with its own [documentation](dependencies/kdl_parser/README.md) and [license](dependencies/kdl_parser/LICENSE).
+The console shows device and task messages. Each app run also saves warnings, errors, and tracebacks to `logs/`, independently of recording.
+
+For code layout, advanced settings, tests, and implementation notes, see [development documentation](docs/DEVELOPMENT.md). Repository guidance for coding agents is in [AGENTS.md](AGENTS.md).

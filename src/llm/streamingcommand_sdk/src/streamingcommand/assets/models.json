@@ -1,0 +1,251 @@
+{
+  "asr-base": {
+    "repo_id": "Qwen/Qwen3-ASR-1.7B",
+    "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+    "files": {
+      "chat_template.json": {
+        "sha256": "75a8cfca24f00de72d796fbfed6858fc9614ef3dabd8696684cc3bc03a9c58ff",
+        "size": 1161
+      },
+      "config.json": {
+        "sha256": "2e74a751548b8ad7d7526d29365ad8144c345d8b412b1152d25dc6698452712f",
+        "size": 6194
+      },
+      "generation_config.json": {
+        "sha256": "1da527824d81e07118facff437e03f2e24a23311e3bdeb2368973fe77e5f275c",
+        "size": 142
+      },
+      "merges.txt": {
+        "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        "size": 1671853
+      },
+      "model-00001-of-00002.safetensors": {
+        "sha256": "a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6",
+        "size": 4220320824
+      },
+      "model-00002-of-00002.safetensors": {
+        "sha256": "6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc",
+        "size": 478200688
+      },
+      "model.safetensors.index.json": {
+        "sha256": "f994739fe38e5210b9e3e8ce6c6307315e2ceac3cb630e7b7414d69dce520f60",
+        "size": 64821
+      },
+      "preprocessor_config.json": {
+        "sha256": "45e120a4eda2c20c5d7f2ea9354e63536bf35e27aa573fb7cdf78017b378770d",
+        "size": 330
+      },
+      "tokenizer_config.json": {
+        "sha256": "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+        "size": 12487
+      },
+      "vocab.json": {
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "size": 2776833
+      }
+    }
+  },
+  "llm-base": {
+    "repo_id": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "files": {
+      "chat_template.jinja": {
+        "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+        "size": 7755
+      },
+      "config.json": {
+        "sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+        "size": 2907
+      },
+      "merges.txt": {
+        "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+        "size": 3353259
+      },
+      "model.safetensors-00001-of-00001.safetensors": {
+        "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+        "size": 1746942600
+      },
+      "model.safetensors.index.json": {
+        "sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e",
+        "size": 50900
+      },
+      "tokenizer.json": {
+        "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "size": 12807982
+      },
+      "tokenizer_config.json": {
+        "sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+        "size": 16709
+      },
+      "vocab.json": {
+        "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+        "size": 6722759
+      }
+    }
+  },
+  "language": {
+    "repo_id": "FunAudioLLM/SenseVoiceSmall",
+    "revision": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
+    "files": {
+      "am.mvn": {
+        "sha256": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5",
+        "size": 11203
+      },
+      "chn_jpn_yue_eng_ko_spectok.bpe.model": {
+        "sha256": "aa87f86064c3730d799ddf7af3c04659151102cba548bce325cf06ba4da4e6a8",
+        "size": 377341
+      },
+      "config.yaml": {
+        "sha256": "f71e239ba36705564b5bf2d2ffd07eece07b8e3f2bbf6d2c99d8df856339ac19",
+        "size": 1855
+      },
+      "configuration.json": {
+        "sha256": "02810a7f8e9e8aee10370a265f7e799728ce25b4c00cdbf4602b303ee395a38e",
+        "size": 396
+      },
+      "model.pt": {
+        "sha256": "833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea",
+        "size": 936291369
+      }
+    }
+  },
+  "asr": {
+    "repo_id": "humoiww/PhonoCommand-ASR",
+    "revision": "ff8daaafd4a7fd4b396c2ffcab8da230d3c17a4f",
+    "files": {
+      "chat_template.json": {
+        "sha256": "75a8cfca24f00de72d796fbfed6858fc9614ef3dabd8696684cc3bc03a9c58ff",
+        "size": 1161
+      },
+      "config.json": {
+        "sha256": "294131d7804f1e0f460a48cc74d9ecf3cef0a68aee134347cad8de7d80447931",
+        "size": 5818
+      },
+      "generation_config.json": {
+        "sha256": "832bbd42924612ea75208679eb8306d28f47c5f05d742f4dcd77ae2654bf89e0",
+        "size": 143
+      },
+      "merges.txt": {
+        "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        "size": 1671853
+      },
+      "model-00001-of-00003.safetensors": {
+        "sha256": "f1015f9ec194ab3e7db0df01e9a0c2383b149154d5a8d11b733e63f12ea2c5ed",
+        "size": 1987213512
+      },
+      "model-00002-of-00003.safetensors": {
+        "sha256": "a0ee646f66b9e05875fbb59f8e3e232eb290c405643a76703772e6e6daffd7ef",
+        "size": 1996688400
+      },
+      "model-00003-of-00003.safetensors": {
+        "sha256": "3197a1e9474593b7ca7d0c7fee9f0a3614bba009dd07db0a6d46fc84b3e2a5da",
+        "size": 92288792
+      },
+      "model.safetensors.index.json": {
+        "sha256": "3c8acc2c922d56d36d1297859025227588dc7339e94631a997e03ed3e7363ec1",
+        "size": 64802
+      },
+      "preprocessor_config.json": {
+        "sha256": "45e120a4eda2c20c5d7f2ea9354e63536bf35e27aa573fb7cdf78017b378770d",
+        "size": 330
+      },
+      "tokenizer_config.json": {
+        "sha256": "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+        "size": 12487
+      },
+      "vocab.json": {
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "size": 2776833
+      }
+    }
+  },
+  "speech": {
+    "repo_id": "humoiww/PhonoCommand-ASR",
+    "revision": "ff8daaafd4a7fd4b396c2ffcab8da230d3c17a4f",
+    "prefix": "silero_vad/",
+    "files": {
+      "LICENSE": {
+        "sha256": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b",
+        "size": 1075
+      },
+      "PROVENANCE.json": {
+        "sha256": "8e47e81934a239a774a5f85f9834a92ba7dd4073ff2abaeae77aebbea0113ce0",
+        "size": 1138
+      },
+      "silero_vad.onnx": {
+        "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+        "size": 2327524
+      }
+    }
+  },
+  "phonocommand-llm-0.8b": {
+    "repo_id": "humoiww/PhonoCommand-LLM-0.8B",
+    "revision": "f5824a4b36af0ff66dfa2d916fcf0b6166fe22fc",
+    "files": {
+      "adapter_config.json": {
+        "sha256": "8fd7bf25222c94036b4bb3217dd08ad46b30de58de14c7beb94603b802e90072",
+        "size": 1335
+      },
+      "adapter_model.safetensors": {
+        "sha256": "0173479a2d871b69621e3b57a8f1c09303a7af2fa385ee1821696e9efd4876f2",
+        "size": 22088304
+      },
+      "head.safetensors": {
+        "sha256": "9ee68d1001fedd8fd14da15f6085eca645917a9b19cca8cef390d61b41b0af46",
+        "size": 1640404
+      },
+      "experiment.json": {
+        "sha256": "7db3a5ec9d4e09f7d67081a3d4690013b7137896b01ee84bd58dae9e9a1d368b",
+        "size": 2894
+      }
+    }
+  },
+  "clarification-hybrid": {
+    "repo_id": "humoiww/PhonoCommand-LLM-0.8B",
+    "revision": "d5217d0c486933822da027600d7ceb9ed2d9bfb7",
+    "prefix": "clarification-hybrid/",
+    "files": {
+      "COMPLETE.json": {
+        "sha256": "709d2e9f7bfbeeca4787cd18a6cb11f0f66d3717f9beac924fe549a19fe0c94a",
+        "size": 457
+      },
+      "MANIFEST.json": {
+        "sha256": "7a11ed7b48ca07cbac92527ecdd6481143c0f7389d13d8d777744703e07ebeca",
+        "size": 1313
+      },
+      "README.md": {
+        "sha256": "c5d6ab6f93a7c6f4a3deb6e7f8dd7eb59ac4578d465c3001b1441e3e2343d497",
+        "size": 617
+      },
+      "adapter/adapter_config.json": {
+        "sha256": "de532cccfd674b5a205eb2f2519c71afbfffe54fcdc748dcf2a25dce17bbaebc",
+        "size": 1335
+      },
+      "adapter/adapter_model.safetensors": {
+        "sha256": "efbea478563b178e326d7a7a60ee5aaeeb108927a6dbb71ff96508e7f6e5ef01",
+        "size": 22088304
+      },
+      "clarify_head.pt": {
+        "sha256": "51a4a3355b2ae8a6605ab8e3290f0defabd76428a6f328de4b1a0333078aab36",
+        "size": 18895
+      },
+      "endoscope-hybrid.json": {
+        "sha256": "4dcda8181c39120b7ecf3dfdba94b65d69d75a4fa62700097dc781fa71707818",
+        "size": 583
+      },
+      "experiment.json": {
+        "sha256": "709d2e9f7bfbeeca4787cd18a6cb11f0f66d3717f9beac924fe549a19fe0c94a",
+        "size": 457
+      },
+      "head.safetensors": {
+        "sha256": "98dc089369cf30f8bc2a90360622d483b4bf2f59bd511a6ccbb5da95a699598a",
+        "size": 1640404
+      },
+      "integrity.json": {
+        "sha256": "a2aef06fd93ed589ede0fe929589baf34687c1baf42461839d6ebfe5f4c74982",
+        "size": 597
+      }
+    },
+    "expected_step": 1392
+  }
+}
