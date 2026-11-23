@@ -21,6 +21,7 @@ from status import Recorder, Status
 from keyboard_listener import KeyboardListener
 from tasks import TaskExecutor, TaskState
 from diagnostics import DiagnosticLog
+from scope.camera import CameraFeed
 
 
 class DashboardTests(unittest.TestCase):
@@ -114,6 +115,24 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual([category["id"] for category in json.loads(body)["categories"]],
                          [0, 39, 41, 46, 56])
         self.assertEqual([task['id'] for task in json.loads(body)['tasks']], list(range(1, 16)))
+
+    def test_perception_switch_categories_revisions_and_tracking_guard(self):
+        camera = CameraFeed()
+        with patch.object(self.server, 'camera', camera):
+            status, _, body = self.request('POST', '/api/camera/mode', '{"mode":"full","revision":0}')
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)['mode'], 'full')
+            self.assertEqual(len(json.loads(self.request('GET', '/api/config')[2])['categories']), 27)
+            self.assertEqual(self.request('POST', '/api/camera/category', '{"category":0}')[0], 400)
+            self.assertEqual(self.request('POST', '/api/camera/category', '{"category":10,"revision":0}')[0], 409)
+            self.assertEqual(self.request('POST', '/api/camera/category', '{"category":10,"revision":1}')[0], 200)
+            self.server.tasks.select(16)
+            self.assertEqual(self.request('POST', '/api/camera/mode', '{"mode":"test"}')[0], 409)
+            self.assertEqual(camera.status()['mode'], 'full')
+            self.server.tasks.select(0)
+            self.assertEqual(self.request('POST', '/api/camera/mode', '{"mode":"bad"}')[0], 400)
+            self.assertEqual(self.request('POST', '/api/camera/mode', '{"mode":"test"}')[0], 200)
+            self.assertEqual(camera.status()['stage']['status'], 'inactive')
 
     def test_task_selection_switching_and_interrupt_clear_held_inputs(self):
         self.server.node._key_state['arm_up'] = True

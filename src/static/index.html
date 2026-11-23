@@ -8,11 +8,12 @@
   <div class="brand-actions">
     <img class="lab-logo" src="/imgs/ABML_logo.png" alt="Advanced Bio-Medical Robotics Lab">
     <button id="theme-toggle" type="button" aria-pressed="false" title="Switch color mode">Light mode</button>
+    <button id="perception-toggle" type="button" aria-pressed="true" title="Switch between test detection and full surgical perception">Test mode</button>
   </div>
 </header>
 <main class="workspace">
-<section class="panel robot-panel" aria-labelledby="control-heading">
-<h2 id="control-heading">Flex-Endo-Robo</h2>
+<section class="panel robot-panel" id="robot-panel" aria-labelledby="control-heading">
+<h2 id="control-heading" class="sr-only">Flex-Endo-Robo</h2>
 <div class="panel-scroll" tabindex="0" aria-label="Robot controls">
   <div class="card primary-actions">
     <div class="actions">
@@ -161,11 +162,24 @@
   </div>
 </section>
 
-<section class="panel camera-panel" aria-labelledby="camera-heading">
-  <h2 id="camera-heading">SCOPE</h2>
+<section class="panel scope-panel" aria-labelledby="scope-heading">
+  <h2 id="scope-heading" class="sr-only">SCOPE</h2>
+  <div class="scope-content">
+<section class="panel camera-panel" aria-label="Camera view">
   <div class="camera-stage">
     <div class="camera">
-      <img id="camera-feed" alt="Live SCOPE camera with detection boxes">
+      <img id="camera-feed" alt="Live SCOPE camera with perception overlays">
+      <section class="panel stage-panel" id="surgical-stage" aria-labelledby="stage-heading" aria-disabled="true" data-inactive="true">
+        <div class="panel-scroll">
+          <section class="card stage-recognition" aria-label="Stage recognition">
+            <h3 id="stage-heading" class="scope-subheading">Surgical stage</h3>
+            <p id="stage-status" class="stage-status" role="status">Inactive in Test mode</p>
+            <ul id="stage-rail" class="stage-rail" aria-label="Surgical stages"></ul>
+            <p id="stage-context" class="stage-context">Elapsed / statistical duration (seconds).</p>
+          </section>
+        </div>
+      </section>
+      <span id="perception-mode-label" class="camera-mode">Test · boxes</span>
     </div>
   </div>
   <div id="camera-zoom-controls" class="camera-zoom" role="group" aria-label="Camera zoom">
@@ -194,9 +208,11 @@
     <span>Hold <kbd>=</kbd> to zoom in · <kbd>-</kbd> to zoom out</span>
   </p>
 </section>
+  </div>
+</section>
 
-<aside class="panel category-panel" aria-labelledby="categories-heading">
-  <h2 id="categories-heading">Vision-Language Interaction</h2>
+<aside class="panel category-panel" id="interaction-panel" aria-labelledby="categories-heading">
+  <h2 id="categories-heading" class="sr-only">Vision-Language Interaction</h2>
   <div class="panel-scroll">
     <section class="card llm-card" aria-labelledby="llm-heading">
       <div class="task-heading llm-heading">
@@ -209,16 +225,18 @@
     <section class="card" aria-labelledby="tasks-heading">
       <div class="task-heading">
         <h3 id="tasks-heading">Tasks</h3>
+        <p class="task-help">Select a task to execute. Spray water/air runs for 3 seconds. INTERRUPT stops.</p>
       </div>
-      <p class="task-help">Select a task to execute. Spray water/air runs for 3 seconds. INTERRUPT stops.</p>
       <div class="task-options" id="task-options" role="group" aria-label="Tasks"></div>
       <p class="shortcut-tips" aria-label="Task keyboard shortcut">
         <span><kbd>I</kbd> interrupt the current task</span>
       </p>
     </section>
     <section class="card" aria-labelledby="yolo-heading">
-      <h3 id="yolo-heading">YOLO</h3>
-      <button id="tracking" type="button" aria-pressed="false" title="Task 16 · Track selected category · Alt+T" aria-keyshortcuts="Alt+t" disabled>16 · TRACKING</button>
+      <div class="task-heading">
+        <h3 id="yolo-heading">YOLO</h3>
+        <button id="tracking" type="button" aria-pressed="false" title="Task 16 · Track selected category · Alt+T" aria-keyshortcuts="Alt+t" disabled>16 · TRACKING</button>
+      </div>
       <div class="category-options" id="category-options" role="group" aria-label="YOLO categories"></div>
       <p class="shortcut-tips" aria-label="YOLO keyboard shortcut">
         <span><kbd>Alt</kbd>+<kbd>T</kbd> start/stop tracking</span>

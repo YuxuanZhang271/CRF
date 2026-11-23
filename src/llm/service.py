@@ -307,6 +307,8 @@ class LLMService:
     async def _dispatch(self, event, generation, expected_revision=None):
         from tasks import TaskCoordinator
         from scope.yolo import CATEGORIES
+        def current_categories():
+            return getattr(self.server.camera, 'categories', lambda: CATEGORIES)()
         try:
             task_id = task_for(event['slots'])
             camera_selection = None
@@ -322,7 +324,7 @@ class LLMService:
                 camera_revision, category = camera_selection
                 self._publish({'type': 'command.waiting', 'segment_id': event.get('segment_id'),
                     'generation': generation,
-                    'message': f'Waiting for a fresh YOLO observation for {CATEGORIES.get(category, "the selected category")}.'})
+                    'message': f'Waiting for a fresh YOLO observation for {current_categories().get(category, "the selected category")}.'})
                 observation = self.server.camera.wait_for_observation(camera_revision, category,
                     cancelled=lambda: not valid() or self.server.stopping or
                         self.server.tasks.snapshot()['revision'] != revision)
@@ -337,7 +339,8 @@ class LLMService:
                         return {'ok': False, 'error': 'Task changed after the voice command started.'}, 409
                     target = event['slots']['T']
                     if task_id == 16 and target != 'none':
-                        category = next((k for k, name in CATEGORIES.items() if name == target), None)
+                        category = next((k for k, name in current_categories().items()
+                                         if name.casefold() == target.casefold()), None)
                         if category is None:
                             raise ValueError(f'The current detector cannot track {target!r}.')
                         if self.server.tasks.snapshot()['id'] != 0:

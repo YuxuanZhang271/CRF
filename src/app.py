@@ -31,7 +31,8 @@ from flex_endo_robo.flex_endo.flex_control import MAX_FLEX_BEND_DEG, MIN_FLEX_BE
 from flex_endo_robo.flex_endo.flex_ipc import MIN_SPEED_DEG_S, SPEED_PRESETS_DEG_S, FlexClient
 from flex_endo_robo.ur5_rtde_server import TCP_HOST, TCP_PORT, UR5_IP, open_relay, serve_relay
 from scope.camera import CAMERA_INDEX, CameraFeed
-from scope.yolo import CATEGORIES, COLORS, MODEL_PATH
+from scope.yolo import MODEL_PATH
+from scope.catalog import SURGICAL_MODEL_PATH, TEMPORAL_MODEL_PATH, TIPS_PATH, category_metadata
 from status import COMMAND_NAMES, RECORDINGS_DIR, Recorder, Status, app_state
 from keyboard_listener import KeyboardListener
 from tasks import (
@@ -128,10 +129,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({
                 'tasks': [{'id': i, 'label': name}
                           for i, name in enumerate(TASK_NAMES) if 1 <= i <= 15],
-                'categories': [
-                    {'id': class_id, 'label': label.title(), 'color': '#%02x%02x%02x' % COLORS[class_id][::-1]}
-                    for class_id, label in CATEGORIES.items()
-                ],
+                'categories': category_metadata(self.server.camera.status().get('mode', 'test')),
             })
         elif url.path == '/api/camera/state':
             self._json(self.server.camera.status())
@@ -257,15 +255,21 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == '/api/cmd/freedrive':
             return self._freedrive_command(body)
 
-        if self.path == '/api/camera/category':
-            if 'category' not in body:
+        if self.path in ('/api/camera/category', '/api/camera/mode'):
+            switching = self.path == '/api/camera/mode'
+            if not switching and 'category' not in body:
                 return self._json({'error': 'Expected a category ID or null'}, 400)
             try:
                 with self.server.node.control_lock:
                     if self.server.tasks.snapshot()['id'] == 16:
-                        return self._json({'error': 'Use INTERRUPT before changing the tracked category.'}, 409)
+                        return self._json({'error': 'Use INTERRUPT before changing the tracked category or perception mode.'}, 409)
+                    if self.server.stopping or self.server.interrupting:
+                        return self._json({'error': 'Wait for stopping to finish before changing perception.'}, 409)
                     prior = self.server.camera.status()['revision']
-                    state = self.server.camera.select_category(body['category'])
+                    if 'revision' in body and (type(body['revision']) is not int or body['revision'] != prior):
+                        return self._json({'error': 'Camera selection changed. Retry with the current state.'}, 409)
+                    state = (self.server.camera.select_mode(body.get('mode')) if switching
+                             else self.server.camera.select_category(body['category']))
                     if (self.server.node.flex and self.server.node.flex.task_direction is None
                             and state['revision'] != prior):
                         self.server.node.stop_camera_tracking()
@@ -532,6 +536,12 @@ def _run_app():
     ap.add_argument('--camera-roll-offset-deg', type=float, default=0.0,
                     help='Measured optical roll relative to the modeled Flex camera, about its forward axis')
     ap.add_argument('--model', type=Path, default=MODEL_PATH, help='Path to YOLO weights')
+    ap.add_argument('--surgical-model', type=Path, default=SURGICAL_MODEL_PATH,
+                    help='Paired Gastro28 segmentation weights for full perception mode')
+    ap.add_argument('--temporal-model', type=Path, default=TEMPORAL_MODEL_PATH,
+                    help='Gastro28 online temporal checkpoint (Causal MS-TCN or TeCNO)')
+    ap.add_argument('--stage-tips', type=Path, default=TIPS_PATH,
+                    help='JSON mapping stage IDs 1–7 to doctor tip text')
     ap.add_argument('--recordings-dir', type=Path, default=RECORDINGS_DIR,
                     help='Session recording output directory (default: recordings in repository root)')
     ap.add_argument('--llm-config', type=Path, default=Path(__file__).with_name('llm') / 'settings.json')
@@ -560,7 +570,9 @@ def _run_app():
                     args.robot_ip, TCP_HOST, relay_port, urdf_path=args.urdf,
                     rcm_point_local=args.rcm_local, tip_local=args.tip_local))
                 relay_port = relay_server.getsockname()[1]
-            srv.camera = resources.enter_context(CameraFeed(args.camera_index, args.model))
+            srv.camera = resources.enter_context(CameraFeed(args.camera_index, args.model,
+                surgical_model=args.surgical_model, temporal_model=args.temporal_model,
+                stage_tips=args.stage_tips))
             flex = (None if args.camera_only or args.arm_only else
                     FlexControl(FlexClient(), srv.camera,
                                 camera_roll_offset_deg=args.camera_roll_offset_deg))

@@ -15,13 +15,14 @@ from llm import LLMService
 from llm.mapping import task_for
 from llm.fast_stop import has_stop_word
 from tasks import TaskCoordinator, TaskState
+from scope.yolo import CATEGORIES
 
 
 def server():
     return SimpleNamespace(node=SimpleNamespace(control_lock=threading.RLock(),
             cmd_interrupt=Mock(return_value=None), flex_stop_delivered=False, flex=None),
         tasks=TaskState(), recorder=Mock(), executor=Mock(), stopping=False,
-        interrupting=False, relay=None, camera=Mock())
+        interrupting=False, relay=None, camera=Mock(categories=Mock(return_value=CATEGORIES)))
 
 
 class MappingTests(unittest.TestCase):

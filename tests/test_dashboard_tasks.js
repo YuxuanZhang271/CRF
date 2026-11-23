@@ -88,14 +88,17 @@ async function main() {
   `, context);
   vm.runInContext(source.slice(source.indexOf('function renderState('), source.indexOf('const cameraImage')), context);
   context.tasks = Array.from({length: 15}, (_, i) => ({id: i + 1, label: `Task ${i + 1}`, completable: i >= 11}));
-  context.state = {task: {id: 0, name: 'Stop', revision: 0}, arm_enabled: true,
+  context.renderInput = {task: {id: 0, name: 'Stop', revision: 0}, arm_enabled: true,
     relay_connected: true, joints_received: true, kinematics_ready: true,
     arm_moving: false, arm_mode: 'rcm', rcm_enabled: true,
     flex_hardware: {connected: true, positioning_ready: true, moving: false, fault: 0,
       busy: false, tracking: false, setup_encoder_mismatch: false, recheck_pending: false,
       calibrated: true, bend_limit_supported: true, roll_jog_supported: true,
       tracking_horizon_supported: true, water_ready: true, gas_ready: true}};
-  vm.runInContext('renderTaskButtons(tasks); renderRecording({active:false}); renderState(state)', context);
+  // A browser has no global `state`: renderState must use its parameter.
+  // Use a distinct fixture name so an accidental global state reference fails.
+  assert.equal(vm.runInContext('typeof state', context), 'undefined');
+  vm.runInContext('renderTaskButtons(tasks); renderRecording({active:false}); renderState(renderInput)', context);
   assert.equal(get('task-options').children.length, 15);
   assert.equal(get('calibrate').disabled, false);
   assert.equal(get('arm-up').disabled, false);
@@ -106,8 +109,8 @@ async function main() {
   await vm.runInContext('toggleFreedrive()', context);
   assert.ok(requests.some(item => item.url === '/api/cmd/freedrive' &&
     item.body.enabled === true && typeof item.body.lease === 'string'));
-  context.state.freedrive_active = true;
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.freedrive_active = true;
+  vm.runInContext('renderState(renderInput)', context);
   assert.equal(get('arm-freedrive').attrs['aria-pressed'], 'true');
   assert.equal(get('arm-freedrive').disabled, false);
   for (const id of ['arm-up', 'arm-reset', 'arm-mode', 'arm-apply', 'flex-up', 'calibrate']) {
@@ -121,12 +124,12 @@ async function main() {
   assert.equal(requests.length, duringFreedrive);
   await vm.runInContext('toggleFreedrive()', context);
   assert.equal(requests.at(-1).body.enabled, false);
-  context.state.freedrive_active = false;
-  context.state.freedrive_transition = true;
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.freedrive_active = false;
+  context.renderInput.freedrive_transition = true;
+  vm.runInContext('renderState(renderInput)', context);
   assert.equal(get('arm-freedrive').disabled, true, 'Wait for the exit handoff');
-  context.state.freedrive_transition = false;
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.freedrive_transition = false;
+  vm.runInContext('renderState(renderInput)', context);
   assert.equal(get('arm-up').disabled, false);
   assert.equal(get('arm-freedrive').attrs['aria-pressed'], 'false');
 
@@ -144,7 +147,7 @@ async function main() {
     item.url === '/api/cmd/freedrive' && item.body.enabled === true));
   assert.ok(requests.slice(beforeQuickRelease).some(item =>
     item.url === '/api/cmd/freedrive' && item.body.enabled === false));
-  vm.runInContext('renderState(state)', context);
+  vm.runInContext('renderState(renderInput)', context);
 
   // Pending selection locks immediately and releases a previously held input.
   vm.runInContext("held.set('arm_up', 1)", context);
@@ -160,7 +163,7 @@ async function main() {
   assert.equal(get('task-options').children[11].attrs['aria-pressed'], 'true');
 
   // Old polling responses and independent recording polls cannot unlock a task.
-  vm.runInContext('renderState(state); renderRecording({active:true})', context);
+  vm.runInContext('renderState(renderInput); renderRecording({active:true})', context);
   assert.ok(left.filter(button => button.id !== 'interrupt').every(button => button.disabled));
   assert.equal(vm.runInContext('currentTask.id', context), 12);
   const beforeBlocked = requests.length;
@@ -172,29 +175,29 @@ async function main() {
   await vm.runInContext('selectTask(12)', context);
   assert.equal(requests.length, beforeRepeat);
   assert.equal(vm.runInContext('currentTask.id', context), 12);
-  context.state.task = {id: 0, name: 'Stop', revision: 2};
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.task = {id: 0, name: 'Stop', revision: 2};
+  vm.runInContext('renderState(renderInput)', context);
   assert.equal(get('calibrate').disabled, false);
   assert.equal(get('arm-up').disabled, false);
   assert.equal(get('record').disabled, false);
   assert.equal(get('tracking').disabled, true);
-  vm.runInContext('selectedCategory = 39; renderState(state)', context);
+  vm.runInContext('selectedCategory = 39; renderState(renderInput)', context);
   assert.equal(get('tracking').disabled, false, 'Tracking is executable with a selected category and ready devices');
-  context.state.task = {id: 3, name: 'Zoom in', revision: 3, zoom: 1.5, phase: 'running'};
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.task = {id: 3, name: 'Zoom in', revision: 3, zoom: 1.5, phase: 'running'};
+  vm.runInContext('renderState(renderInput)', context);
   assert.equal(vm.runInContext('cameraZoom', context), 1.5);
   assert.equal(get('camera-zoom').disabled, true);
-  context.state.task = {id: 0, name: 'Stop', revision: 4, zoom: 1.5};
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.task = {id: 0, name: 'Stop', revision: 4, zoom: 1.5};
+  vm.runInContext('renderState(renderInput)', context);
   assert.equal(get('camera-zoom').disabled, false);
-  context.state.task = {id: 16, name: 'Tracking', revision: 5};
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.task = {id: 16, name: 'Tracking', revision: 5};
+  vm.runInContext('renderState(renderInput)', context);
   assert.equal(get('tracking').disabled, false, 'The active tracking button remains available for cancellation');
   assert.equal(get('tracking').attrs['aria-pressed'], 'true');
   assert.equal(get('arm-up').disabled, true);
-  context.state.task = {id: 0, name: 'Stop', revision: 6};
-  context.state.flex_hardware.fault = 1;
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.task = {id: 0, name: 'Stop', revision: 6};
+  context.renderInput.flex_hardware.fault = 1;
+  vm.runInContext('renderState(renderInput)', context);
   assert.equal(get('calibrate').disabled, true);
 
   vm.runInContext('stateFeedReady = false; applyTaskLock(); renderRecording({active:true})', context);
@@ -202,20 +205,19 @@ async function main() {
   assert.ok(left.filter(button => button.id !== 'interrupt').every(button => button.disabled));
   assert.equal(get('interrupt').disabled, false);
 
-  // Categories keep their detector IDs; empty slots have no actions or tab stops.
+  // Categories keep their detector IDs and have no empty placeholder slots.
   vm.runInContext('function changeCategory() {}', context);
   vm.runInContext(source.slice(source.indexOf('function renderCategoryButtons('), source.indexOf('async function init(')), context);
   context.categories = [0, 39, 41, 46, 56].map(id => ({id, label: `Category ${id}`, color: '#fff'}));
   vm.runInContext('renderCategoryButtons(categories)', context);
-  assert.equal(get('category-options').children.length, 27);
+  assert.equal(get('category-options').children.length, 5);
   assert.deepEqual(get('category-options').children.slice(0, 5).map(button => button.children.at(-1).textContent), [0, 39, 41, 46, 56]);
-  assert.ok(get('category-options').children.slice(5).every(slot => slot.attrs['aria-hidden'] === 'true' && !Object.keys(slot.listeners).length));
   // STOP must still send its request after its handler sets the local stopping flag.
-  context.state.flex_hardware.fault = 0;
-  vm.runInContext('renderState(state)', context);
+  context.renderInput.flex_hardware.fault = 0;
+  vm.runInContext('renderState(renderInput)', context);
   await vm.runInContext('stopSession()', context);
   assert.ok(requests.some(item => item.url === '/api/cmd/stop'));
   assert.equal(vm.runInContext('sessionStopped', context), true);
-  console.log('Task selection, completion, stale responses, pending locks, releases, readiness restoration and 27 category slots passed.');
+  console.log('Task selection, completion, stale responses, pending locks, releases, readiness restoration and category buttons passed.');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

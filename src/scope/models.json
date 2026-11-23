@@ -1,0 +1,8 @@
+{
+  "source": "endo_agent/handoff_gastro28_dual_shared_READY/assets",
+  "files": [
+    {"name": "gastro28_yolo26m_seg.pt", "bytes": 54552170, "sha256": "4061864912078b3ac3d0e262389892aec6b31ae06b4a8f1e191754fea3c667cb"},
+    {"name": "YOLO26m_CausalMSTCN_fold0.pt", "bytes": 2225722, "sha256": "32666116d6f6b89a3df53b49f2571faf08c90ebd788eb19e96bb8b4d5fa384d8"},
+    {"name": "YOLO26m_TeCNO_fold0.pt", "bytes": 1540842, "sha256": "abc3474633233e3aae2c5dc5552aaffcd8bb361517b914693d91eb0ecfd88a79"}
+  ]
+}

@@ -112,7 +112,19 @@ For another camera or YOLO model in camera-only mode:
 python src/app.py --camera-only --camera-index 1 --model path/to/weights.pt --port-web 8081
 ```
 
-The bundled detector supports **person, bottle, cup, banana, and chair**. Custom models need matching class labels in `src/scope/yolo.py`. During operation, set arm/Flex speed and motion limits in the dashboard and click **APPLY**.
+The dashboard starts in **Test mode**, using the bundled detector for **person, bottle, cup, banana, and chair**. Click **Test mode** beside **Light mode** to turn testing off and enter **Full mode**: Gastro28 surgical segmentation and temporal stage recognition. The current mode appears beside SCOPE. This perception setting is independent of the camera-only/Flex-only/full-system launch options.
+
+Full mode requires these local files under `models/scope/` (already installed on the integration PC):
+
+| File | Source in the supplied Gastro28 handoff package |
+| --- | --- |
+| `gastro28_yolo26m_seg.pt` | `assets/vision_checkpoints/Gastro28/YOLO26/yolo26m-seg/fold0/train/weights/best.pt` |
+| `YOLO26m_CausalMSTCN_fold0.pt` | `assets/temporal_checkpoints/Gastro28/YOLO26m_CausalMSTCN_fold0.pt` |
+| `YOLO26m_TeCNO_fold0.pt` (optional alternative) | `assets/temporal_checkpoints/Gastro28/YOLO26m_TeCNO_fold0.pt` |
+
+Copy and rename the paired weights as shown when setting up another PC. Model files are ignored by Git. The segmentation weights must match the temporal checkpoint; unrelated 28-class models cannot be substituted. Use `--surgical-model PATH` and `--temporal-model PATH` for other local locations. Missing or incompatible models produce dashboard errors while camera preview remains available; switch back to Test mode to resume the bundled detector. There are no model downloads during operation.
+
+Custom **test** detectors need matching class labels in `src/scope/yolo.py`. During operation, set arm/Flex speed and motion limits in the dashboard and click **APPLY**.
 
 See [advanced configuration](docs/DEVELOPMENT.md#advanced-configuration) for geometry, microphone, model settings, output directories, and direct Python launch options.
 
@@ -142,11 +154,23 @@ Check the installed tool's payload and center of gravity on the pendant before h
 
 Select a detection category, calibrate Flex, and enable UR5 RCM. Press **TRACKING** or `Alt+T` to start Task 16. The button is green while tracking, sky blue while waiting for a target, and yellow when motion is limited. Press the same command again or INTERRUPT to stop.
 
+The YOLO section switches between five test categories and 27 surgical categories; background is excluded. Use INTERRUPT before changing perception mode during tracking. A mode change clears the selected category and previous tracking observations, so select the new target before restarting tracking.
+
+### Surgical stage recognition
+
+On desktop, each side panel takes one quarter of the available column width, leaving half for the camera. The translucent stage card floats over the camera's upper-left corner. The camera stays square (1:1), scaling to the available width or height, whichever is smaller. At 1x zoom the full source image is retained; non-square sources are letterboxed. On small screens, scroll inside the stage card to see the full list.
+
+Full mode segments the latest available frames as fast as inference allows. An independent stage worker samples the same raw camera stream at **1 Hz**, using its own segmentation pass and Causal MS-TCN temporal head. Confidence appears inside the model's top three stage boxes, with the current stage highlighted; a dash means no score was returned for that stage. Stage IDs and names are in the [development guide](docs/DEVELOPMENT.md#gastro28-perception).
+
+Stages before the current recognized stage light up with full vertical timing segments; for example, recognizing stage 6 lights stages 1–5. The current stage's segment fills using **elapsed time / statistical duration**. The fixed durations for stages 1–7 are **40.8, 568.8, 101.4, 583.8, 490.2, 830.4, and 216.6 seconds**. The highlighted stage shows elapsed and statistical duration in seconds. Elapsed time resets when the recognized stage changes or temporal context resets; timing is hidden while recognition is stale. The fill caps at 100% while the elapsed timer continues. Earlier-stage highlights follow the current stage number and clear if recognition moves backward, becomes stale, or enters Test mode. Confidence scores remain the model's current predictions. These highlights and timing ratios do not verify surgical completion.
+
+In Test mode the stage card stays visible but inactive; stage inference stops and predictions are cleared. Switching perception mode or a gap in stage sampling resets temporal context. Selecting another category leaves stage context intact.
+
 ### Voice commands
 
 The app recognizes speech in the background. Press **LISTEN** or `Alt+L` to enable task triggering, then speak a command such as “move forward,” “look left,” “zoom in,” or “track the bottle.” Check the transcript and task result in the LLM panel.
 
-With LISTEN enabled, the standalone English word **stop** triggers Task 0 as soon as it appears in recognition. Turning LISTEN off leaves an already-running task active; use INTERRUPT or `I` to stop it. Voice tracking supports the five detector categories above; a tracking command without a named target uses the selected category. Surgical target names are not supported by the bundled detector.
+With LISTEN enabled, the standalone English word **stop** triggers Task 0 as soon as it appears in recognition. Turning LISTEN off leaves an already-running task active; use INTERRUPT or `I` to stop it. Voice tracking resolves names against the active perception mode's categories; a command without a named target uses the selected category. Surgical names require Full mode.
 
 ## Keyboard shortcuts
 

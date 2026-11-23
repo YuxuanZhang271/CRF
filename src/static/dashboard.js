@@ -429,8 +429,7 @@ async function pollState() {
     renderMeasurements();
     renderStatusBar({});
     renderTask(null);
-    document.getElementById('task-message').textContent = 'Task status unavailable; manual controls locked.';
-    document.getElementById('task-message').title = 'Task status unavailable; manual controls locked.';
+    document.getElementById('task-status').title = 'Task status unavailable; manual controls locked.';
     syncDeviceLimits('arm', null, null, null, false, false);
     syncDeviceLimits('flex', null, null, null, false, false);
     pullOutButton.disabled = true;
@@ -442,7 +441,7 @@ async function pollState() {
     releaseFreedrive();
     applyTaskLock();
     document.querySelectorAll('button[data-key]').forEach(button => { button.disabled = true; });
-    if (!stopping) reportStatus('state-feed', 'APP', 'Control state unavailable.', 'error');
+    if (!stopping) reportStatus('state-feed', 'APP', `Control state unavailable. ${e.message}`, 'error');
   }
   setTimeout(pollState, 200);
 }
@@ -790,6 +789,7 @@ function renderState(s) {
   zoomOut.disabled = taskZoom || cameraZoom === 1;
   if (taskZoom) stopZoom();
   categoryButtons.forEach(button => { button.disabled = currentTask?.id === 16; });
+  document.getElementById('perception-toggle').disabled = currentTask?.id === 16 || taskPending || s.stopping || s.interrupting || document.getElementById('perception-toggle').dataset.pending === 'true';
 }
 
 function setActivity(button, state) {
@@ -799,7 +799,7 @@ function setActivity(button, state) {
 
 const cameraImage = document.getElementById('camera-feed');
 const zoomControls = document.getElementById('camera-zoom-controls');
-// Match the actual square viewport, including when its height limits its width.
+// Keep zoom controls aligned with the camera viewport as the workspace resizes.
 new ResizeObserver(([entry]) => {
   zoomControls.style.width = `${entry.borderBoxSize[0].inlineSize}px`;
 }).observe(cameraImage.parentElement);
@@ -959,17 +959,136 @@ let selectedCategory = null;
 let viewRevision = -1;
 let categoryRequest = Promise.resolve();
 let categoryPending = 0;
+let categorySignature = '';
+let perceptionMode = 'test';
+const perceptionToggle = document.getElementById('perception-toggle');
+perceptionToggle.addEventListener('click', () => {
+  if (perceptionToggle.disabled) return;
+  categoryPending++;
+  perceptionToggle.dataset.pending = 'true';
+  perceptionToggle.disabled = true;
+  categoryRequest = categoryRequest.then(async () => {
+    try {
+      const response = await fetch('/api/camera/mode', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode: perceptionMode === 'test' ? 'full' : 'test', revision: viewRevision}),
+        signal: AbortSignal.timeout(3000)
+      });
+      const camera = await response.json();
+      if (!response.ok) throw new Error(camera.error || 'Could not switch perception mode');
+      renderCamera(camera);
+    } catch (error) {
+      writeOutput('SCOPE', error.message, 'error');
+    } finally {
+      categoryPending--;
+      delete perceptionToggle.dataset.pending;
+      perceptionToggle.disabled = currentTask?.id === 16 || taskPending || stopping;
+    }
+  });
+});
+
+function renderPerception(camera) {
+  perceptionMode = camera.mode || 'test';
+  const full = perceptionMode === 'full';
+  document.getElementById('category-options').dataset.mode = perceptionMode;
+  perceptionToggle.setAttribute('aria-pressed', String(!full));
+  perceptionToggle.disabled = currentTask?.id === 16 || taskPending || categoryPending > 0 || stopping;
+  perceptionToggle.title = full ? 'Switch to test bounding-box detection' : 'Switch to full surgical segmentation and stage recognition';
+  document.getElementById('perception-mode-label').textContent =
+    `${full ? 'Full · masks' : 'Test · boxes'}${camera.vision_status === 'loading' ? ' · Loading…' : camera.vision_status === 'error' ? ' · Unavailable' : ''}`;
+  const stage = camera.stage || {status: 'inactive', phases: [], top3: []};
+  const panel = document.getElementById('surgical-stage');
+  panel.dataset.inactive = String(!full);
+  panel.setAttribute('aria-disabled', String(!full));
+  const top = full ? stage.top3 || [] : [];
+  const active = top[0]?.id ?? null;
+  const status = document.getElementById('stage-status');
+  status.hidden = active !== null;
+  status.textContent = !full ? 'Inactive in Test mode' : stage.error ||
+    (stage.status === 'loading' ? 'Loading stage model…' : 'Waiting for a fresh stage prediction…');
+  status.dataset.level = full && stage.error ? 'error' : 'info';
+  const percent = value => value > 0 && value < .01 ? '<1%' : `${Math.round(value * 100)}%`;
+  const elapsed = active !== null && Number.isFinite(stage.phase_elapsed_s) ? Math.max(0, stage.phase_elapsed_s) : null;
+  const rail = document.getElementById('stage-rail');
+  rail.replaceChildren();
+  for (const phase of stage.phases || []) {
+    const item = document.createElement('li');
+    const passed = active !== null && phase.id < active;
+    item.dataset.passed = String(passed);
+    const index = document.createElement('span');
+    index.className = 'stage-index';
+    const number = document.createElement('span');
+    number.className = 'stage-number';
+    number.textContent = phase.id;
+    index.appendChild(number);
+    const track = document.createElement('span');
+    track.className = 'stage-time-track';
+    const timeFill = document.createElement('span');
+    timeFill.style.height = '0%';
+    const duration = phase.duration_s;
+    const hasDuration = Number.isFinite(duration) && duration > 0;
+    if (passed) {
+      timeFill.style.height = '100%';
+      track.setAttribute('role', 'progressbar');
+      track.setAttribute('aria-label', `${phase.name}: earlier than the current stage`);
+      track.setAttribute('aria-valuemin', '0');
+      track.setAttribute('aria-valuemax', '100');
+      track.setAttribute('aria-valuenow', '100');
+      track.setAttribute('aria-valuetext', 'Full: earlier than the current recognized stage');
+    } else if (phase.id === active && elapsed !== null && hasDuration) {
+      timeFill.style.height = `${Math.min(100, elapsed / duration * 100)}%`;
+      track.setAttribute('role', 'progressbar');
+      track.setAttribute('aria-label', `${phase.name}: elapsed time against statistical duration`);
+      track.setAttribute('aria-valuemin', '0');
+      track.setAttribute('aria-valuemax', String(duration));
+      track.setAttribute('aria-valuenow', String(Math.min(duration, elapsed)));
+      track.setAttribute('aria-valuetext', `${Math.floor(elapsed)} seconds elapsed / ${duration} seconds statistical duration`);
+    } else track.setAttribute('aria-hidden', 'true');
+    track.appendChild(timeFill);
+    index.appendChild(track);
+    const box = document.createElement('div');
+    box.className = 'stage-box';
+    if (hasDuration) box.title = `Statistical duration: ${duration} s`;
+    const label = document.createElement('span');
+    label.className = 'stage-name';
+    label.textContent = phase.name;
+    const score = document.createElement('span');
+    score.className = 'stage-score';
+    const prediction = top.find(value => value.id === phase.id);
+    score.textContent = prediction ? percent(prediction.prob) : '—';
+    box.dataset.predicted = String(Boolean(prediction));
+    const confidenceFill = document.createElement('span');
+    confidenceFill.className = 'stage-box-confidence';
+    confidenceFill.setAttribute('aria-hidden', 'true');
+    confidenceFill.style.width = prediction ? `${Math.max(0, Math.min(100, prediction.prob * 100))}%` : '0%';
+    box.append(label, score, confidenceFill);
+    if (phase.id === active) {
+      item.setAttribute('aria-current', 'step');
+      const timing = document.createElement('span');
+      timing.className = 'stage-elapsed';
+      timing.textContent = elapsed === null ? 'Waiting for timing…' : hasDuration ?
+        `${Math.floor(elapsed)} / ${duration} s` : `${Math.floor(elapsed)} s elapsed`;
+      box.appendChild(timing);
+    }
+    item.append(index, box);
+    rail.appendChild(item);
+  }
+  document.getElementById('stage-context').textContent = active === null ?
+    'Elapsed / statistical duration (seconds).' : 'Elapsed / statistical duration (seconds). Timer resets on stage changes.';
+}
 
 function renderCamera(camera) {
   if (camera.revision < viewRevision) return;
   viewRevision = camera.revision;
+  if (camera.categories && JSON.stringify(camera.categories) !== categorySignature) renderCategoryButtons(camera.categories);
   selectedCategory = camera.category;
+  renderPerception(camera);
   reportStatus('detector-state', 'YOLO', camera.detection_error || '', 'error');
   categoryButtons.forEach((button, id) => {
     button.setAttribute('aria-pressed', String(id === selectedCategory));
   });
   reportStatus('category', 'YOLO', selectedCategory === null ? 'Showing all categories.' :
-    `Showing ${categoryButtons.get(selectedCategory).dataset.label.toLowerCase()}.`);
+    `Showing ${categoryButtons.get(selectedCategory)?.dataset.label.toLowerCase() || 'selected category'}.`);
 
   const url = `/api/camera/stream?revision=${viewRevision}`;
   if (camera.ready) {
@@ -985,7 +1104,9 @@ cameraImage.addEventListener('error', () => {
   cameraImage.removeAttribute('src');
   if (!stopping) reportStatus('camera-stream', 'CAMERA', 'Camera stream interrupted.', 'error');
 });
-cameraImage.addEventListener('load', () => reportStatus('camera-stream', 'CAMERA', ''));
+cameraImage.addEventListener('load', () => {
+  reportStatus('camera-stream', 'CAMERA', '');
+});
 
 function changeCategory(id) {
   categoryPending++;
@@ -993,7 +1114,7 @@ function changeCategory(id) {
     try {
       const response = await fetch('/api/camera/category', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({category: selectedCategory === id ? null : id}),
+        body: JSON.stringify({category: selectedCategory === id ? null : id, revision: viewRevision}),
         signal: AbortSignal.timeout(3000)
       });
       const camera = await response.json();
@@ -1020,12 +1141,14 @@ async function pollCamera() {
 }
 
 function renderCategoryButtons(categories) {
+  categorySignature = JSON.stringify(categories);
   const options = document.getElementById('category-options');
   options.replaceChildren();
   categoryButtons.clear();
   for (const {id, label, color} of categories) {
     const button = document.createElement('button');
     button.type = 'button';
+    button.disabled = currentTask?.id === 16;
     button.dataset.label = label;
     button.style.setProperty('--class-color', color);
     button.setAttribute('aria-pressed', 'false');
@@ -1035,16 +1158,13 @@ function renderCategoryButtons(categories) {
     const number = document.createElement('span');
     number.className = 'category-id';
     number.textContent = id;
-    button.append(swatch, label, number);
+    const labelText = document.createElement('span');
+    labelText.className = 'category-label';
+    labelText.textContent = label;
+    button.append(swatch, labelText, number);
     button.addEventListener('click', () => changeCategory(id));
     categoryButtons.set(id, button);
     options.appendChild(button);
-  }
-  for (let i = categories.length; i < 27; i++) {
-    const slot = document.createElement('div');
-    slot.className = 'category-placeholder';
-    slot.setAttribute('aria-hidden', 'true');
-    options.appendChild(slot);
   }
 }
 

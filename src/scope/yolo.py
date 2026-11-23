@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 
 MODEL_PATH = Path(__file__).with_name("yolov8n.pt")
@@ -23,6 +24,7 @@ class Detection:
     class_id: int
     confidence: float
     bounds: tuple[int, int, int, int]
+    polygon: tuple[tuple[int, int], ...] = ()
 
     @property
     def center(self):
@@ -87,18 +89,32 @@ def select_target(detections, category, shape):
                  key=lambda item: item.confidence, default=None)
 
 
-def draw_detections(frame, detections, category):
+def draw_detections(frame, detections, category, *, categories=None, colors=None, segmentation=False):
     """Draw all visible detections and return the strongest selected target."""
     font = cv2.FONT_HERSHEY_SIMPLEX
+    categories = CATEGORIES if categories is None else categories
+    colors = COLORS if colors is None else colors
+    detections = [item for item in detections if category is None or item.class_id == category]
+    if segmentation:
+        overlay = frame.copy()
+        for item in detections:
+            if len(item.polygon) >= 3:
+                cv2.fillPoly(overlay, [np.asarray(item.polygon, dtype=np.int32)], colors[item.class_id])
+        cv2.addWeighted(overlay, .35, frame, .65, 0, dst=frame)
     for detection in detections:
         x1, y1, x2, y2 = detection.bounds
-        color = COLORS[detection.class_id]
-        label = f"{CATEGORIES[detection.class_id]} {detection.confidence:.2f}"
+        color = colors[detection.class_id]
+        label = f"{categories[detection.class_id]} {detection.confidence:.2f}"
         (width, height), baseline = cv2.getTextSize(label, font, 0.6, 2)
+        left = max(0, min(x1, frame.shape[1] - width - 8))
         top = max(0, y1 - height - baseline - 6)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.rectangle(frame, (x1, top), (x1 + width + 8, top + height + baseline + 6), color, -1)
-        cv2.putText(frame, label, (x1 + 4, top + height + 3), font, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+        if segmentation:
+            if len(detection.polygon) >= 3:
+                cv2.polylines(frame, [np.asarray(detection.polygon, dtype=np.int32)], True, color, 2)
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(frame, (left, top), (left + width + 8, top + height + baseline + 6), color, -1)
+        cv2.putText(frame, label, (left + 4, top + height + 3), font, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
 
     if category is None:
         return None

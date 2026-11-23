@@ -114,6 +114,26 @@ class TrackingStartTests(unittest.IsolatedAsyncioTestCase):
                       self.server.tasks.snapshot()['error'])
         self.assertFalse(self.server.interrupting)
 
+    async def test_full_mode_voice_uses_surgical_categories_and_mode_change_cancels_preparation(self):
+        self.camera.select_mode('full')
+        entered = threading.Event()
+        original = self.camera.wait_for_observation
+        def wait(*args, **kwargs):
+            entered.set()
+            return original(*args, **kwargs)
+        with patch.object(self.camera, 'wait_for_observation', side_effect=wait):
+            operation = asyncio.create_task(self.service._dispatch(self.command(target='liver'), 1, 0))
+            try:
+                await self.wait_entered(entered)
+                self.assertEqual(self.camera.status()['category'], 10)
+                self.camera.select_mode('test')
+                await asyncio.wait_for(operation, 1.)
+            finally:
+                if not operation.done():
+                    operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+        self.server.executor.activate.assert_not_called()
+
     async def test_changed_category_cannot_start_tracking_a_different_target(self):
         entered = threading.Event()
         original = self.camera.wait_for_observation

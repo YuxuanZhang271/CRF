@@ -55,10 +55,13 @@ clarification-hybrid command model, original recognition logic, and disabled
 CUDA graphs. The model manifest describes approximately 11.5 GB of downloads.
 The SDK validates pinned model file sizes and SHA-256 hashes.
 
-The current detector's person/bottle/cup/banana/chair target candidates are added
-alongside the original candidates. Surgical targets are explicitly rejected for
-tracking by the current YOLO model. `track` with target `none` uses the category
-currently selected in the dashboard.
+Test mode's person/bottle/cup/banana/chair target candidates and Full mode's
+Gastro28 surgical names are included alongside the original candidates. Dispatch
+resolves named targets against the active mode's category registry. Surgical
+targets require Full mode; test objects require Test mode. `track` with target
+`none` uses the category currently selected in the dashboard. A perception mode
+change clears that selection and cancels pending preparation for an old camera
+revision. Mode switching is blocked while Task 16 is active.
 
 Voice tracking selects the requested category, confirms motion has stopped, then
 waits up to two seconds for fresh inference for that exact camera revision before

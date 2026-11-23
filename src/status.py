@@ -109,7 +109,8 @@ class Status:
                   'control': {key: state.get(key) for key in CONFIG_FIELDS},
                   'flex': {key: state.get('flex_hardware', {}).get(key)
                            for key in FLEX_CONFIG_FIELDS},
-                  'camera': {'category': camera['category'], 'revision': camera['revision']}}
+                  'camera': {key: camera[key] for key in
+                             ('category', 'revision', 'mode', 'mode_revision') if key in camera}}
         llm = getattr(self.server, 'llm', None)
         if llm is not None:
             config['llm'] = {'config_path': str(llm.config), 'microphone': llm.device}

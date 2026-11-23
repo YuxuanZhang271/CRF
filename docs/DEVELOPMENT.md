@@ -13,6 +13,7 @@ Use the [README](../README.md) for setup, launching, controls, shortcuts, and ta
 | `src/flex_endo_robo/kinematics.py`, `ur5_endo_flex.urdf` | Kinematics and robot geometry; both are under `src/flex_endo_robo/`. |
 | `src/flex_endo_robo/flex_endo/` | Flex Python interface, native GTS driver, IPC, and PowerShell launcher. |
 | `src/scope/camera.py`, `src/scope/yolo.py` | Camera capture, inference, detector categories, and observations. |
+| `src/scope/catalog.py`, `surgical.py`, `temporal.py` | Mode metadata, Gastro28 masks, paired temporal model and independent stage inference. |
 | `src/tasks.py` | Task IDs, shared state, execution, stop confirmation, and HTTP/voice task coordination. |
 | `src/llm/` | Voice service, task mapping, fast Stop detection, dependency pins, and settings. |
 | `src/llm/streamingcommand_sdk/` | Vendored speech SDK, CLI, examples, licenses, and model provenance. |
@@ -31,6 +32,9 @@ Run `python src/app.py --help` for all options. Direct Python launches using Fle
 | --- | --- | --- |
 | `--camera-index` | `0` | DirectShow camera device index. |
 | `--model` | `src/scope/yolov8n.pt` | YOLO weights. |
+| `--surgical-model` | `models/scope/gastro28_yolo26m_seg.pt` | Paired Gastro28 segmentation weights for Full perception mode. |
+| `--temporal-model` | `models/scope/YOLO26m_CausalMSTCN_fold0.pt` | Online Causal MS-TCN checkpoint; the paired TeCNO checkpoint is also supported. |
+| `--stage-tips` | `src/scope/stage_tips.json` | Reserved JSON mapping stage IDs 1–7 to text, loaded at startup; not displayed in the current dashboard. |
 | `--host-web` / `--port-web` | `127.0.0.1` / `8080` | Dashboard bind address and port. |
 | `--robot-ip` / `--relay-port` | `192.168.1.10` / `9000` | UR5 address and local RTDE relay port. |
 | `--urdf` | `src/flex_endo_robo/ur5_endo_flex.urdf` | Robot/endoscope geometry. |
@@ -50,7 +54,106 @@ For example, select a microphone and configuration while previewing a camera:
 python src/app.py --camera-only --microphone "Microphone name" --llm-config src/llm/settings.json
 ```
 
-For a custom detector, update `CATEGORIES` and `COLORS` in `src/scope/yolo.py` to match its class IDs. Camera resolution and frame-rate defaults are in `src/scope/camera.py`. Launch settings and runtime configuration changes are retained in recordings.
+For a custom test detector, update `CATEGORIES` and `COLORS` in `src/scope/yolo.py` to match its class IDs. Full mode requires the paired Gastro28 weights. Camera resolution and frame-rate defaults are in `src/scope/camera.py`. Launch settings and runtime configuration changes are retained in recordings.
+
+## Gastro28 perception
+
+Perception starts in `test` independently of the hardware launch mode. The mode
+API is `POST /api/camera/mode` with `{"mode":"test"}` or `{"mode":"full"}`.
+Both this endpoint and `/api/camera/category` accept an optional `revision`;
+stale selections receive HTTP 409. Mode changes are rejected during Task 16 or
+stopping. Model loading occurs on the workers, outside the motion and camera
+locks. An accepted switch immediately increments the camera revision, clears
+the category, observations and overlays, and closes streams for the old
+revision. Results from old revisions cannot publish tracking observations.
+
+`GET /api/camera/state` includes active category metadata, mode and mode revision,
+vision loading/error status, and a stage object. `/api/config` also reports the
+active categories. Test IDs retain COCO numbering, including person at 0; Full
+mode exposes Gastro28 IDs 1–27. Background 0 is excluded. Voice dispatch resolves
+names case-insensitively using this same active registry; candidates include the
+surgical names, while unsupported names are rejected in the current mode.
+
+Three independent workers own capture, primary inference, and stage inference.
+Each inference worker consumes the latest raw frame rather than a queue. Test
+inference retains the existing YOLO boxes. Full inference uses all Gastro28
+classes at 512px, stores polygons in original frame coordinates, and filters only
+drawing and target selection. Mask overlays and tracking observations retain
+their capture timestamps and expire after 0.5 seconds.
+
+The stage worker loads its own YOLO and temporal head only in Full mode. It
+samples at most once per capture second, uses the same unmodified BGR frame,
+stretches it to 512×512, and extracts layer-22 neck/global/mask features with the
+supplied feature protocol. It does not share the primary predictor or run on the
+capture/motion threads. The neck hook attaches to the initialized predictor's
+actual model because the installed Ultralytics copies the original model during
+setup. Repeated-sample smoke tests cover this version-sensitive behavior.
+
+Mode changes release the previous worker models and discard causal history.
+Category changes preserve stage context. Sampling gaps over 2.5 seconds reset
+history rather than treating widely separated frames as consecutive 1 Hz input.
+Stage results older than three seconds are shown as waiting, with no active
+prediction or tip. The recent-history display retains at most 120 samples;
+Causal MS-TCN retains up to its 505-sample receptive field internally (TeCNO:
+509). GPU resource contention can still affect achieved throughput; the workers
+do not guarantee a specific camera/inference FPS.
+
+| Stage ID | Label | Statistical duration (seconds) |
+| --- | --- | --- |
+| 1 | Duodenum transection | 40.8 |
+| 2 | Hepatic artery exposure | 568.8 |
+| 3 | Ligament incision | 101.4 |
+| 4 | Right gastric division | 583.8 |
+| 5 | Hepatic artery dissection | 490.2 |
+| 6 | Common hepatic dissection | 830.4 |
+| 7 | Coronary vein division | 216.6 |
+
+The stage card integrates top-three confidence scores and proportional fills in
+the seven stage boxes. Unreturned scores are dashes, not zero probabilities.
+The vertical index rail fills the active stage segment using elapsed time
+against the supplied statistical duration. Rows with IDs below the current
+recognized stage are highlighted and their timing segments fill to 100%. This
+progression is derived from the current ID, without retaining a maximum ID or
+inventing confidence or elapsed times for earlier stages. It clears when the
+current prediction clears, including stale recognition and Test mode. `PHASE_DURATIONS_S` in `src/scope/catalog.py` stores the seven supplied
+statistics in checkpoint stage order. Stage metadata exposes each as `duration_s`;
+the UI uses that value for its time ratio and displays seconds. Durations are
+fixed, with no editable reference controls or assumed five-minute defaults.
+
+The stage worker retains `phase_started_at` from the capture timestamp of each
+new top-1 prediction, independently of the bounded history. Mode/context resets
+and sampling gaps reset it; category changes preserve it. Status exposes
+`phase_elapsed_s` using the server monotonic clock only while the prediction is
+fresh. Stage events record the visit start for replay/auditing. Timer overruns
+remain visible while the fill caps at 100%; no completion or remaining-time
+estimate is inferred. The recent-history strip is removed from the UI. The
+Doctor tips UI is also removed; its optional backend configuration remains.
+
+The three main column headings are visually hidden but retained for accessible
+region labels. Both side panels remain visible, with no folding controls.
+The Surgical stage heading is inside a translucent card anchored over the
+camera's upper-left corner. The stage list scrolls within the image height on
+small screens. Desktop columns use a 1:2:1 ratio for controls, camera and VLI
+after accounting for the gaps. Existing compact-screen stacking remains. The
+camera uses a square viewport sized to `min(100cqw, 100cqh)` within its available
+area above the controls. `object-fit: contain` preserves the full source at 1x,
+letterboxing non-square inputs. The camera ResizeObserver keeps
+zoom controls aligned with the dynamically sized viewport. Zoom transforms only
+the image, leaving the stage overlay fixed. Tasks help text and the existing
+Tracking button share their respective title rows, aligned right; help text
+wraps within its header on narrow screens.
+
+Model source, file sizes and hashes are retained in
+[`models.json`](../src/scope/models.json) and
+[`MODEL_PROVENANCE.md`](../src/scope/MODEL_PROVENANCE.md). Runtime assets live
+under ignored `models/scope/`. Segmentation and temporal loading both enforce
+the paired vision hash. Temporal loading also checks format, architecture,
+512px `global_mask` protocol, and strict state-dict compatibility.
+
+Recordings include `perception_mode` transitions, `surgical_stage` predictions
+with capture times/frame IDs, mode-tagged `yolo` events and camera frames, and
+mode metadata in sampled state/configuration. Existing JSONL/MJPEG readers
+remain compatible; the replay UI does not add a separate stage rail.
 
 ## Control and task implementation
 
@@ -145,5 +248,20 @@ Get-ChildItem tests/test_*.js | ForEach-Object {
 ```
 
 Native C++ tests in `tests/` exercise motion and spray behavior with mocked GTS calls. For changes to the driver, build the x86 Visual Studio solution and run the relevant native checks using an available C++ toolchain.
+
+For actual model validation without opening cameras, microphones or robots:
+
+```powershell
+python tests/smoke_scope_models.py
+# Or infer from one frame of a saved video:
+python tests/smoke_scope_models.py --video path/to/video.mkv
+# Exercise the dashboard against a looping saved video, with hardware disconnected:
+python tests/preview_perception.py --video path/to/video.mkv --port 8099
+```
+
+The smoke check validates all installed model hashes, mask output, repeated
+temporal samples for both heads and context reset. The preview uses the real
+camera/inference workers with a file-backed capture; it starts no speech models,
+native keyboard hook or robot connections. Its LLM/device statuses are unavailable.
 
 For documentation-only edits, verify local links and heading anchors, script paths, flags/defaults against their parsers, task IDs against `TASK_NAMES`, and shortcut descriptions against the browser/native handlers. Run `git diff --ignore-submodules=all --check` for whitespace validation. If submodule status cannot run because its metadata is inaccessible, validate `.gitmodules` against the indexed gitlink without changing repository permissions.
