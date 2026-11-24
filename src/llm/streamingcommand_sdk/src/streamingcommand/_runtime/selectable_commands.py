@@ -39,6 +39,7 @@ class SelectableCommandParser:
         self.python = str(python or sys.executable)
         self.base_model_dir = base_model_dir
         self.use_cuda_graphs = use_cuda_graphs
+        self.num_workers = 4
         self.specs = model_specs(checkpoint)
         if PUBLISHED_MODEL in (checkpoint_overrides or {}):
             self.specs[PUBLISHED_MODEL] = dict(
@@ -163,6 +164,7 @@ class SelectableCommandParser:
         self._log = path.open("ab", buffering=0)
         self.status["log_path"] = str(path)
         environment = dict(os.environ, CUDA_VISIBLE_DEVICES=visible,
+                           STREAMINGCOMMAND_LOADING_WORKERS=str(self.num_workers),
                            STREAMINGCOMMAND_DEVICE=self.device,
                            STREAMINGCOMMAND_EXPECTED_GPU_UUID=self.gpu_uuid,
                            TOKENIZERS_PARALLELISM="false", OMP_NUM_THREADS="4",

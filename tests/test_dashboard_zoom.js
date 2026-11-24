@@ -30,11 +30,22 @@ const document = new Element(), window = new Element();
 document.getElementById = get;
 document.querySelectorAll = () => presets;
 const timers = new Map();
+const syncTimers = new Map(), requests = [];
+let nextSyncTimer = 0, holdFetch = false, finishFetch;
 let nextTimer = 0;
 let time = 0;
 let resizeCamera;
 get('camera-feed').parentElement = new Element();
 const context = vm.createContext({document, window,
+  currentTask: {id:0,revision:30}, taskPending:false, interrupting:false, stopping:false, sessionStopped:false,
+  AbortSignal, reportStatus() {},
+  setTimeout(fn, delay) { syncTimers.set(++nextSyncTimer, {fn,delay}); return nextSyncTimer; },
+  clearTimeout(id) { syncTimers.delete(id); },
+  fetch: async (url, options) => {
+    requests.push({url,body:JSON.parse(options.body)});
+    if (holdFetch) await new Promise(resolve=>{finishFetch=resolve;});
+    return {ok:true,status:200};
+  },
   ResizeObserver: class {
     constructor(callback) { resizeCamera = callback; }
     observe(element) { assert.equal(element, get('camera-feed').parentElement); }
@@ -231,4 +242,27 @@ assert.equal(timers.size, 0);
 check(1.52);
 vm.runInContext("syncTaskZoom({id:0, revision:26, zoom:1.52, phase:'idle'})", context);
 assert.ok(!zoomIn.disabled && !zoomOut.disabled);
-console.log('Manual zoom and frame-smooth task zoom, server bounds, stale feedback, locks and cancellation passed.');
+async function checkSynchronization() {
+  assert.equal(requests.length,0,'initial rendering and task animation must not publish manual zoom');
+  presets[1].fire('click');presets[2].fire('click');
+  slider.value='1.7';slider.fire('input');
+  assert.equal(syncTimers.size,1,'coalesce a burst into one latest-value update');
+  const flush=()=>{const [id,job]=syncTimers.entries().next().value;syncTimers.delete(id);return job.fn();};
+  holdFetch=true;
+  const pending=flush();
+  assert.deepEqual(requests.at(-1),{url:'/api/camera/zoom',body:{zoom:1.7,revision:30}});
+  slider.value='1.8';slider.fire('input');
+  slider.value='1.9';slider.fire('input');
+  assert.equal(syncTimers.size,0,'only one synchronization request may be in flight');
+  holdFetch=false;finishFetch();await pending;
+  assert.equal(syncTimers.size,1);
+  await flush();
+  assert.deepEqual(requests.at(-1).body,{zoom:1.9,revision:30});
+  slider.value='1.6';slider.fire('input');
+  const count=requests.length;
+  context.currentTask={id:3,revision:31};
+  await flush();
+  assert.equal(requests.length,count,'do not send queued manual values after a task change');
+  console.log('Manual/task zoom, shared zoom updates, coalescing, task ownership and cancellation passed.');
+}
+checkSynchronization().catch(error=>{console.error(error);process.exitCode=1;});

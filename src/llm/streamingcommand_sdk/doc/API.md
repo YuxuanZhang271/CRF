@@ -36,6 +36,12 @@ if __name__ == "__main__":
 
 `recognizer.listen(*, device=None, candidates=None, history=None)` 返回事件异步迭代器。省略 `device` 使用系统默认输入，指定时可传设备编号或名称。用 `python -m sounddevice` 查看设备。只需要语音转写时，把 `StreamingCommand` 换成 `StreamingASR`。
 
+CRF extension: `listen(..., audio_callback=callback)` calls a synchronous,
+nonblocking callback with each mono 16 kHz PCM16 block before feeding ASR,
+including silence. Exceptions propagate as audio-source failures. The microphone
+iterator closes with the session; CRF's callback only enqueues bounded recorder
+data and never performs file I/O.
+
 ## 录音与文字
 
 | 接入方式 | Python 调用 | 返回 |
@@ -182,6 +188,8 @@ I 和 T 至少各含一个值，每组里的名称应非空、唯一。P 非空�
 | `asr.backend`、`asr.device` | 默认 `native`、`auto`。可选 `cpu` 或 `cuda:N`，其中 N 是当前进程看到的设备编号。也支持需要兼容 CUDA 环境的 `vllm`、`vllm-builtin` 和用于协议测试的 `fake`。 [Windows 与 vLLM](../docs/VLLM_WINDOWS.md) |
 | `asr.profile` | 默认 `v15-canto-commit`。可选 `v17-yue-precision` 和历史单引擎策略 `v15`、`v15-realtime`、`v15-continuity`、`v15-temporal`、`v15-temporal-stream`、`v15-speech-aware`。 |
 | `asr.python`、`asr.expected_gpu_uuid`、`asr.warmup` | 可指定 ASR worker 的解释器和预期 GPU，默认在启动时预热。 |
+| `asr.num_workers`、`command.num_workers` | CRF extension: 1–32 weight-loading threads per native model worker; SDK default 4, CRF settings 8. Pinned Transformers 5.23 worker-local compatibility setting. |
+| `parallel_start` | CRF extension: start ASR and command workers concurrently; SDK default `false`, CRF settings `true`. Startup failure cancels/joins sibling startup before closing both backends. |
 | `asr.model_dir`、`asr.alternate_model_dir`、`asr.language_model_dir`、`asr.speech_model_dir` | 直接指定 ASR 主模型、参考基座、语种模型和 VAD 的本地目录。 |
 | `asr.compatibility_lock_file` | 与已有 POSIX 部署共用的额外 ASR 锁路径，可选。 |
 | `command.enabled`、`command.model`、`command.device` | 默认 `true`、`clarification-hybrid`、`auto`。设备选择用与 ASR 相同的规则。 |

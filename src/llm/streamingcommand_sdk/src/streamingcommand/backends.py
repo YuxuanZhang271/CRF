@@ -46,6 +46,8 @@ async def build_backends(config: StreamingConfig):
             asr.worker = paths.WORKERS / "portable_worker.py"
             asr.worker_environment.update(STREAMINGCOMMAND_ASR_BACKEND=spec.backend)
         asr.warmup = spec.warmup
+        asr.worker_environment['STREAMINGCOMMAND_LOADING_WORKERS'] = str(spec.num_workers)
+        asr.status['num_workers'] = spec.num_workers
         asr.gpu_uuid = spec.expected_gpu_uuid or expected_uuid
         asr.status.update(device=device, backend=spec.backend, model_dir=str(asr.model_dir), implementation="streamingcommand")
         asr.status["model_sources"] = {name: {**store.source(name), "resolved_path": str(path)}
@@ -65,4 +67,6 @@ async def build_backends(config: StreamingConfig):
             checkpoint_sources={llm.model: store.source(llm.model)},
             use_cuda_graphs=llm.use_cuda_graphs, logs_root=config.logs_dir, expected_gpu_uuid=llm.expected_gpu_uuid)
         command.status["base_model_source"] = {**store.source("llm-base"), "resolved_path": str(base)}
+        command.num_workers = llm.num_workers
+        command.status['num_workers'] = llm.num_workers
     return asr, command

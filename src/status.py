@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 import uuid
+import wave
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,7 @@ SEGMENT_SECONDS = 300
 STATE_HZ = 20
 QUEUE_ITEMS = 4096
 QUEUE_BYTES = 32 * 1024 * 1024
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Runtime settings retained with every segment and whenever they change.
 CONFIG_FIELDS = (
@@ -83,6 +84,11 @@ class Status:
     def __init__(self, server, launch_config):
         self.server = server
         self.launch_config = json_value(launch_config)
+        config_path = Path(launch_config.get('llm_config') or Path(__file__).with_name('llm') / 'settings.json')
+        try:
+            self.voice_settings = json.loads(config_path.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError) as error:
+            self.voice_settings = {'error': str(error)}
         self.defaults = {}
         for name in CONFIG_MODULES:
             constants = {}
@@ -112,9 +118,13 @@ class Status:
                   'camera': {key: camera[key] for key in
                              ('category', 'revision', 'mode', 'mode_revision') if key in camera}}
         llm = getattr(self.server, 'llm', None)
+        voice = llm.recording_snapshot() if llm is not None else None
         if llm is not None:
-            config['llm'] = {'config_path': str(llm.config), 'microphone': llm.device}
-        return {'config': config, 'robot': state, 'camera': camera}
+            config['llm'] = {'config_path': str(llm.config), 'microphone': llm.device,
+                             'settings': self.voice_settings, 'offline': True,
+                             'models': voice.pop('models')}
+        return {'config': config, 'robot': state, 'camera': camera,
+                'llm': voice}
 
 
 class _LogHandler(logging.Handler):
@@ -191,6 +201,9 @@ class Recorder:
             self._segment = -1
             self._file = None
             self._frames = None
+            self._raw_frames = None
+            self._audio = None
+            self._audio_file = None
             self._sequence = 0
             self._queue = queue.Queue(self.queue_items)
             self._pending_bytes = 0
@@ -239,9 +252,9 @@ class Recorder:
         logging.getLogger().removeHandler(self._log_handler)
         self.stop()
 
-    def event(self, kind, data, *, jpeg=None):
+    def event(self, kind, data, *, jpeg=None, raw_jpeg=None, pcm=None):
         # Payloads are immutable source snapshots. JPEG bytes are shared, not copied.
-        size = len(jpeg) if jpeg is not None else 4096
+        size = 4096 + sum(len(blob) for blob in (jpeg, raw_jpeg, pcm) if blob is not None)
         with self._lock:
             if not self._active:
                 return
@@ -253,9 +266,14 @@ class Recorder:
                 self._dropped[kind] = self._dropped.get(kind, 0) + 1
                 return
             self._pending_bytes += size
-            self._queue.put_nowait((time.monotonic(), kind, data, jpeg, size))
+            self._queue.put_nowait((time.monotonic(), kind, data, jpeg, raw_jpeg, pcm, size))
 
     def _open_segment(self, index):
+        for name in ('_raw_frames', '_audio', '_audio_file'):
+            stream = getattr(self, name)
+            if stream is not None:
+                stream.close()
+                setattr(self, name, None)
         if self._frames is not None:
             self._frames.close()
             self._frames = None
@@ -292,12 +310,19 @@ class Recorder:
             self._config = config
             self._write('config', config, stamp)
         self._write('state', {'robot': snapshot['robot'], 'camera': snapshot['camera'],
+                              'llm': snapshot.get('llm'),
                               'recording': {'dropped': self.status()['dropped']}}, stamp)
 
     def _flush(self):
         # Make image bytes available before publishing their JSON index.
         if self._frames is not None:
             self._frames.flush()
+        if self._raw_frames is not None:
+            self._raw_frames.flush()
+        if self._audio is not None:
+            # Publish a valid WAV header during recording as well as on close.
+            self._audio.writeframes(b'')
+            self._audio_file.flush()
         self._file.flush()
 
     def _sample_loop(self):
@@ -314,7 +339,7 @@ class Recorder:
         try:
             while not self._closing.is_set() or not self._queue.empty():
                 try:
-                    stamp, kind, data, jpeg, size = self._queue.get(timeout=.1)
+                    stamp, kind, data, jpeg, raw_jpeg, pcm, size = self._queue.get(timeout=.1)
                 except queue.Empty:
                     if time.monotonic() - last_flush >= 1.:
                         self._flush()
@@ -330,6 +355,24 @@ class Recorder:
                     self._frames.write(jpeg)
                     data = {**data, 'image': {'path': f'{self._segment:05d}/camera.mjpeg',
                                             'offset_bytes': offset, 'length_bytes': len(jpeg)}}
+                if raw_jpeg is not None:
+                    if self._raw_frames is None:
+                        self._raw_frames = (self._segment_dir / 'camera_raw.mjpeg').open('wb')
+                    offset = self._raw_frames.tell()
+                    self._raw_frames.write(raw_jpeg)
+                    data = {**data, 'raw_image': {'path': f'{self._segment:05d}/camera_raw.mjpeg',
+                        'offset_bytes': offset, 'length_bytes': len(raw_jpeg)}}
+                if pcm is not None:
+                    if len(pcm) % 2:
+                        raise ValueError('Microphone PCM must contain whole 16-bit samples')
+                    if self._audio is None:
+                        self._audio_file = (self._segment_dir / 'microphone.wav').open('wb')
+                        self._audio = wave.open(self._audio_file, 'wb')
+                        self._audio.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+                    offset = self._audio.getnframes()
+                    self._audio.writeframesraw(pcm)
+                    data = {**data, 'audio': {'path': f'{self._segment:05d}/microphone.wav',
+                        'offset_samples': offset, 'sample_count': len(pcm) // 2}}
                 if kind == 'state':
                     self._write_state(data, stamp)
                 else:
@@ -354,7 +397,7 @@ class Recorder:
             self._closing.set()
             # Do not log through the recorder from its failure path.
         finally:
-            for file in (self._frames, self._file):
+            for file in (self._frames, self._raw_frames, self._audio, self._audio_file, self._file):
                 try:
                     if file is not None:
                         file.close()

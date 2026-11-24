@@ -15,9 +15,10 @@ class Element {
   get childElementCount() { return this.children.length; }
 }
 async function main() {
-  const elements = new Map(['listen','llm-status','llm-output'].map(id => [id,new Element()]));
+  const elements = new Map(['listen','llm-status','llm-output','llm-load-time'].map(id => [id,new Element()]));
   const timers = [], calls = [];
-  let feed = {enabled: false, phase: 'ready', sequence: 1, events: [
+  const readyTiming = {phase:'ready',elapsed_s:42.25};
+  let feed = {enabled: false, phase: 'ready', model_loading:readyTiming, sequence: 1, events: [
     {type: 'transcript.partial', generation: 1, stream_id: 5, segment_id: 1, text: '向上'},
     {type: 'transcript.final', generation: 1, stream_id: 5, segment_id: 1, text: '向上望少少。'},
     {type: 'command.final', generation: 1, stream_id: 5, segment_id: 1, command: 'Y', status: 'EXECUTE', resolved: true, slots: {I:'bend',T:'none',P:'up'}},
@@ -30,11 +31,13 @@ async function main() {
     setTimeout:fn=>timers.push(fn), fetch:async (url,options)=>{
       calls.push([url,options]); return {ok:true,json:async()=>url.includes('/listen')?{enabled:true,sequence:999,events:[]}:feed};
     }});
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/static/status.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/static/llm.js'),'utf8'),context);
   const flush = () => new Promise(resolve=>setImmediate(resolve));
   await flush();
   const output=elements.get('llm-output'),button=elements.get('listen');
   assert.equal(elements.get('llm-status').label, 'Ready');
+  assert.equal(elements.get('llm-load-time').textContent, 'Loaded in 42.3s');
   assert.equal(output.children.length,1);
   assert.equal(output.firstChild.firstChild.textContent,'向上望少少。');
   assert.equal(output.firstChild.dataset.partial,'false');
@@ -42,10 +45,11 @@ async function main() {
   assert.match(output.firstChild.lastChild.textContent,/Task 5 accepted/);
   await button.handlers.click();
   assert.equal(JSON.parse(calls.at(-1)[1].body).enabled,true);
-  feed={enabled:true,phase:'listening',sequence:2,events:[]};
+  feed={enabled:true,phase:'listening',model_loading:readyTiming,sequence:2,events:[]};
   await timers.shift()();await flush();
   assert.equal(calls.at(-1)[0],'/api/llm?after=1','toggle responses must not skip pending events');
   assert.equal(button.attributes['aria-pressed'],'true');
+  assert.equal(elements.get('llm-load-time').textContent, 'Loaded in 42.3s', 'LISTEN toggles retain model startup time');
   feed={enabled:false,phase:'ready',sequence:3,events:[
     {type:'listen.changed',generation:2,stream_id:5,enabled:false},
     {type:'transcript.final',generation:2,stream_id:5,segment_id:1,text:'向上望少少。'},
@@ -66,7 +70,7 @@ async function main() {
   assert.equal(output.firstChild.dataset.fastStop,'true');
   assert.equal(output.firstChild.dataset.command,'true');
   assert.match(output.firstChild.lastChild.textContent,/Fast STOP/);
-  feed={enabled:false,phase:'error',error:'Tokenizer failed',sequence:5,events:[
+  feed={enabled:false,phase:'error',model_loading:readyTiming,error:'Tokenizer failed',sequence:5,events:[
     {type:'command.error',generation:2,stream_id:5,segment_id:1,message:'Tokenizer failed',
       diagnostic:'Tokenizer failed\nInput: invalid Unicode\nTraceback: worker line 19',level:'error'}
   ]};
@@ -75,8 +79,15 @@ async function main() {
   assert.equal(elements.get('llm-status').tone,'error');
   assert.match(output.lastChild.textContent,/Traceback: worker line 19/);
   assert.equal(output.lastChild.dataset.level,'error');
+  assert.equal(elements.get('llm-load-time').textContent,'Loaded in 42.3s', 'a command error is not a model loading failure');
+  feed={enabled:false,phase:'loading',model_loading:{phase:'loading',elapsed_s:3.2},sequence:6,events:[]};
+  await timers.shift()();await flush();
+  assert.equal(elements.get('llm-load-time').textContent,'Loading 3.2s');
+  feed={enabled:false,phase:'error',model_loading:{phase:'error',elapsed_s:5.4},sequence:7,events:[]};
+  await timers.shift()();await flush();
+  assert.equal(elements.get('llm-load-time').textContent,'Load failed after 5.4s');
   context.stopping=true;
   const count=calls.length;await button.handlers.click();assert.equal(calls.length,count);
-  console.log('LLM partial replacement, command highlighting, task results, event cursor and shutdown gating passed.');
+  console.log('LLM transcripts, task results, loading times, event cursor and shutdown gating passed.');
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

@@ -9,6 +9,7 @@
     <img class="lab-logo" src="/imgs/ABML_logo.png" alt="Advanced Bio-Medical Robotics Lab">
     <button id="theme-toggle" type="button" aria-pressed="false" title="Switch color mode">Light mode</button>
     <button id="perception-toggle" type="button" aria-pressed="true" title="Switch between test detection and full surgical perception">Test mode</button>
+    <a class="view-link" href="/live" target="_blank" rel="noopener" title="Duplicate surgical stage and annotated camera in a new tab">Open live view ↗</a>
   </div>
 </header>
 <main class="workspace">
@@ -217,7 +218,10 @@
     <section class="card llm-card" aria-labelledby="llm-heading">
       <div class="task-heading llm-heading">
         <h3 id="llm-heading">LLM</h3>
-        <button id="listen" type="button" aria-pressed="false" aria-keyshortcuts="Alt+l" title="Toggle speech task triggering · Alt+L">LISTEN</button>
+        <div class="llm-actions">
+          <span id="llm-load-time" title="ASR and LLM model loading time">Loading…</span>
+          <button id="listen" type="button" aria-pressed="false" aria-keyshortcuts="Alt+l" title="Toggle speech task triggering · Alt+L">LISTEN</button>
+        </div>
       </div>
       <div id="llm-output" class="llm-output" role="log" aria-label="Speech recognition" tabindex="0"></div>
       <p class="shortcut-tips"><span><kbd>Alt</kbd>+<kbd>L</kbd> toggle listening</span></p>
@@ -246,6 +250,8 @@
 </aside>
 </main>
 
+<script src="/static/stage.js"></script>
+<script src="/static/status.js"></script>
 <script src="/static/dashboard.js"></script>
 <script src="/static/llm.js"></script>
 <script src="/static/keyboard.js"></script></body></html>

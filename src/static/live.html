@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CRF Live Surgical View</title>
+  <script src="/static/theme.js"></script>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <link rel="stylesheet" href="/static/live.css">
+</head>
+<body class="live-view">
+  <header class="live-header">
+    <h1>Live surgical view</h1>
+    <nav aria-label="View options">
+      <a class="view-link" href="/" target="_blank" rel="noopener">Dashboard ↗</a>
+      <button id="theme-toggle" type="button" aria-pressed="false" title="Switch color mode">Light mode</button>
+    </nav>
+  </header>
+  <main class="live-workspace">
+    <aside class="panel stage-panel live-stage" id="surgical-stage" aria-labelledby="stage-heading" aria-disabled="true" data-inactive="true">
+      <div class="panel-scroll">
+        <section class="card stage-recognition" aria-label="Stage recognition">
+          <h2 id="stage-heading" class="scope-subheading">Surgical stage</h2>
+          <p id="stage-status" class="stage-status" role="status">Waiting for camera status…</p>
+          <ul id="stage-rail" class="stage-rail" aria-label="Surgical stages"></ul>
+          <p id="stage-context" class="stage-context">Elapsed / statistical duration (seconds).</p>
+        </section>
+      </div>
+    </aside>
+    <section class="panel live-camera" aria-label="Live annotated camera">
+      <div class="camera-stage">
+        <div class="camera">
+          <img id="camera-feed" alt="Live SCOPE camera with perception overlays">
+          <span id="perception-mode-label" class="camera-mode">Connecting…</span>
+          <p id="camera-placeholder" class="live-placeholder">Waiting for a camera frame…</p>
+        </div>
+      </div>
+      <dl class="status-bar" aria-label="System status">
+        <div class="status-chip" id="arm-status"><dt>ARM</dt><dd>Disconnected</dd></div>
+        <div class="status-chip" id="flex-connection"><dt>FLEX</dt><dd>Disconnected</dd></div>
+        <div class="status-chip" id="motion-status"><dt>MOTION</dt><dd>Unavailable</dd></div>
+        <div class="status-chip" id="task-status" role="status"><dt>TASK</dt><dd>Unavailable</dd></div>
+        <div class="status-chip" id="llm-status" role="status"><dt>LLM</dt><dd>Loading</dd></div>
+      </dl>
+      <p id="live-status" class="status" role="status">Connecting to the live session…</p>
+    </section>
+    <aside class="live-reserved" aria-hidden="true"></aside>
+  </main>
+  <script src="/static/stage.js"></script>
+  <script src="/static/status.js"></script>
+  <script src="/static/live.js"></script>
+</body>
+</html>

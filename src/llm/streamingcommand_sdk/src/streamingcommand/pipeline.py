@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import suppress
 import copy
+import time
 from pathlib import Path
 from .config import CLARIFICATION_MODELS, StreamingConfig
 
@@ -21,6 +22,8 @@ class StreamingCommand:
         self._session = None
         self._closed = False
         self._ready = False
+        self._startup_seconds = None
+        self._resource_seconds = None
 
     @classmethod
     async def initialize(cls, config_path=None, *, config=None):
@@ -34,14 +37,32 @@ class StreamingCommand:
                 raise RuntimeError("Runtime is closed; create a new instance")
             if self._ready:
                 return self
+            started = time.perf_counter()
             try:
                 if self.asr is None:
                     from .backends import build_backends
                     self.asr, self.commands = await build_backends(self.config)
-                await self.asr.start()
-                if self.commands is not None:
-                    await self.commands.start()
+                self._resource_seconds = time.perf_counter() - started
+                async def start_backend(backend):
+                    started = time.perf_counter()
+                    await backend.start()
+                    backend.status['startup_seconds'] = time.perf_counter() - started
+                backends = [b for b in (self.asr, self.commands) if b is not None]
+                if self.config.parallel_start:
+                    # Cancel and join sibling startup before releasing either backend.
+                    jobs = [asyncio.create_task(start_backend(b)) for b in backends]
+                    try:
+                        await asyncio.gather(*jobs)
+                    finally:
+                        for job in jobs:
+                            if not job.done():
+                                job.cancel()
+                        await asyncio.gather(*jobs, return_exceptions=True)
+                else:
+                    for backend in backends:
+                        await start_backend(backend)
                 self._ready = True
+                self._startup_seconds = time.perf_counter() - started
             except BaseException:
                 await self._close()
                 raise
@@ -80,6 +101,7 @@ class StreamingCommand:
     def info(self):
         """Return a detached snapshot of readiness and backend status without starting models."""
         return {"implementation": "streamingcommand", "ready": self._ready,
+                "startup_seconds": self._startup_seconds, "resource_seconds": self._resource_seconds,
                 "asr": copy.deepcopy(self.asr.status) if self.asr else None,
                 "command": copy.deepcopy(self.commands.status) if self.commands else None}
 
@@ -139,10 +161,19 @@ class StreamingCommand:
                 with suppress(asyncio.CancelledError):
                     await receiver
 
-    async def listen(self, *, device=None, candidates=None, history=None):
+    async def listen(self, *, device=None, candidates=None, history=None, audio_callback=None):
         """Convert microphone input into PCM and yield transcript and command events."""
         from .audio import microphone
-        async for event in self.stream(microphone(device), candidates=candidates, history=history):
+        async def source():
+            audio = microphone(device)
+            try:
+                async for pcm in audio:
+                    if audio_callback is not None:
+                        audio_callback(pcm)
+                    yield pcm
+            finally:
+                await audio.aclose()
+        async for event in self.stream(source(), candidates=candidates, history=history):
             yield event
 
     async def transcribe_file(self, path, *, realtime=True, candidates=None, history=None):

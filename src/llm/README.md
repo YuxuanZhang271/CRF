@@ -21,6 +21,11 @@ messages, input representations, worker log paths, and tracebacks appear in the
 LLM console and the main console. Server diagnostics also print in the launcher
 terminal. Browser messages are forwarded to the terminal even when RECORD is off.
 The LLM card grows vertically with the available space, like the main console.
+The time beside LISTEN counts model loading seconds, then retains the total
+duration once ASR and LLM are ready. It uses server startup timing, includes
+resource verification/warmup, survives dashboard reloads and LISTEN toggles,
+and reports a frozen elapsed time if loading fails or is cancelled. Each new
+loading attempt resets the timer; speech/command errors after readiness do not.
 
 Each app run creates `logs/crf_YYYYMMDD_HHMMSS_microseconds_PID.log`, using Hong Kong
 start time. The UTF-8 file contains warnings, errors, tracebacks, and start/end
@@ -73,10 +78,36 @@ timeouts report their cause without starting tracking.
 App options: `--llm-config PATH` selects another SDK JSON configuration and
 `--microphone NAME` selects an input device by name. LISTEN starts off.
 
+The app's `settings.json` enables `parallel_start` and sets `asr.num_workers`
+and `command.num_workers` to **8** each (valid range 1–32). ASR and LLM start
+concurrently in their existing isolated processes; these counts control weight
+loading threads, without creating extra inference engines. Set `parallel_start`
+to `false` for sequential startup if simultaneous loading uses too much memory,
+or reduce either worker count. Restart the app after changing settings. Startup
+seconds (total, resource resolution/verification, and each backend), worker settings, and worker log paths appear in model-ready
+diagnostics and recordings. Performance depends on storage, CPU and available
+memory; no fixed speedup is assumed. Cached model hash verification and ASR/LLM
+warmup still run. The app and native ASR worker select this checkout's vendored
+SDK, so a stale editable install pointing at another copy cannot override it.
+
+Transformers **5.23.0**, pinned by CRF, already loads asynchronously and uses an
+internal `core_model_loading.GLOBAL_WORKERS` limit (normally four). The vendored
+worker-local compatibility helper sets that limit before loading; the former
+`HF_ENABLE_PARALLEL_LOADING` / `HF_PARALLEL_LOADING_WORKERS` variables do not
+control this version. The helper warns if a future runtime removes this limit.
+An explicit `HF_DEACTIVATE_ASYNC_LOAD` environment override still takes priority.
+
 Recordings include `llm` events with the original SDK event type, segment and
 revision, local receive timestamp, audio-stream origin, parsed slots, and task
-dispatch results. Raw microphone audio is not saved. Camera and state recordings
-continue using the existing JSONL/MJPEG format.
+dispatch results. RECORD also saves the microphone PCM passed to ASR as mono
+16 kHz PCM16 WAV, including silence, independently of LISTEN. This is resampled
+input, not the original device sampling format. Audio chunk indexes carry stream
+IDs, source sample positions, sample counts and a monotonic stream origin shared
+with speech events. The clock estimates the first PCM block's start from its
+receive time minus duration; it is not a hardware ADC clock. Current voice state,
+model identities/timings and the JSON settings are retained when recording starts
+mid-stream. Camera/state storage remains JSONL/MJPEG, with additive schema v2
+media references. See [recording coverage](../../docs/DEVELOPMENT.md#recording-and-diagnostics).
 
 `streamingcommand_sdk/` is vendored from the supplied CRF-LLM archive. Its Apache
 license, notices, model provenance, and documentation are retained. Model weights

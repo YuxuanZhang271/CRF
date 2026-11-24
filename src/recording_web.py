@@ -6,9 +6,11 @@ from bisect import bisect_right
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import io
 import math
 from pathlib import Path
 import threading
+import wave
 from urllib.parse import parse_qs, urlsplit
 
 from recording_viewer import RecordingData, event_label
@@ -47,7 +49,7 @@ class RecordingArchive:
             if old and old['signature'] == signature:
                 return old
             data = {'path': path, 'signature': signature, 'states': [], 'frames': [],
-                    'events': [], 'configs': [], 'yolo': [], 'invalid': 0,
+                    'events': [], 'configs': [], 'yolo': [], 'audio': [], 'invalid': 0,
                     'counts': Counter(), 'duration_s': 0., 'ended': False, 'dropped': {}}
             for file in files:
                 with file.open(encoding='utf-8') as stream:
@@ -71,17 +73,21 @@ class RecordingArchive:
                                 data['frames'].append((stamp, payload))
                             elif kind == 'yolo':
                                 data['yolo'].append((stamp, payload))
+                            elif kind == 'microphone_audio':
+                                data['audio'].append((stamp, payload))
                             elif kind in ('segment_start', 'config'):
+                                if kind == 'segment_start':
+                                    data['origin_monotonic_s'] = payload.get('session_origin_monotonic_s')
                                 data['configs'].append((stamp, payload.get('config', {}) if kind == 'segment_start' else payload))
                             elif kind == 'session_stop':
                                 data['ended'] = True
                                 data['dropped'] = payload.get('dropped', {})
-                            if kind in ('task', 'llm', 'console', 'command', 'command_result', 'state_error', 'config', 'session_stop'):
+                            if kind in ('task', 'llm', 'console', 'command', 'command_result', 'state_error', 'camera_recording_error', 'perception_mode', 'surgical_stage', 'config', 'session_stop'):
                                 if payload.get('path') != '/api/key/heartbeat':
                                     data['events'].append((stamp, kind, payload))
                         except (ValueError, TypeError, KeyError):
                             data['invalid'] += 1
-            for key in ('states', 'frames', 'events', 'configs', 'yolo'):
+            for key in ('states', 'frames', 'events', 'configs', 'yolo', 'audio'):
                 data[key].sort(key=lambda item: item[0])
                 data[key + '_times'] = [r[0] for r in data[key]]
             if len(self._cache) >= 2:
@@ -116,14 +122,57 @@ class RecordingArchive:
                            for t, kind, payload in self._window(data, 'events', start, start + duration, 2500)],
                 'frames': [{'time': frames[i][0], 'index': i} for i in range(lo, hi)]}
 
-    def image(self, name, index):
+    def image(self, name, index, raw=False):
         data = self.load(name)
         if type(index) is not int or not 0 <= index < len(data['frames']):
             raise ValueError('Frame index is outside this recording.')
         # Reuse the viewer's validated path and byte-range reader without loading its timeline.
         reader = RecordingData(data['path'])
         reader.session = data['path']
-        return reader.image_bytes(data['frames'][index][1])
+        frame = data['frames'][index][1]
+        return reader.image_bytes({'image': frame.get('raw_image')} if raw else frame)
+
+    def audio(self, name, start, duration):
+        """Return a bounded WAV clip; preserve gaps instead of concatenating missing audio."""
+        if not math.isfinite(start) or start < 0 or not math.isfinite(duration) or not 0 < duration <= 30:
+            raise ValueError('Audio start must be nonnegative; duration must be 0–30 seconds.')
+        data = self.load(name)
+        origin = data.get('origin_monotonic_s')
+        if origin is None:
+            raise ValueError('This recording has no audio clock.')
+        pcm = bytearray(round(duration * 16000) * 2)
+        found = False
+        for _, chunk in data['audio']:
+            begin = chunk['audio_start_monotonic_s'] - origin
+            reference = chunk['audio']
+            count = reference['sample_count']
+            if type(count) is not int or not 0 <= count <= 16000 * 30:
+                raise ValueError('Invalid audio sample count.')
+            position = round((begin - start) * 16000)
+            low, high = max(0, -position), min(count, len(pcm) // 2 - position)
+            if high <= low:
+                continue
+            path = (data['path'] / reference['path']).resolve()
+            if not path.is_relative_to(data['path']) or path.suffix.lower() != '.wav':
+                raise ValueError('Audio reference is outside the recording session.')
+            offset = reference['offset_samples']
+            if type(offset) is not int or offset < 0:
+                raise ValueError('Invalid audio offset.')
+            with wave.open(str(path), 'rb') as source:
+                if (source.getnchannels(), source.getsampwidth(), source.getframerate()) != (1, 2, 16000):
+                    raise ValueError('Unsupported recorded audio format.')
+                source.setpos(offset + low)
+                block = source.readframes(high - low)
+            destination = (position + low) * 2
+            pcm[destination:destination + len(block)] = block
+            found = found or bool(block)
+        if not found:
+            raise ValueError('No microphone audio at this time (older recordings contain speech text only).')
+        output = io.BytesIO()
+        with wave.open(output, 'wb') as target:
+            target.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+            target.writeframes(pcm)
+        return output.getvalue()
 
 
 def serve_recording(handler, url, archive):
@@ -135,7 +184,7 @@ def serve_recording(handler, url, archive):
         filename, mime = assets[url.path]
         handler._send(200, mime + '; charset=utf-8', (STATIC / filename).read_bytes())
         return True
-    if url.path not in ('/api/viewer/sessions', '/api/viewer/window', '/api/viewer/frame'):
+    if url.path not in ('/api/viewer/sessions', '/api/viewer/window', '/api/viewer/frame', '/api/viewer/audio'):
         return False
     try:
         args = parse_qs(url.query)
@@ -144,14 +193,20 @@ def serve_recording(handler, url, archive):
         elif url.path == '/api/viewer/window':
             result = archive.window(args.get('session', [''])[0], float(args.get('start', ['0'])[0]),
                                     float(args.get('duration', ['60'])[0]))
+        elif url.path == '/api/viewer/audio':
+            clip = archive.audio(args.get('session', [''])[0], float(args.get('start', ['0'])[0]),
+                                 float(args.get('duration', ['15'])[0]))
+            handler._send(200, 'audio/wav', clip)
+            return True
         else:
-            image = archive.image(args.get('session', [''])[0], int(args.get('index', ['-1'])[0]))
+            image = archive.image(args.get('session', [''])[0], int(args.get('index', ['-1'])[0]),
+                                  raw=args.get('raw', ['0'])[0] == '1')
             if not image:
                 raise ValueError('Recorded frame is not available yet.')
             handler._send(200, 'image/jpeg', image)
             return True
         handler._json(result)
-    except (ValueError, OSError, KeyError, TypeError) as error:
+    except (ValueError, OSError, KeyError, TypeError, wave.Error, EOFError) as error:
         handler._json({'error': str(error)}, 400)
     return True
 

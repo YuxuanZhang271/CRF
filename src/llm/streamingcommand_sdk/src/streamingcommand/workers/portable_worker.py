@@ -15,6 +15,8 @@ import time
 import traceback
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 
 def fixed_bias(tokenizer, context):
     """Decode the request's fixed prior payload and build bounded token weights for portable ASR."""

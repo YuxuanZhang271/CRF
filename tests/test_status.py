@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,6 +136,48 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(self.recorder._worker.is_alive())
         self.assertFalse(self.recorder._sampler.is_alive())
         self.assertFalse(self.recorder.stop()['active'])
+
+    def test_audio_and_clean_images_survive_rotation(self):
+        self.recorder.start()
+        for index in range(2):
+            self.recorder.event('camera_frame', {'frame': index}, jpeg=b'preview', raw_jpeg=b'clean')
+            self.recorder.event('microphone_audio', {'stream_id': 1}, pcm=b'\x12\x34' * 320)
+            time.sleep(.1)
+        self.recorder.stop()
+        rows = self.rows()
+        audio = [row for row in rows if row['type'] == 'microphone_audio']
+        self.assertEqual(len(audio), 2)
+        self.assertNotEqual(audio[0]['data']['audio']['path'], audio[1]['data']['audio']['path'])
+        for row in audio:
+            ref = row['data']['audio']
+            with wave.open(str(Path(self.recorder.status()['session']) / ref['path']), 'rb') as stream:
+                self.assertEqual((stream.getnchannels(), stream.getsampwidth(), stream.getframerate()), (1, 2, 16000))
+                stream.setpos(ref['offset_samples'])
+                self.assertEqual(stream.readframes(ref['sample_count']), b'\x12\x34' * 320)
+        for row in (r for r in rows if r['type'] == 'camera_frame'):
+            ref = row['data']['raw_image']
+            self.assertEqual((Path(self.recorder.status()['session']) / ref['path']).read_bytes(), b'clean')
+
+    def test_live_wav_header_is_flushed_before_index(self):
+        self.recorder.segment_seconds = 300
+        self.recorder.start()
+        self.recorder.event('microphone_audio', {}, pcm=b'\x12\x34' * 320)
+        deadline = time.monotonic() + 2
+        path = Path(self.recorder.status()['session']) / '00000' / 'events.jsonl'
+        while time.monotonic() < deadline and 'microphone_audio' not in path.read_text(encoding='utf-8'):
+            time.sleep(.02)
+        self.assertIn('microphone_audio', path.read_text(encoding='utf-8'))
+        with wave.open(str(path.with_name('microphone.wav')), 'rb') as stream:
+            self.assertEqual(stream.readframes(320), b'\x12\x34' * 320)
+        self.assertTrue(self.recorder.status()['active'])
+
+    def test_audio_overload_is_counted_without_blocking_and_inactive_audio_is_ignored(self):
+        self.recorder.event('microphone_audio', {}, pcm=b'\0' * 640)
+        self.recorder.start()
+        self.recorder.event('microphone_audio', {}, pcm=b'\0' * self.recorder.queue_bytes)
+        self.recorder.stop()
+        self.assertEqual(self.recorder.status()['dropped']['microphone_audio'], 1)
+        self.assertFalse(any(row['type'] == 'microphone_audio' for row in self.rows()))
 
     def test_output_directory_failure_is_visible(self):
         destination = Path(self.temp.name) / 'ordinary-file'

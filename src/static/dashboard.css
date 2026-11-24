@@ -16,6 +16,9 @@ body{display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;height:100dvh;pa
 .brand-actions{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:10px;max-width:74%;min-width:0}
 .lab-logo{display:block;width:clamp(120px,26vw,280px);min-width:0;height:28px;object-fit:contain;object-position:right center}
 #theme-toggle{flex:none;white-space:nowrap}
+.view-link{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--edge);border-radius:6px;padding:8px 10px;color:var(--fg);background:var(--button);font:600 12px system-ui,sans-serif;text-decoration:none}
+.view-link:hover{background:var(--button-hover)}
+.view-link:focus-visible{outline:2px solid var(--hi);outline-offset:2px}
 #theme-toggle[aria-pressed="true"]{background:var(--hi);color:var(--on-hi)}
 #theme-toggle[aria-pressed="true"]:hover{background:var(--hi-hover)}
 #perception-toggle{flex:none;white-space:nowrap}
@@ -122,6 +125,8 @@ button[data-key][data-held="true"]{outline:2px solid var(--hi);background:var(--
 .llm-detail{display:block;color:var(--dim);font:11px/1.5 system-ui,sans-serif}
 #listen[aria-pressed="true"]{background:var(--hi);color:var(--on-hi)}
 .llm-heading{align-items:center;gap:8px}
+.llm-actions{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:6px;margin-left:auto;min-width:0}
+#llm-load-time{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
 #listen{flex:none}
 button{background:var(--button);color:var(--fg);border:1px solid transparent;border-radius:6px;padding:8px 10px;cursor:pointer;font:600 12px system-ui,sans-serif}
 button:hover{background:var(--button-hover)}

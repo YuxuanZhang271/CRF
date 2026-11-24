@@ -28,7 +28,11 @@ def describe_event(event):
         info = event.get('info', {})
         asr, command = info.get('asr') or {}, info.get('command') or {}
         text = f"Models ready. ASR: {asr.get('device', 'ready')}; LLM: {command.get('device', 'ready')}."
+        if info.get('startup_seconds') is not None:
+            text += f"\nTotal startup: {info['startup_seconds']:.1f}s; resource resolution/verification: {info.get('resource_seconds', 0):.1f}s."
         for name, backend in (('ASR', asr), ('LLM', command)):
+            if backend.get('startup_seconds') is not None:
+                text += f"\n{name} startup: {backend['startup_seconds']:.1f}s ({backend.get('num_workers', 'default')} loading workers)."
             if backend.get('log_path'):
                 text += f"\n{name} worker log: {backend['log_path']}"
     elif kind == 'listen.changed':
@@ -82,13 +86,28 @@ class LLMService:
         self._runner_task = None
         self._stream_id = 0
         self._owned_revision = None
+        self._model_info = None
+        self._model_loading_started = None
+        self._model_loading = {'phase': 'idle', 'elapsed_s': None}
 
     def snapshot(self, after=0):
         with self._lock:
             error = self._error or self._command_error
+            loading = dict(self._model_loading)
+            if loading['phase'] == 'loading':
+                loading['elapsed_s'] = time.monotonic() - self._model_loading_started
             return {'enabled': self._desired, 'phase': 'error' if error else self._phase, 'error': error,
+                    'model_loading': loading,
                     'sequence': self._sequence, 'generation': self._generation,
                     'events': copy.deepcopy([e for e in self._events if e['sequence'] > after])}
+
+    def recording_snapshot(self):
+        """Retain current voice state even when recording starts mid-stream."""
+        with self._lock:
+            state = self.snapshot(after=self._sequence)
+            state.pop('events')
+            state['models'] = copy.deepcopy(self._model_info)
+        return state
 
     def _publish(self, event):
         diagnostic, level = describe_event(event)
@@ -97,6 +116,16 @@ class LLMService:
                 self._command_error = event.get('message', 'Command parsing failed.')
             elif event['type'] in ('command.final', 'command.feedback', 'models.loading', 'models.ready'):
                 self._command_error = None
+            if event['type'] == 'models.ready':
+                self._model_info = copy.deepcopy(event.get('info'))
+                duration = (event.get('info') or {}).get('startup_seconds')
+                self._finish_model_loading('ready', duration)
+            elif event['type'] == 'models.loading':
+                self._model_info = None
+                self._model_loading_started = time.monotonic()
+                self._model_loading = {'phase': 'loading', 'elapsed_s': 0.}
+            elif event['type'] == 'llm.error' and self._model_loading['phase'] == 'loading':
+                self._finish_model_loading('error')
             self._sequence += 1
             row = {**copy.deepcopy(event), 'sequence': self._sequence,
                    'received_monotonic_s': time.monotonic(),
@@ -109,6 +138,12 @@ class LLMService:
         if diagnostic:
             log.log({'error': logging.ERROR, 'warning': logging.WARNING}.get(level, logging.INFO),
                     '[%s] %s', event['type'], diagnostic)
+
+    def _finish_model_loading(self, phase, duration=None):
+        """Freeze this attempt's elapsed time; caller owns the service lock."""
+        if duration is None and self._model_loading_started is not None:
+            duration = time.monotonic() - self._model_loading_started
+        self._model_loading = {'phase': phase, 'elapsed_s': duration}
 
     def start(self):
         """Preload models and start continuous recognition without enabling task triggers."""
@@ -207,7 +242,10 @@ class LLMService:
             await self._stop_owned()
             if sdk is not None:
                 await sdk.close()
-            self._phase = 'closed'
+            with self._lock:
+                if self._model_loading['phase'] == 'loading':
+                    self._finish_model_loading('cancelled')
+                self._phase = 'closed'
 
     async def _listen(self, sdk):
         seen = set()
@@ -226,9 +264,26 @@ class LLMService:
                         'traceback': ''.join(traceback.format_exception(type(error), error, error.__traceback__))})
             job.add_done_callback(completed)
         audio_origin = time.monotonic()
+        audio_samples = 0
         with self._lock:
             self._stream_id += 1
-        events = sdk.listen(device=self.device)
+        def record_audio(pcm):
+            nonlocal audio_samples, audio_origin
+            samples = len(pcm) // 2
+            received = time.monotonic()
+            if audio_samples == 0:
+                audio_origin = received - samples / 16000
+            self.server.recorder.event('microphone_audio', {
+                'stream_id': self._stream_id, 'sample_start': audio_samples,
+                'sample_count': samples, 'sample_rate': 16000, 'channels': 1,
+                'sample_width_bytes': 2, 'encoding': 'pcm_s16le',
+                'session_audio_origin_monotonic_s': audio_origin,
+                'audio_start_monotonic_s': audio_origin + audio_samples / 16000,
+                'received_monotonic_s': received,
+                'clock': 'first_pcm_receive_minus_duration',
+            }, pcm=pcm)
+            audio_samples += samples
+        events = sdk.listen(device=self.device, audio_callback=record_audio)
         try:
             async for event in events:
                 if self._closed:

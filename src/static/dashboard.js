@@ -47,14 +47,13 @@ function renderTask(task) {
     return;
   }
   if (currentTask && task.revision < currentTask.revision) return;
-  if (([3, 4].includes(task.id) || [3, 4].includes(currentTask?.id)) && Number.isFinite(task.zoom)) {
+  if ((!currentTask || [3, 4].includes(task.id) || [3, 4].includes(currentTask?.id)) && Number.isFinite(task.zoom)) {
     syncTaskZoom(task, !taskPending && !interrupting && !stopping && !sessionStopped);
   }
   if (task.id !== 0 && currentTask?.id !== task.id) releaseKeys();
   currentTask = task;
-  const phase = task.error ? 'Error' : ({idle: 'Ready', starting: 'Starting', running: 'Running', limited: 'Limited', error: 'Error'}[task.phase] || (task.id ? 'Running' : 'Ready'));
-  setStatusChip('task-status', task.id ? `${task.id} · ${phase}` : phase,
-    task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'ok');
+  const {phase, label, tone, title} = taskStatus(task);
+  setStatusChip('task-status', label, tone);
   taskButtons.forEach((button, id) => {
     const active = id === task.id;
     button.setAttribute('aria-pressed', String(active));
@@ -63,7 +62,7 @@ function renderTask(task) {
   const level = task.error ? 'error' : task.phase === 'limited' ? 'warning' : 'info';
   const detail = task.error ? `${task.error} Use INTERRUPT to retry stopping.` :
     task.message || (task.id ? 'Running; manual controls locked.' : 'Manual controls available when devices are ready.');
-  document.getElementById('task-status').title = `${task.id} · ${task.name} · ${phase}`;
+  document.getElementById('task-status').title = title;
   reportStatus('task-state', 'TASK', `${task.id} · ${task.name} · ${detail}`, level, false);
 }
 
@@ -627,33 +626,8 @@ function setStatusChip(id, label, tone = '') {
 }
 
 function renderStatusBar(s) {
-  const flex = s.flex_hardware;
-  const armFault = s.arm_enabled && !s.stopping && (s.motion_fault || s.kinematics_ready === false);
-  const armConnected = s.relay_connected && s.joints_received;
-  const flexFault = flex?.fault || flex?.setup_encoder_mismatch;
-  if (s.arm_enabled === false) setStatusChip('arm-status', 'Disabled');
-  else if (armFault) setStatusChip('arm-status', 'Error', 'error');
-  else if (armConnected) setStatusChip('arm-status', 'Connected', 'ok');
-  else setStatusChip('arm-status', 'Disconnected', 'warning');
-
-  if (flexFault) setStatusChip('flex-connection', 'Error', 'error');
-  else if (flex?.connected) setStatusChip('flex-connection', 'Connected', 'ok');
-  else if (flex?.driver_online) setStatusChip('flex-connection', 'Connecting', 'warning');
-  else if (!flex && s.arm_enabled !== undefined) {
-    setStatusChip('flex-connection', s.arm_enabled ? 'Modeled' : 'Disabled');
-  } else setStatusChip('flex-connection', 'Disconnected', 'warning');
-
-  const armStill = s.arm_enabled === false || (armConnected && !armFault && s.arm_moving === false);
-  const flexStill = !flex || (flex.connected && !flexFault && flex.moving === false);
-  if (sessionStopped) setStatusChip('motion-status', 'Stopped', 'ok');
-  else if (stopping || s.stopping || interrupting || s.interrupting) setStatusChip('motion-status', 'Stopping', 'warning');
-  else if (s.freedrive_transition) setStatusChip('motion-status', 'Changing Freedrive', 'warning');
-  else if (s.freedrive_active) setStatusChip('motion-status', 'Freedrive', 'active');
-  else if ([5, 6, 7, 8].includes(currentTask?.id) && flex?.tracking) setStatusChip('motion-status', 'Looking', 'active');
-  else if (flex?.tracking || s.tracking) setStatusChip('motion-status', 'Tracking', 'tracking');
-  else if (s.arm_moving === true || flex?.moving === true) setStatusChip('motion-status', 'Moving', 'active');
-  else if ((s.arm_enabled || flex) && armStill && flexStill) setStatusChip('motion-status', 'Standstill', 'ok');
-  else setStatusChip('motion-status', 'Unavailable');
+  const chips = systemStatus(s, {sessionStopped, stopping, interrupting, currentTask});
+  for (const [id, chip] of Object.entries(chips)) setStatusChip(id, chip.label, chip.tone);
 }
 
 function renderState(s) {
@@ -815,6 +789,39 @@ const ZOOM_RATE_PER_MS = 0.0002;
 let taskZoomFrame = null;
 let taskZoomTarget = null;
 let taskZoomKey = null;
+let zoomToPublish = null, zoomPublishTimer = null, zoomPublishing = false;
+
+function queueCameraZoom(zoom) {
+  if (!currentTask || [3, 4].includes(currentTask.id) || taskPending || interrupting || stopping || sessionStopped) return;
+  zoomToPublish = {zoom, revision: currentTask.revision};
+  if (zoomPublishTimer === null && !zoomPublishing) zoomPublishTimer = setTimeout(publishCameraZoom, 80);
+}
+
+async function publishCameraZoom() {
+  zoomPublishTimer = null;
+  const update = zoomToPublish;
+  zoomToPublish = null;
+  if (!update || update.revision !== currentTask?.revision || [3, 4].includes(currentTask?.id)
+      || taskPending || interrupting || stopping || sessionStopped) return;
+  zoomPublishing = true;
+  let retry = false;
+  try {
+    const response = await fetch('/api/camera/zoom', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(update), signal: AbortSignal.timeout(3000)
+    });
+    if (!response.ok && response.status !== 409) throw new Error('Could not synchronize camera zoom');
+    reportStatus('camera-zoom', 'CAMERA', '');
+  } catch (error) {
+    // Keep the latest value for recovery; never replay an old task revision.
+    if (!zoomToPublish) zoomToPublish = update;
+    retry = true;
+    reportStatus('camera-zoom', 'CAMERA', error.message, 'error');
+  } finally {
+    zoomPublishing = false;
+    if (zoomToPublish) zoomPublishTimer = setTimeout(publishCameraZoom, retry ? 500 : 80);
+  }
+}
 
 function stopZoom() {
   cancelAnimationFrame(zoomFrame);
@@ -834,7 +841,7 @@ function syncTaskZoom(task, animate = true) {
   if (!Number.isFinite(task.zoom)) { stopTaskZoom(); return; }
   if (!active || task.error) {
     stopTaskZoom();
-    setCameraZoom(task.zoom, active);
+    setCameraZoom(task.zoom, active, false);
     return;
   }
   if (document.hidden) { stopTaskZoom(); return; }
@@ -872,12 +879,13 @@ function syncTaskZoom(task, animate = true) {
   taskZoomFrame = requestAnimationFrame(advance);
 }
 
-function setCameraZoom(value, taskControlled = false) {
+function setCameraZoom(value, taskControlled = false, publish = true) {
   if (!Number.isFinite(value)) return;
   cameraZoom = Math.min(2, Math.max(1, value));
   const label = `${Number(cameraZoom.toFixed(2))}x`;
   // Enlarge around the center; the camera viewport clips the outer image.
   cameraImage.style.transform = `scale(${cameraZoom})`;
+  if (publish && !taskControlled) queueCameraZoom(cameraZoom);
   zoomSlider.value = cameraZoom;
   zoomSlider.setAttribute('aria-valuetext', label);
   zoomRatio.value = label;
@@ -947,7 +955,7 @@ window.addEventListener('blur', () => { stopZoom(); stopTaskZoom(); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { stopZoom(); stopTaskZoom(); }
 });
-setCameraZoom(1);
+setCameraZoom(1, false, false);
 
 const categoryButtons = new Map();
 document.getElementById('tracking').addEventListener('click', event => {
@@ -996,85 +1004,7 @@ function renderPerception(camera) {
   perceptionToggle.title = full ? 'Switch to test bounding-box detection' : 'Switch to full surgical segmentation and stage recognition';
   document.getElementById('perception-mode-label').textContent =
     `${full ? 'Full · masks' : 'Test · boxes'}${camera.vision_status === 'loading' ? ' · Loading…' : camera.vision_status === 'error' ? ' · Unavailable' : ''}`;
-  const stage = camera.stage || {status: 'inactive', phases: [], top3: []};
-  const panel = document.getElementById('surgical-stage');
-  panel.dataset.inactive = String(!full);
-  panel.setAttribute('aria-disabled', String(!full));
-  const top = full ? stage.top3 || [] : [];
-  const active = top[0]?.id ?? null;
-  const status = document.getElementById('stage-status');
-  status.hidden = active !== null;
-  status.textContent = !full ? 'Inactive in Test mode' : stage.error ||
-    (stage.status === 'loading' ? 'Loading stage model…' : 'Waiting for a fresh stage prediction…');
-  status.dataset.level = full && stage.error ? 'error' : 'info';
-  const percent = value => value > 0 && value < .01 ? '<1%' : `${Math.round(value * 100)}%`;
-  const elapsed = active !== null && Number.isFinite(stage.phase_elapsed_s) ? Math.max(0, stage.phase_elapsed_s) : null;
-  const rail = document.getElementById('stage-rail');
-  rail.replaceChildren();
-  for (const phase of stage.phases || []) {
-    const item = document.createElement('li');
-    const passed = active !== null && phase.id < active;
-    item.dataset.passed = String(passed);
-    const index = document.createElement('span');
-    index.className = 'stage-index';
-    const number = document.createElement('span');
-    number.className = 'stage-number';
-    number.textContent = phase.id;
-    index.appendChild(number);
-    const track = document.createElement('span');
-    track.className = 'stage-time-track';
-    const timeFill = document.createElement('span');
-    timeFill.style.height = '0%';
-    const duration = phase.duration_s;
-    const hasDuration = Number.isFinite(duration) && duration > 0;
-    if (passed) {
-      timeFill.style.height = '100%';
-      track.setAttribute('role', 'progressbar');
-      track.setAttribute('aria-label', `${phase.name}: earlier than the current stage`);
-      track.setAttribute('aria-valuemin', '0');
-      track.setAttribute('aria-valuemax', '100');
-      track.setAttribute('aria-valuenow', '100');
-      track.setAttribute('aria-valuetext', 'Full: earlier than the current recognized stage');
-    } else if (phase.id === active && elapsed !== null && hasDuration) {
-      timeFill.style.height = `${Math.min(100, elapsed / duration * 100)}%`;
-      track.setAttribute('role', 'progressbar');
-      track.setAttribute('aria-label', `${phase.name}: elapsed time against statistical duration`);
-      track.setAttribute('aria-valuemin', '0');
-      track.setAttribute('aria-valuemax', String(duration));
-      track.setAttribute('aria-valuenow', String(Math.min(duration, elapsed)));
-      track.setAttribute('aria-valuetext', `${Math.floor(elapsed)} seconds elapsed / ${duration} seconds statistical duration`);
-    } else track.setAttribute('aria-hidden', 'true');
-    track.appendChild(timeFill);
-    index.appendChild(track);
-    const box = document.createElement('div');
-    box.className = 'stage-box';
-    if (hasDuration) box.title = `Statistical duration: ${duration} s`;
-    const label = document.createElement('span');
-    label.className = 'stage-name';
-    label.textContent = phase.name;
-    const score = document.createElement('span');
-    score.className = 'stage-score';
-    const prediction = top.find(value => value.id === phase.id);
-    score.textContent = prediction ? percent(prediction.prob) : '—';
-    box.dataset.predicted = String(Boolean(prediction));
-    const confidenceFill = document.createElement('span');
-    confidenceFill.className = 'stage-box-confidence';
-    confidenceFill.setAttribute('aria-hidden', 'true');
-    confidenceFill.style.width = prediction ? `${Math.max(0, Math.min(100, prediction.prob * 100))}%` : '0%';
-    box.append(label, score, confidenceFill);
-    if (phase.id === active) {
-      item.setAttribute('aria-current', 'step');
-      const timing = document.createElement('span');
-      timing.className = 'stage-elapsed';
-      timing.textContent = elapsed === null ? 'Waiting for timing…' : hasDuration ?
-        `${Math.floor(elapsed)} / ${duration} s` : `${Math.floor(elapsed)} s elapsed`;
-      box.appendChild(timing);
-    }
-    item.append(index, box);
-    rail.appendChild(item);
-  }
-  document.getElementById('stage-context').textContent = active === null ?
-    'Elapsed / statistical duration (seconds).' : 'Elapsed / statistical duration (seconds). Timer resets on stage changes.';
+  renderSurgicalStage(camera);
 }
 
 function renderCamera(camera) {

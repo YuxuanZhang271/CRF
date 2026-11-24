@@ -15,10 +15,10 @@
 <input id="seek" type="range" min="0" max="1" step="0.01" value="0" disabled aria-label="Playback time">
 <p id="notice" class="status" role="status">Choose a recording to load.</p>
 </section>
-<section class="card replay-video"><h3>Recorded camera</h3><div class="replay-image"><img id="frame" alt="Recorded camera frame"><p id="no-frame">No frame at this time</p></div><p id="frame-status" class="status"></p></section>
+<section class="card replay-video"><h3>Recorded camera</h3><label><input type="checkbox" id="raw-camera"> Clean camera image</label><div class="replay-image"><img id="frame" alt="Recorded camera frame"><p id="no-frame">No frame at this time</p></div><p id="frame-status" class="status"></p></section>
 <section class="card replay-summary"><h3>Session summary</h3><dl id="summary"></dl><h3>State at cursor</h3><dl id="state"></dl></section>
 <section class="card replay-charts"><h3>Motion traces</h3><canvas id="joints" aria-label="UR5 joint angles"></canvas><canvas id="flex" aria-label="Flex bend and roll"></canvas><canvas id="tendons" aria-label="Tendon travel"></canvas></section>
 <section class="card replay-events"><h3>Tasks, commands and console</h3><div id="events" role="log"></div></section>
-<section class="card replay-speech"><h3>Speech and parsed commands</h3><div id="speech" role="log"></div></section>
+<section class="card replay-speech"><h3>Speech and parsed commands</h3><button id="listen-audio" type="button">Listen from cursor (15s)</button><audio id="voice-audio" controls preload="none"></audio><p id="audio-status" class="status" role="status">Microphone audio is available in new recordings.</p><div id="speech" role="log"></div></section>
 <details class="card replay-config"><summary>Configuration at cursor</summary><pre id="config"></pre></details>
 </main><script src="/static/recording.js"></script></body></html>

@@ -166,9 +166,19 @@ Stages before the current recognized stage light up with full vertical timing se
 
 In Test mode the stage card stays visible but inactive; stage inference stops and predictions are cleared. Switching perception mode or a gap in stage sampling resets temporal context. Selecting another category leaves stage context intact.
 
+### Separate live view
+
+Click **Open live view ↗** in the dashboard header to duplicate the surgical stage and annotated camera into a new tab, or open [the live view](http://127.0.0.1:8080/live) directly. Move that tab to another window or monitor as needed. The left quarter shows surgical stages, the middle half shows the annotated camera, and the right quarter is blank. The camera keeps its square viewport with the full source image visible at 1× zoom.
+
+The view follows the running app's perception mode, selected category, and digital zoom. Dashboard zoom buttons, slider, presets and keyboard zoom are mirrored, and zoom Tasks 3/4 continue updating the live view while the dashboard is in the background. Stages remain inactive in Test mode. This is a passive display with its own theme button; it does not send robot commands or take keyboard control. The app must remain running, and closing either tab leaves the other available. Saved-session replay remains at `/viewer`.
+
+The **ARM**, **FLEX**, **MOTION**, **TASK** and **LLM** status bar sits below the live camera and uses the same labels and colors as the dashboard. Indicators update independently of the camera; unavailable status feeds clear their previous values until they reconnect.
+
 ### Voice commands
 
 The app recognizes speech in the background. Press **LISTEN** or `Alt+L` to enable task triggering, then speak a command such as “move forward,” “look left,” “zoom in,” or “track the bottle.” Check the transcript and task result in the LLM panel.
+
+Beside **LISTEN**, **Loading 12.3s** shows elapsed model startup time; once both ASR and LLM are ready, **Loaded in 12.3s** retains the total startup duration, including resource verification and warmup. Reloading the dashboard or toggling LISTEN preserves this time.
 
 With LISTEN enabled, the standalone English word **stop** triggers Task 0 as soon as it appears in recognition. Turning LISTEN off leaves an already-running task active; use INTERRUPT or `I` to stop it. Voice tracking resolves names against the active perception mode's categories; a command without a named target uses the selected category. Surgical names require Full mode.
 
@@ -224,9 +234,11 @@ Look Tasks 5–8 and Reset require active RCM when the UR5 is connected. Trackin
 
 ## Record and replay
 
-Press **RECORD** or `Alt+R` to start or stop recording. Sessions are saved under `recordings/` in five-minute slices; the slice index starts at `00000` and the timer resets for each slice. Recordings include camera frames, robot state, commands, task events, and speech results. Raw microphone audio is not saved.
+Press **RECORD** or `Alt+R` to start or stop recording. Sessions are saved under `recordings/` in five-minute slices; the slice index starts at `00000` and the timer resets for each slice. Recordings include annotated and clean camera images, robot/pump state, commands, task events, detections/segmentation polygons, stage predictions, configuration, console messages, speech results, and microphone audio. Audio includes silence and speech while LISTEN is off; RECORD controls storage independently of task triggering. Audio is the unfiltered mono 16 kHz PCM supplied to ASR after input resampling, saved as WAV. Clean camera images use JPEG compression. See the [recording coverage table](docs/DEVELOPMENT.md#recording-and-diagnostics) for rates and limits.
 
 Click **Open recording viewer** beside the recording controls, or open [the dashboard viewer](http://127.0.0.1:8080/viewer). Select a session and use play/pause, seek, and playback speed to inspect the camera, motion charts, and event timeline.
+
+Select **Clean camera image** to inspect frames without overlays. **Listen from cursor (15s)** opens a microphone clip at the selected time with its own audio controls. Older recordings remain readable but do not contain these new media streams. Each slice's `microphone.wav` can also be opened directly; timeline indexes preserve recording boundaries and audio gaps.
 
 To replay without starting cameras or robot connections:
 

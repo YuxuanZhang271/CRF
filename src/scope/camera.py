@@ -252,12 +252,20 @@ class CameraFeed:
                 jpeg = self._latest
                 self._condition.notify_all()
             if self.recorder is not None:
+                raw_jpeg = None
+                if self.recorder.status()['active']:
+                    ok, raw_encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if ok:
+                        raw_jpeg = raw_encoded.tobytes()
+                    else:
+                        self.recorder.event('camera_recording_error', {'frame': frame_id,
+                            'captured_at': captured_at, 'error': 'Could not encode clean camera image'})
                 self.recorder.event('camera_frame', {
                     'frame': frame_id, 'captured_at': captured_at,
                     'revision': revision, 'category': category, 'mode': mode,
                     'width': frame.shape[1], 'height': frame.shape[0],
                     'overlay_captured_at': cached[1] if detections else None,
-                }, jpeg=jpeg)
+                }, jpeg=jpeg, raw_jpeg=raw_jpeg)
 
     def _run_detection(self):
         detector, epoch, previous_id = None, -1, 0

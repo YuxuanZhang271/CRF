@@ -143,6 +143,34 @@ the image, leaving the stage overlay fixed. Tasks help text and the existing
 Tracking button share their respective title rows, aligned right; help text
 wraps within its header on narrow screens.
 
+`GET /live` serves a passive duplicate in `src/static/live.html`, with its own
+`live.css` and `live.js`. Its content grid retains 1:2:1 columns for surgical
+stage, annotated camera and an empty reserved column. The stage panel sits in
+the left column instead of overlaying the camera. `stage.js` shares the exact
+stage rendering with the dashboard (scores, timing rail and inactive states).
+The new tab polls `/api/camera/state` and consumes `/api/camera/stream` for the
+current revision, reusing the existing camera/inference workers. It follows
+mode/category changes and reconnects on stream failure; status failures clear
+the image and stage highlights. No dashboard/keyboard script, focus lease,
+motion endpoint or additional model instance is used. The recording `/viewer`
+routes remain separate. Camera status includes the current shared `TaskState.zoom`.
+Dashboard manual zoom updates are coalesced through `POST /api/camera/zoom`,
+with one request in flight and an expected task revision. The server rejects
+stale updates, updates during stopping, and manual writes while Tasks 3/4 own
+zoom. This endpoint updates display state only; it never selects a task or
+sends motion. Initial dashboard state restores the saved zoom, and task-feedback
+animation never publishes manual updates. The live view polls at 200 ms and
+applies that zoom to the annotated image, with a 200 ms visual transition.
+Both views clip around the image center and retain the fixed stage panel.
+
+The live camera column also includes the dashboard's five system-status chips.
+`status.js` shares device/motion, task and speech label/tone calculations between
+both views. The passive view reads `/api/state` and `/api/llm?after=...` at 200 ms,
+separately from camera polling; its speech cursor avoids re-fetching event history.
+Failed feeds replace affected chips with Unavailable while other feeds continue.
+Closing the view cancels its timers/requests and releases its image stream;
+restoring a cached tab resumes polling without acquiring a control lease.
+
 Model source, file sizes and hashes are retained in
 [`models.json`](../src/scope/models.json) and
 [`MODEL_PROVENANCE.md`](../src/scope/MODEL_PROVENANCE.md). Runtime assets live
@@ -207,7 +235,55 @@ Fast Stop detects the standalone English word in ASR partials/finals only while 
 
 ## Recording and diagnostics
 
-Sessions use five-minute JSONL/MJPEG segments under `recordings/`. The recorder retains state, commands, detections, task transitions, configuration, and speech/dispatch events. It does not save raw microphone audio. Browser replay reads bounded timeline windows and indexed JPEG byte ranges.
+Sessions use five-minute JSONL/MJPEG/WAV segments under `recordings/`. RECORD
+gates storage for all streams, including microphone audio; LISTEN only gates voice
+task triggering. This table audits coverage before and after the recording
+extension; unavailable devices produce unavailable/null state, not invented data.
+
+| System data | Prior coverage | Current storage and rate |
+| --- | --- | --- |
+| Annotated camera preview | Recorded | `camera_frame` + indexed `camera.mjpeg`, each published capture frame, JPEG quality 85. Source frame ID, capture clock, size, category/mode revision and overlay source time are retained. Browser zoom is in task state, not baked into the image. |
+| Clean camera image | Missing | Same event's `raw_image` indexes `camera_raw.mjpeg`, without overlays, JPEG quality 95 at capture resolution. This is compressed, not lossless sensor output. Encoded only during RECORD. |
+| Microphone voice and silence | Missing | `microphone_audio` + `microphone.wav`, every consumed PCM block (normally 20 ms), mono 16 kHz signed little-endian PCM16 after device resampling, before VAD/ASR. Includes LISTEN-off periods during RECORD. |
+| ASR and LLM output | Recorded | `llm` events: partial/final transcripts, revisions/segment IDs, slots, clarification, candidate metadata, errors/tracebacks, fast Stop, suppression and dispatch outcomes. No model tensors or token activations are captured. |
+| Voice runtime/model state | Events only; no initial state if recording starts late | `state.llm` at 20 Hz and initial snapshot: gate/generation, stream ID and readiness/errors. Worker identity/log path, loading times, settings JSON, pinned model revisions, microphone choice and offline policy in config (updated when models become ready). |
+| UR5 telemetry and geometry | Recorded | `state.robot` at 20 Hz from cached feedback: six joint angles, sample freshness/time, motion/connection faults, derived endoscope pose, RCM pivot/axis/depth, tip angles/cone, Freedrive and procedure state. Not the complete 125 Hz RTDE stream, joint torque/current, or a network packet capture. |
+| Flex telemetry and modeled shape | Recorded | Same sampled state: bend components/magnitude, roll, tendon positions, model shape, feedback mode, calibration/zero, native feedback stamp/sequence/request/action/result/flags, capabilities, motion/fault and procedure status. Does not archive every native IPC exchange or unexposed motor channels. |
+| Water/gas and cleaning | Recorded | Sampled Flex readiness, spray action/phase/error/message, plus command/task transitions and outcomes. No pressure or flow measurements are exposed by the current system. |
+| Perception and tracking | Recorded | `yolo` for every completed inference: all returned boxes/confidences/class IDs, segmentation polygons, selected target, pixel error, freshness, capture frame/time and revision. Test mode's configured category filtering still applies. No dense masks, features or unreturned class scores. |
+| Surgical stage | Recorded, but omitted from viewer event list | `surgical_stage` at independent 1 Hz sampling when Full mode is ready: top-three scores, frame/time, sample count, phase visit start; sampled status also includes elapsed time and bounded history. Now visible in viewer event lists. |
+| Perception mode/category | Recorded | Mode transition event, mode-tagged camera/inference, and sampled metadata/configuration including available categories and stage metadata. |
+| Commands and task lifecycle | Recorded | HTTP command bodies/results, shared task selection/stopping/error/completion events, ownership revisions, zoom and sampled current task. Held key requests/releases and focus heartbeats follow the same audited HTTP path; no global keyboard recording. |
+| Configuration | Recorded; voice settings path only | Initial/segment config plus changes: launch arguments, JSON-safe module constants, control/Flex limits/calibration, camera selection, and now voice settings contents. Model weights and executable binaries are not duplicated. |
+| Console/diagnostics | Recorded while RECORD is active | Python and forwarded dashboard console events, state/media errors, dispatch tracebacks. Separate per-run warning/error log remains independent of RECORD. Worker stderr logs are referenced by path, not copied in full into recordings. |
+| Recorder health and timing | Recorded | UTC timestamps, session monotonic/Unix origins, sequence, segment index, nominal state rate, per-kind dropped-record counts and final stop event. Bounded queues drop incoming records under overload instead of blocking producers. |
+
+Schema **2** adds `raw_image` and `audio` references; old JSONL/MJPEG recordings
+remain readable. A slice contains `events.jsonl`, optional `camera.mjpeg`, optional
+`camera_raw.mjpeg`, and optional `microphone.wav`. No microphone file is created
+until PCM arrives while RECORD is active. At 16 kHz PCM16, continuous mono audio
+uses approximately **9.6 MB per five-minute slice**, plus JSON indexes. Keeping
+both camera streams adds image encoding and storage work; queue byte accounting
+includes both images and PCM, and camera records leave queue capacity for other
+events. Drops remain visible by kind, including `microphone_audio`.
+
+Each audio reference has a segment-local `offset_samples` and `sample_count`.
+The enclosing event retains stream-global `sample_start`, stream ID, input format,
+`audio_start_monotonic_s`, receive time and stream origin. The first block's
+receive time minus duration estimates the stream start; subsequent blocks use
+sample counts. It does not claim ADC-level synchronization. WAV files concatenate
+stored blocks, so use indexes when recovering gaps or aligning streams. Browser
+audio clips reconstruct the requested time range with silence for missing blocks
+and can cross segment boundaries. The WAV header and media/index files flush
+periodically; normal stop/rotation finalizes headers. A crash can leave the last
+buffered records unavailable.
+
+Browser replay reads bounded timeline windows and indexed JPEG byte ranges.
+The clean-image checkbox selects the alternate reference; older recordings show
+an unavailable message. The audio button requests a bounded 15-second WAV clip
+from the cursor, with separate native playback controls (not synchronized with
+the viewer's play/speed controls). Audio reads validate paths, offsets and format.
+Neither viewer starts hardware or speech models.
 
 The browser viewer has its own assets in `src/static/recording.*`; `src/recording_web.py` serves it without opening camera or robot connections. Both viewers read the recording format maintained by `src/status.py`.
 

@@ -63,6 +63,7 @@ async function main() {
     },
   });
   const source = fs.readFileSync(path.join(__dirname, '../src/static/dashboard.js'), 'utf8');
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/static/status.js'), 'utf8'), context);
   vm.runInContext(source.slice(0, source.indexOf('const speedFieldIds')), context);
   vm.runInContext(`
     const pullOutButton = document.getElementById('pull-out');

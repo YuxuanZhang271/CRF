@@ -3,6 +3,7 @@
   const button = document.getElementById('listen');
   const status = document.getElementById('llm-status');
   const output = document.getElementById('llm-output');
+  const loadTime = document.getElementById('llm-load-time');
   const segments = new Map();
   let cursor = 0, generation = null, enabled = false, pending = false;
   let lastStateError = null, transportError = null;
@@ -22,6 +23,7 @@
     if (atEnd) output.scrollTop = output.scrollHeight;
   }
   function unavailable(error) {
+    loadTime.textContent = 'Load time unavailable';
     setStatusChip('llm-status', 'Error', 'error');
     if (transportError !== error.message) {
       message(error.message, 'error');
@@ -30,14 +32,20 @@
     transportError = error.message;
   }
   function render(state) {
+    const loading = state.model_loading || {};
+    const seconds = Number.isFinite(loading.elapsed_s) && loading.elapsed_s >= 0
+      ? `${loading.elapsed_s.toFixed(1)}s` : null;
+    const timingLabels = {loading: 'Loading', ready: 'Loaded in', error: 'Load failed after', cancelled: 'Load cancelled after'};
+    loadTime.textContent = seconds && timingLabels[loading.phase]
+      ? `${timingLabels[loading.phase]} ${seconds}`
+      : ['idle', 'loading'].includes(state.phase) ? 'Loading…' : 'Load time unavailable';
     enabled = state.enabled;
     button.setAttribute('aria-pressed', String(enabled));
     button.textContent = enabled ? 'LISTEN ●' : 'LISTEN';
     button.disabled = pending || stopping || sessionStopped;
-    const label = state.error ? 'Error' : ({idle: 'Loading', loading: 'Loading', ready: 'Ready',
-      listening: 'Listening', closed: 'Closed', unavailable: 'Unavailable'}[state.phase] || 'Unavailable');
-    setStatusChip('llm-status', label, state.error ? 'error' : label === 'Loading' ? 'warning' : 'ok');
-    status.title = `${label} · Task triggering ${enabled ? 'enabled' : 'disabled'}`;
+    const {label, tone, title} = speechStatus(state);
+    setStatusChip('llm-status', label, tone);
+    status.title = title;
     for (const event of state.events || []) {
       const stream = event.stream_id ?? event.generation;
       if (generation !== stream) { segments.clear(); generation = stream; }

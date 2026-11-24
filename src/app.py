@@ -48,6 +48,11 @@ DASHBOARD_CONFIRM_TIMEOUT_S = 10.0
 STATIC_DIR = Path(__file__).with_name("static")
 STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
+    "/live": ("live.html", "text/html; charset=utf-8"),
+    "/static/live.css": ("live.css", "text/css; charset=utf-8"),
+    "/static/live.js": ("live.js", "text/javascript; charset=utf-8"),
+    "/static/stage.js": ("stage.js", "text/javascript; charset=utf-8"),
+    "/static/status.js": ("status.js", "text/javascript; charset=utf-8"),
     "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/static/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
@@ -132,7 +137,7 @@ class _Handler(BaseHTTPRequestHandler):
                 'categories': category_metadata(self.server.camera.status().get('mode', 'test')),
             })
         elif url.path == '/api/camera/state':
-            self._json(self.server.camera.status())
+            self._json({**self.server.camera.status(), 'zoom': self.server.tasks.snapshot()['zoom']})
         elif url.path == '/api/camera/stream':
             try:
                 revision = int(parse_qs(url.query).get('revision', [''])[0])
@@ -254,6 +259,18 @@ class _Handler(BaseHTTPRequestHandler):
 
         if self.path == '/api/cmd/freedrive':
             return self._freedrive_command(body)
+
+        if self.path == '/api/camera/zoom':
+            zoom = body.get('zoom')
+            if type(zoom) not in (int, float) or not 1 <= zoom <= 2:
+                return self._json({'error': 'Expected a zoom ratio from 1 to 2.'}, 400)
+            with self.server.node.control_lock:
+                task = self.server.tasks.snapshot()
+                if (type(body.get('revision')) is not int or body['revision'] != task['revision']
+                        or task['id'] in (3, 4) or self.server.stopping or self.server.interrupting):
+                    return self._json({'error': 'Zoom ownership changed; wait for current task state.'}, 409)
+                self.server.tasks.update(zoom=float(zoom))
+            return self._json({'ok': True, 'zoom': float(zoom)})
 
         if self.path in ('/api/camera/category', '/api/camera/mode'):
             switching = self.path == '/api/camera/mode'

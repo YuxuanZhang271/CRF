@@ -135,7 +135,7 @@ class RecordingData:
             self.frames.append((stamp, data))
         elif kind == 'yolo':
             self.yolo.append((stamp, data))
-        elif (kind in ('console', 'state_error', 'session_stop', 'task', 'llm')
+        elif (kind in ('console', 'state_error', 'camera_recording_error', 'session_stop', 'task', 'llm', 'perception_mode', 'surgical_stage')
               or kind == 'config' or
               (kind in ('command', 'command_result') and data.get('path') != '/api/key/heartbeat')):
             self.events.append((stamp, kind, data))
@@ -199,7 +199,12 @@ def event_label(kind, data):
         return f"{data.get('command')} → HTTP {data.get('http_status')} {data.get('response', {}).get('error', '')}"
     if kind == 'command':
         return f"{data.get('command')} {json.dumps(data.get('body', {}), ensure_ascii=False)}"
-    if kind == 'state_error':
+    if kind == 'surgical_stage':
+        top = (data.get('top3') or [{}])[0]
+        return f"Stage {top.get('id', '—')} · {top.get('name', '')}"
+    if kind == 'perception_mode':
+        return f"Perception mode · {data.get('mode', '')}"
+    if kind in ('state_error', 'camera_recording_error'):
         return str(data.get('error', 'State unavailable'))
     return kind.replace('_', ' ')
 

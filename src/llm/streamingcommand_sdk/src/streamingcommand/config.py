@@ -37,10 +37,13 @@ class ASRConfig:
     speech_model_dir: str | None = None
     expected_gpu_uuid: str | None = None
     warmup: bool = True
+    num_workers: int = 4
     compatibility_lock_file: str | None = None
 
     def __post_init__(self):
         """Check that the ASR backend exists and that the profile uses a single engine."""
+        if type(self.num_workers) is not int or not 1 <= self.num_workers <= 32:
+            raise ValueError("asr.num_workers must be an integer from 1 to 32")
         if self.backend not in {"native", "vllm", "vllm-builtin", "fake"}:
             raise ValueError("ASR backend must be native, vllm, vllm-builtin or fake")
         if self.profile == "v15-speech-aware-dual":
@@ -50,6 +53,7 @@ class ASRConfig:
 @dataclass
 class CommandConfig:
     enabled: bool = True
+    num_workers: int = 4
     model: str = HYBRID_MODEL
     device: str = "auto"
     python: str | None = None
@@ -64,6 +68,8 @@ class CommandConfig:
 
     def __post_init__(self):
         """Validate inline candidates and require a single candidate source."""
+        if type(self.num_workers) is not int or not 1 <= self.num_workers <= 32:
+            raise ValueError("command.num_workers must be an integer from 1 to 32")
         if self.candidates is not None and self.candidates_file is not None:
             raise ValueError("Choose either command.candidates or command.candidates_file")
         if self.candidates is not None:
@@ -127,11 +133,14 @@ class StreamingConfig:
     cache_dir: str | None = None
     logs_dir: str | None = None
     offline: bool = False
+    parallel_start: bool = False
     models: dict[str, dict[str, str | int]] = field(default_factory=dict)
 
     def __post_init__(self):
         """Check model and recognition-logic compatibility along with segment and queue capacities."""
         _validate_sources(self.models)
+        if type(self.parallel_start) is not bool:
+            raise ValueError("parallel_start must be a boolean")
         if self.command.enabled and self.command.model not in CHECKPOINTS:
             raise ValueError(f"Unknown command.model: {self.command.model}")
         if self.command.enabled and self.command.model == PUBLISHED_MODEL and self.command.recognition_logic != "original":

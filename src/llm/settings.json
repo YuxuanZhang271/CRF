@@ -1,10 +1,13 @@
 {
+  "parallel_start": true,
   "asr": {
+    "num_workers": 8,
     "backend": "native",
     "device": "auto",
     "profile": "v17-yue-precision"
   },
   "command": {
+    "num_workers": 8,
     "model": "clarification-hybrid",
     "device": "auto",
     "recognition_logic": "original",

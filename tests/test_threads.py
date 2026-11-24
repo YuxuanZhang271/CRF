@@ -39,7 +39,7 @@ class CameraThreadTests(unittest.TestCase):
                 patch("scope.camera.Detector", return_value=detector):
             feed = CameraFeed()
             recorded = []
-            feed.recorder = SimpleNamespace(event=lambda kind, data, **kwargs:
+            feed.recorder = SimpleNamespace(status=lambda: {'active': True}, event=lambda kind, data, **kwargs:
                                            recorded.append((kind, data, kwargs)))
             feed.select_category(39)
             feed.__enter__()
@@ -65,6 +65,7 @@ class CameraThreadTests(unittest.TestCase):
                 camera_records = [item for item in recorded if item[0] == 'camera_frame']
                 self.assertTrue(camera_records)
                 self.assertTrue(camera_records[-1][2]['jpeg'].startswith(b'\xff\xd8'))
+                self.assertTrue(camera_records[-1][2]['raw_jpeg'].startswith(b'\xff\xd8'))
                 # Inference publishes its completed record just after waking observers.
                 deadline = time.monotonic() + 1.
                 while time.monotonic() < deadline and not any(

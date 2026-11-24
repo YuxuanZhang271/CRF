@@ -3,6 +3,7 @@
   let session = '', data = null, cursor = 0, duration = 0, playing = false, last = 0;
   let windowStart = 0, loading = false, generation = 0, frameIndex = null, frameLoading = false;
   let nextFrame = null, lastEvents = '', lastConfig = '';
+  let audioUrl = null;
   const colors = ['#c995d1','#e9bc62','#5bc5a4','#79b2f2','#edaa78','#d8d2de'];
   const format = t => `${Math.floor(t/60)}:${(t%60).toFixed(2).padStart(5,'0')}`;
   async function json(url) {
@@ -40,6 +41,8 @@
   }
   function pause() { playing=false; $('play').textContent='PLAY'; }
   async function load() {
+    $('voice-audio').pause(); $('voice-audio').removeAttribute('src');
+    if(audioUrl) { URL.revokeObjectURL(audioUrl); audioUrl=null; }
     pause(); generation++; session=$('sessions').value; cursor=0; data=null; frameIndex=null;
     $('frame').removeAttribute('src'); $('no-frame').hidden=false;
     $('play').disabled=true; $('notice').textContent='Loading recording index…';
@@ -62,11 +65,12 @@
   }
   function showFrame(index) {
     nextFrame=index;
-    if(frameLoading || index===frameIndex || index===null) return;
+    const raw=$('raw-camera').checked, key=`${index}:${raw}`;
+    if(frameLoading || key===frameIndex || index===null) return;
     frameLoading=true; const token=generation, image=new Image();
-    const done=ok=>{frameLoading=false;if(token===generation && index===nextFrame && ok){$('frame').src=image.src;frameIndex=index;$('no-frame').hidden=true;}if(nextFrame!==index)showFrame(nextFrame);};
+    const done=ok=>{frameLoading=false;if(token===generation && index===nextFrame && raw===$('raw-camera').checked){frameIndex=key;if(ok){$('frame').src=image.src;$('no-frame').hidden=true;}else{$('frame').removeAttribute('src');$('no-frame').hidden=false;$('no-frame').textContent=raw?'Clean image unavailable in this recording':'Frame unavailable';}}if(nextFrame!==index || raw!==$('raw-camera').checked || token!==generation)showFrame(nextFrame);};
     image.onload=()=>done(true);image.onerror=()=>done(false);
-    image.src=`/api/viewer/frame?session=${encodeURIComponent(session)}&index=${index}`;
+    image.src=`/api/viewer/frame?session=${encodeURIComponent(session)}&index=${index}&raw=${$('raw-camera').checked?1:0}`;
   }
   function events() {
     const visible=data.events.filter(e=>e.time<=cursor), signature=visible.map(e=>`${e.time}:${e.kind}:${e.data.sequence||''}`).join('|');
@@ -107,6 +111,22 @@
   $('play').addEventListener('click',()=>{if(cursor>=duration)cursor=0;playing=!playing;$('play').textContent=playing?'PAUSE':'PLAY';if(cursor<windowStart)loadWindow();});
   $('seek').addEventListener('input',()=>{cursor=Number($('seek').value);if(cursor<windowStart||cursor>windowStart+55)loadWindow();else draw();});
   $('seek').addEventListener('change',()=>loadWindow());
+  $('raw-camera').addEventListener('change',()=>{frameIndex=null;draw();});
+  $('listen-audio').addEventListener('click',async()=>{
+    if(!session)return;
+    const token=generation, start=cursor;
+    $('voice-audio').pause(); $('listen-audio').disabled=true;
+    try {
+      const response=await fetch(`/api/viewer/audio?session=${encodeURIComponent(session)}&start=${start}&duration=15`,{signal:AbortSignal.timeout(20000)});
+      if(!response.ok){const result=await response.json();throw new Error(result.error);}
+      const blob=await response.blob(); if(token!==generation)return;
+      if(audioUrl)URL.revokeObjectURL(audioUrl);
+      audioUrl=URL.createObjectURL(blob);$('voice-audio').src=audioUrl;
+      $('audio-status').textContent=`Microphone audio from ${format(start)}. Missing audio is silent.`;
+      await $('voice-audio').play();
+    }catch(error){$('audio-status').textContent=error.message;}
+    finally{$('listen-audio').disabled=false;}
+  });
   window.addEventListener('resize',draw);new MutationObserver(draw).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
   sessions().catch(e=>{$('notice').textContent=e.message;});requestAnimationFrame(tick);
 })();

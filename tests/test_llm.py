@@ -69,6 +69,19 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         self.service._desired = True
         self.service._generation = 1
 
+    async def test_raw_audio_is_recorded_when_listen_gate_is_disabled(self):
+        self.service._desired = False
+        async def listen(device=None, audio_callback=None):
+            audio_callback(b'\0' * 640)
+            audio_callback(b'\x12\x34' * 320)
+            yield {'type': 'transcript.final', 'segment_id': 1, 'text': 'hello'}
+        await self.service._listen(SimpleNamespace(listen=listen))
+        chunks = [call for call in self.server.recorder.event.call_args_list if call.args[0] == 'microphone_audio']
+        self.assertEqual([c.args[1]['sample_start'] for c in chunks], [0, 320])
+        self.assertEqual(chunks[1].kwargs['pcm'], b'\x12\x34' * 320)
+        self.assertEqual(chunks[0].args[1]['stream_id'], 1)
+        self.assertAlmostEqual(chunks[1].args[1]['audio_start_monotonic_s'] - chunks[0].args[1]['audio_start_monotonic_s'], .02)
+
     async def test_worker_failure_preserves_original_traceback_and_log_path(self):
         import json
         from streamingcommand._runtime.selectable_commands import SelectableCommandParser, CommandWorkerError
@@ -232,6 +245,33 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_model_loading_timer_survives_event_cursor_and_freezes_on_ready_or_failure(self):
+        service = LLMService(server())
+        with patch('llm.service.time.monotonic', return_value=100.):
+            service._publish({'type': 'models.loading'})
+        with patch('llm.service.time.monotonic', return_value=105.):
+            self.assertEqual(service.snapshot(after=999)['model_loading'], {'phase': 'loading', 'elapsed_s': 5.})
+        with patch('llm.service.time.monotonic', return_value=110.):
+            service._publish({'type': 'models.ready', 'info': {'startup_seconds': 9.5}})
+        with patch('llm.service.time.monotonic', return_value=120.):
+            self.assertEqual(service.snapshot(after=999)['model_loading'], {'phase': 'ready', 'elapsed_s': 9.5})
+            service._publish({'type': 'command.error', 'message': 'Command failed'})
+            self.assertEqual(service.snapshot()['model_loading']['elapsed_s'], 9.5)
+            service._publish({'type': 'models.loading'})
+        with patch('llm.service.time.monotonic', return_value=123.):
+            service._publish({'type': 'llm.error', 'message': 'Weights missing'})
+        with patch('llm.service.time.monotonic', return_value=130.):
+            self.assertEqual(service.snapshot()['model_loading'], {'phase': 'error', 'elapsed_s': 3.})
+
+    def test_recording_started_after_model_ready_retains_identity_without_event_history(self):
+        service = LLMService(server())
+        service._publish({'type': 'models.ready', 'info': {'asr': {'num_workers': 8}, 'command': {'device': 'cpu'}}})
+        state = service.recording_snapshot()
+        self.assertEqual(state['models']['asr']['num_workers'], 8)
+        self.assertNotIn('events', state)
+        state['models']['asr']['num_workers'] = 0
+        self.assertEqual(service.recording_snapshot()['models']['asr']['num_workers'], 8)
+
     def test_start_preloads_and_toggles_only_gate_commands_without_resetting_session(self):
         opened, released = threading.Event(), threading.Event()
         class SDK:

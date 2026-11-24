@@ -4,6 +4,7 @@ body{height:auto;min-height:100vh;overflow:auto;padding:22px;background:var(--bg
 .replay-header p{color:var(--dim);margin:0;font-size:13px}.replay-header h1{margin-bottom:5px}
 .replay-layout{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(260px,1fr);gap:14px;max-width:1600px;margin:auto;height:auto;padding:0}
 .replay-layout .card{margin:0;min-width:0}.replay-controls{grid-column:1/-1;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.replay-speech audio{display:block;width:100%;margin:10px 0}.replay-video label{display:block;font-size:12px;margin-bottom:10px;color:var(--dim)}
 .replay-controls label{font-size:12px;color:var(--dim)}select{background:var(--inset);border:1px solid var(--edge);border-radius:6px;color:var(--fg);padding:8px;max-width:100%}
 #seek,.replay-controls .status{flex-basis:100%;width:100%;margin:0}#clock{margin-left:auto;font:13px ui-monospace,Consolas,monospace}
 .replay-image{position:relative;height:420px;background:#101014;display:flex;align-items:center;justify-content:center;border-radius:6px}

@@ -63,6 +63,8 @@ class NativeWindowsASR:
     def __init__(self,model_dir,max_new_tokens=96,max_model_len=4096,decoder_backend='hf',device='cuda:0'):
         """Load the local Qwen ASR model and processor onto the selected CPU or CUDA device."""
         from transformers import AutoConfig
+        from streamingcommand._runtime.model_loading import configure_loading
+        configure_loading()
         from qwen_asr_backend import Qwen3ASRConfig, Qwen3ASRForConditionalGeneration, Qwen3ASRProcessor
         from asr_consistent_features import install_native_consistent_features,install_native_consistent_attention
         AutoConfig.register('qwen3_asr',Qwen3ASRConfig,exist_ok=True)

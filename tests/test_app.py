@@ -83,6 +83,24 @@ class DashboardTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.request("GET", path)[0], 404)
 
+    def test_live_view_duplicates_stage_and_camera_without_loading_controls(self):
+        status, content_type, html = self.request('GET', '/live')
+        self.assertEqual(status, 200)
+        self.assertTrue(content_type.startswith('text/html'))
+        self.assertIn(b'id="surgical-stage"', html)
+        self.assertIn(b'id="camera-feed"', html)
+        self.assertIn(b'class="live-reserved"', html)
+        for filename in ('live.css', 'live.js', 'stage.js', 'status.js'):
+            path = f'/static/{filename}'
+            self.assertIn(path.encode(), html)
+            self.assertEqual(self.request('GET', path)[0], 200)
+        self.assertNotIn(b'/static/dashboard.js', html)
+        self.assertNotIn(b'/static/keyboard.js', html)
+        for chip in ('arm-status', 'flex-connection', 'motion-status', 'task-status', 'llm-status'):
+            self.assertIn(f'id="{chip}"'.encode(), html)
+        dashboard = self.request('GET', '/')[2]
+        self.assertIn(b'href="/live" target="_blank" rel="noopener"', dashboard)
+
     def test_diagnostic_feed_and_browser_terminal_forwarding(self):
         feed = DiagnosticLog()
         try:
@@ -148,6 +166,31 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.request('POST', '/api/cmd/interrupt', '{}')[0], 200)
         self.assertEqual(self.server.tasks.snapshot()['id'], 0)
         self.assertFalse(self.server.stopping)
+
+    def test_shared_camera_zoom_and_task_ownership(self):
+        revision = self.server.tasks.snapshot()['revision']
+        with patch.object(self.server.node, 'cmd_interrupt') as interrupt:
+            status, _, body = self.request('POST', '/api/camera/zoom', json.dumps({'zoom': 1.6, 'revision': revision}))
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)['zoom'], 1.6)
+            self.assertEqual(json.loads(self.request('GET', '/api/camera/state')[2])['zoom'], 1.6)
+            self.assertEqual(self.server.tasks.snapshot()['id'], 0)
+            interrupt.assert_not_called()
+        for zoom in (None, True, '1.5', 0, 3):
+            with self.subTest(zoom=zoom):
+                self.assertEqual(self.request('POST', '/api/camera/zoom', json.dumps({'zoom': zoom, 'revision': revision}))[0], 400)
+        for task_id in (3, 4):
+            self.server.tasks.select(task_id)
+            task = self.server.tasks.snapshot()
+            self.assertEqual(self.request('POST', '/api/camera/zoom', json.dumps({'zoom': 1.8, 'revision': task['revision']}))[0], 409)
+            self.server.tasks.update(zoom=1.75)
+            self.assertEqual(json.loads(self.request('GET', '/api/camera/state')[2])['zoom'], 1.75)
+        self.server.tasks.select(0)
+        self.assertEqual(self.request('POST', '/api/camera/zoom', json.dumps({'zoom': 1.8, 'revision': revision}))[0], 409)
+        revision = self.server.tasks.snapshot()['revision']
+        for flag in ('interrupting', 'stopping'):
+            with patch.object(self.server, flag, True):
+                self.assertEqual(self.request('POST', '/api/camera/zoom', json.dumps({'zoom': 1.8, 'revision': revision}))[0], 409)
 
     def test_active_task_blocks_direct_controls_recording_and_native_shortcuts(self):
         self.assertEqual(self.request('POST', '/api/task', '{"id":3}')[0], 200)

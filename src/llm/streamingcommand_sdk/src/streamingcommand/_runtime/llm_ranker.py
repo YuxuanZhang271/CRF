@@ -130,6 +130,8 @@ def load_qwen(model_path, init_adapter=None, device="cuda:0", local_files_only=T
     adapter.
     """
     from transformers import AutoTokenizer, Qwen3_5ForCausalLM
+    from .model_loading import configure_loading
+    configure_loading()
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=local_files_only)
     lm = Qwen3_5ForCausalLM.from_pretrained(model_path, dtype=torch.float16 if str(device).startswith("cuda:") else torch.float32,
             attn_implementation="sdpa", local_files_only=local_files_only)

@@ -28,6 +28,7 @@ async function main() {
   vm.runInContext(`let currentTask = {id: 0}, taskPending = false, stopping = false;
     const cameraImage = document.getElementById('camera-feed');`, context);
   const source = fs.readFileSync(path.join(__dirname, '../src/static/dashboard.js'), 'utf8');
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/static/stage.js'), 'utf8'), context);
   vm.runInContext(source.slice(source.indexOf('const categoryButtons ='), source.indexOf('let diagnosticCursor =')), context);
   const durations = [40.8, 568.8, 101.4, 583.8, 490.2, 830.4, 216.6];
   const phases = durations.map((duration_s, i) => ({id: i + 1, name: `Phase ${i + 1}`, duration_s}));
