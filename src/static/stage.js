@@ -4,7 +4,7 @@ function renderSurgicalStage(camera) {
   const stage = camera.stage || {status: 'inactive', phases: [], top3: []};
   const panel = document.getElementById('surgical-stage');
   panel.dataset.inactive = String(!full);
-  panel.setAttribute('aria-disabled', String(!full));
+  document.getElementById('stage-content').setAttribute('aria-disabled', String(!full));
   const top = full ? stage.top3 || [] : [];
   const active = top[0]?.id ?? null;
   const status = document.getElementById('stage-status');

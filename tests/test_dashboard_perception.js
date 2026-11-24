@@ -97,7 +97,7 @@ async function main() {
     stage: {status: 'inactive', phases, top3: [], history: []}})});
   await vm.runInContext('categoryRequest', context);
   assert.equal(get('category-options').children.length, 5);
-  assert.equal(get('surgical-stage').attrs['aria-disabled'], 'true');
+  assert.equal(get('stage-content').attrs['aria-disabled'], 'true');
   assert.equal(get('stage-status').hidden, false);
   assert.ok(get('stage-rail').children.every(row => row.dataset.passed === 'false'));
   assert.equal(get('stage-rail').children[0].children[0].children[1].children[0].style.height, '0%');

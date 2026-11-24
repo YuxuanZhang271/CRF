@@ -11,20 +11,19 @@
 <body class="live-view">
   <header class="live-header">
     <h1>Live surgical view</h1>
-    <nav aria-label="View options">
-      <a class="view-link" href="/" target="_blank" rel="noopener">Dashboard ↗</a>
-      <button id="theme-toggle" type="button" aria-pressed="false" title="Switch color mode">Light mode</button>
-    </nav>
+    <img class="lab-logo" src="/imgs/ABML_logo.png" alt="Advanced Bio-Medical Robotics Lab">
   </header>
   <main class="live-workspace">
-    <aside class="panel stage-panel live-stage" id="surgical-stage" aria-labelledby="stage-heading" aria-disabled="true" data-inactive="true">
+    <aside class="panel stage-panel live-stage" id="surgical-stage" aria-labelledby="stage-heading" data-inactive="true">
       <div class="panel-scroll">
-        <section class="card stage-recognition" aria-label="Stage recognition">
-          <h2 id="stage-heading" class="scope-subheading">Surgical stage</h2>
-          <p id="stage-status" class="stage-status" role="status">Waiting for camera status…</p>
-          <ul id="stage-rail" class="stage-rail" aria-label="Surgical stages"></ul>
-          <p id="stage-context" class="stage-context">Elapsed / statistical duration (seconds).</p>
-        </section>
+        <details class="card stage-recognition" open>
+          <summary><h2 id="stage-heading" class="scope-subheading">Surgical stage</h2></summary>
+          <div id="stage-content" aria-disabled="true">
+            <p id="stage-status" class="stage-status" role="status">Waiting for camera status…</p>
+            <ul id="stage-rail" class="stage-rail" aria-label="Surgical stages"></ul>
+            <p id="stage-context" class="stage-context">Elapsed / statistical duration (seconds).</p>
+          </div>
+        </details>
       </div>
     </aside>
     <section class="panel live-camera" aria-label="Live annotated camera">

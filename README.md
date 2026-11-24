@@ -160,17 +160,36 @@ The YOLO section switches between five test categories and 27 surgical categorie
 
 On desktop, each side panel takes one quarter of the available column width, leaving half for the camera. The translucent stage card floats over the camera's upper-left corner. The camera stays square (1:1), scaling to the available width or height, whichever is smaller. At 1x zoom the full source image is retained; non-square sources are letterboxed. On small screens, scroll inside the stage card to see the full list.
 
+Click **Surgical stage** to collapse or expand its card on the dashboard or separate live view. It starts expanded and can also be toggled with Enter or Space when the heading has keyboard focus. Recognition continues while the card is collapsed.
+
 Full mode segments the latest available frames as fast as inference allows. An independent stage worker samples the same raw camera stream at **1 Hz**, using its own segmentation pass and Causal MS-TCN temporal head. Confidence appears inside the model's top three stage boxes, with the current stage highlighted; a dash means no score was returned for that stage. Stage IDs and names are in the [development guide](docs/DEVELOPMENT.md#gastro28-perception).
 
 Stages before the current recognized stage light up with full vertical timing segments; for example, recognizing stage 6 lights stages 1–5. The current stage's segment fills using **elapsed time / statistical duration**. The fixed durations for stages 1–7 are **40.8, 568.8, 101.4, 583.8, 490.2, 830.4, and 216.6 seconds**. The highlighted stage shows elapsed and statistical duration in seconds. Elapsed time resets when the recognized stage changes or temporal context resets; timing is hidden while recognition is stale. The fill caps at 100% while the elapsed timer continues. Earlier-stage highlights follow the current stage number and clear if recognition moves backward, becomes stale, or enters Test mode. Confidence scores remain the model's current predictions. These highlights and timing ratios do not verify surgical completion.
 
 In Test mode the stage card stays visible but inactive; stage inference stops and predictions are cleared. Switching perception mode or a gap in stage sampling resets temporal context. Selecting another category leaves stage context intact.
 
+### Hardware performance
+
+The main dashboard's **Performance** card floats over the camera's upper-right
+corner, matching the surgical-stage card. Click **CPU**, **RAM**, or **GPU** to
+switch the color-coded 60-second history chart; readings update once per second
+for the server PC. Click the card heading to collapse it.
+
+CPU separates camera capture, vision, stage recognition, control/IPC, voice,
+recording, other app/native threads, and detected ASR/LLM child processes. All CPU
+percentages use the capacity of the whole CPU. Native library thread pools are
+shared and appear under App / native pools. RAM shows the shared CRF process and
+child-process memory; threads share their process's RAM. GPU utilization and
+VRAM are device-wide NVIDIA readings, with a separate color per GPU. Unsupported
+GPU monitoring and unavailable readings show a dash. Native Flex driver usage
+and unrelated processes are only represented in server totals. This monitor is
+independent of RECORD and is not saved in recordings.
+
 ### Separate live view
 
 Click **Open live view ↗** in the dashboard header to duplicate the surgical stage and annotated camera into a new tab, or open [the live view](http://127.0.0.1:8080/live) directly. Move that tab to another window or monitor as needed. The left quarter shows surgical stages, the middle half shows the annotated camera, and the right quarter is blank. The camera keeps its square viewport with the full source image visible at 1× zoom.
 
-The view follows the running app's perception mode, selected category, and digital zoom. Dashboard zoom buttons, slider, presets and keyboard zoom are mirrored, and zoom Tasks 3/4 continue updating the live view while the dashboard is in the background. Stages remain inactive in Test mode. This is a passive display with its own theme button; it does not send robot commands or take keyboard control. The app must remain running, and closing either tab leaves the other available. Saved-session replay remains at `/viewer`.
+The view follows the running app's perception mode, selected category, and digital zoom. Dashboard zoom buttons, slider, presets and keyboard zoom are mirrored, and zoom Tasks 3/4 continue updating the live view while the dashboard is in the background. Stages remain inactive in Test mode. The lab logo appears at the top right, and light/dark mode follows the main dashboard in the same browser, including changes while the live tab is open. This is a passive display; it does not send robot commands or take keyboard control. The app must remain running, and closing either tab leaves the other available. Saved-session replay remains at `/viewer`.
 
 The **ARM**, **FLEX**, **MOTION**, **TASK** and **LLM** status bar sits below the live camera and uses the same labels and colors as the dashboard. Indicators update independently of the camera; unavailable status feeds clear their previous values until they reconnect.
 

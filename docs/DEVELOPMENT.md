@@ -20,6 +20,7 @@ Use the [README](../README.md) for setup, launching, controls, shortcuts, and ta
 | `src/status.py` | State snapshots and session recording. |
 | `src/recording_web.py`, `src/recording_viewer.py` | Standalone browser replay and desktop viewer/export CLI. |
 | `src/diagnostics.py` | Dashboard diagnostic feed and per-run warning/error files. |
+| `src/performance.py`, `src/static/performance.*` | Passive hardware sampling and dashboard camera overlay. |
 | `src/keyboard_listener.py` | Windows bridge for browser-reserved Alt shortcuts. |
 | `tests/` | Hardware-free Python checks, Node dashboard checks, and native C++ tests. |
 | `environment.yaml` | Pinned Windows Conda environment, including voice requirements. |
@@ -133,7 +134,10 @@ The three main column headings are visually hidden but retained for accessible
 region labels. Both side panels remain visible, with no folding controls.
 The Surgical stage heading is inside a translucent card anchored over the
 camera's upper-left corner. The stage list scrolls within the image height on
-small screens. Desktop columns use a 1:2:1 ratio for controls, camera and VLI
+small screens. A native `details`/`summary` disclosure starts expanded on both
+the dashboard and `/live`; only the body carries the inactive/disabled state,
+so the heading remains operable in Test mode. Stage rendering updates the body
+without resetting the disclosure state. Desktop columns use a 1:2:1 ratio for controls, camera and VLI
 after accounting for the gaps. Existing compact-screen stacking remains. The
 camera uses a square viewport sized to `min(100cqw, 100cqh)` within its available
 area above the controls. `object-fit: contain` preserves the full source at 1x,
@@ -144,7 +148,11 @@ Tracking button share their respective title rows, aligned right; help text
 wraps within its header on narrow screens.
 
 `GET /live` serves a passive duplicate in `src/static/live.html`, with its own
-`live.css` and `live.js`. Its content grid retains 1:2:1 columns for surgical
+`live.css` and `live.js`. Its header shows the shared lab logo at the top right
+without navigation or theme controls. Shared `theme.js` restores the dashboard's
+`abml-color-theme` preference and listens for same-origin storage changes to keep
+open tabs synchronized; pages without a theme toggle are supported. Its content
+grid retains 1:2:1 columns for surgical
 stage, annotated camera and an empty reserved column. The stage panel sits in
 the left column instead of overlaying the camera. `stage.js` shares the exact
 stage rendering with the dashboard (scores, timing rail and inactive states).
@@ -182,6 +190,35 @@ Recordings include `perception_mode` transitions, `surgical_stage` predictions
 with capture times/frame IDs, mode-tagged `yolo` events and camera frames, and
 mode metadata in sampled state/configuration. Existing JSONL/MJPEG readers
 remain compatible; the replay UI does not add a separate stage rail.
+
+## Hardware performance monitoring
+
+`PerformanceMonitor` owns a daemon sampler with a one-second wait between samples.
+`GET /api/performance` deep-copies its cached snapshot; HTTP requests never sample
+hardware or acquire motion/camera locks. The main dashboard polls independently
+with a timeout and bounded 60-second browser history. A stale sample, failed
+request or unavailable sampler clears the old readings; reconnection starts a
+new history. CPU/RAM use the existing `psutil` dependency. GPU sampling uses the
+existing `nvidia-ml-py` NVML binding, without importing Torch or initializing CUDA.
+Missing libraries/drivers, unsupported utilization queries and GPU loss remain
+unavailable rather than being shown as zero. Monitoring stops on app shutdown.
+
+CPU deltas use native thread IDs mapped to Python thread names, grouping capture,
+primary inference, stage inference, control/RTDE/Flex IPC, voice and recording.
+Unregistered/native pool threads remain in App / native pools because their
+work cannot be attributed reliably to the initiating Python thread. Recursive
+child-process CPU/RSS is grouped by speech worker script (ASR, LLM, other).
+Process CPU baselines include creation times to avoid PID-reuse spikes; first
+observations have no CPU delta. All CPU deltas are divided by logical core count,
+matching whole-machine percentages. Group lines and server total are separate,
+not additive stacked samples. Native Flex driver/unrelated process usage is
+included only in host totals. RAM uses process RSS over installed RAM; shared
+pages can be counted by multiple processes, so these are not additive partitions
+of host memory. GPU utilization/VRAM is reported per device, without invented
+per-thread/model attribution. GPU summary shows the busiest monitored device.
+Telemetry is neither added to the recording schema nor the passive `/live` view.
+The overlay uses the stage card's translucent style, caps both cards below half
+the image width to avoid overlap, and leaves image zoom independent of the cards.
 
 ## Control and task implementation
 

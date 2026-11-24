@@ -2,10 +2,11 @@
 .live-header,.live-workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr) minmax(0,1fr);gap:14px;min-width:0}
 .live-header{align-items:center;padding-bottom:8px;border-bottom:1px solid var(--brand-gold)}
 .live-header h1{margin:0;font-size:clamp(13px,1.5vw,20px);color:var(--hi)}
-.live-header nav{display:flex;justify-content:flex-end;align-items:center;flex-wrap:wrap;gap:8px;min-width:0}
+.live-header .lab-logo{grid-column:3;justify-self:end;max-width:100%}
 .live-workspace{min-height:0;grid-template-rows:minmax(0,1fr)}
 .live-stage.stage-panel{position:static;width:auto;max-width:none;max-height:none;z-index:auto}
 .live-stage .card{background:var(--card);backdrop-filter:none;min-height:100%;padding:clamp(8px,1vw,16px)}
+.live-stage .stage-recognition:not([open]){min-height:0}
 .live-stage .stage-rail li{min-height:56px}
 .live-stage .stage-box{font-size:clamp(10px,1vw,14px)}
 .live-stage .stage-score,.live-stage .stage-elapsed{font-size:clamp(10px,.85vw,12px)}

@@ -42,6 +42,7 @@ from tasks import (
 from llm import LLMService
 from recording_web import RecordingArchive, serve_recording
 from diagnostics import DiagnosticLog, RunLog
+from performance import PerformanceMonitor
 
 log = logging.getLogger("WindowsApp")
 DASHBOARD_CONFIRM_TIMEOUT_S = 10.0
@@ -53,6 +54,8 @@ STATIC_ROUTES = {
     "/static/live.js": ("live.js", "text/javascript; charset=utf-8"),
     "/static/stage.js": ("stage.js", "text/javascript; charset=utf-8"),
     "/static/status.js": ("status.js", "text/javascript; charset=utf-8"),
+    "/static/performance.js": ("performance.js", "text/javascript; charset=utf-8"),
+    "/static/performance.css": ("performance.css", "text/css; charset=utf-8"),
     "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/static/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
@@ -114,6 +117,10 @@ class _Handler(BaseHTTPRequestHandler):
             except TimeoutError as error:
                 return self._json({'error': str(error)}, 503)
             self._json(state)
+        elif url.path == '/api/performance':
+            monitor = getattr(self.server, 'performance', None)
+            self._json(monitor.snapshot() if monitor else {
+                'status': 'unavailable', 'sampled_at': None, 'error': 'Performance monitor unavailable.'})
         elif url.path == '/api/recording':
             self._json(self.server.recorder.status())
         elif url.path in ('/api/llm', '/api/diagnostics'):
@@ -576,6 +583,8 @@ def _run_app():
             srv = resources.enter_context(ThreadingHTTPServer((args.host_web, args.port_web), _Handler))
             srv.diagnostics = DiagnosticLog().start()
             resources.callback(srv.diagnostics.close)
+            srv.performance = PerformanceMonitor().start()
+            resources.callback(srv.performance.close)
             srv.stopping = False
             srv.interrupting = False
             srv.tasks = TaskState()

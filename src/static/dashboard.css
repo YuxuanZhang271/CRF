@@ -36,11 +36,15 @@ body{display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;height:100dvh;pa
 .robot-panel,.category-panel{display:grid;grid-template-rows:minmax(0,1fr);position:relative;z-index:1}
 .stage-panel{position:absolute;top:10px;left:10px;z-index:2;display:grid;grid-template-rows:minmax(0,1fr);
   width:clamp(220px,18vw,280px);max-width:calc(100% - 20px);max-height:calc(100% - 20px);text-align:left}
-.stage-panel[data-inactive="true"]>.panel-scroll{opacity:.45}
+.stage-panel[data-inactive="true"] #stage-content{opacity:.45}
 .stage-panel>.panel-scroll{overflow:auto;scrollbar-gutter:auto;border-radius:10px}
 .stage-panel .card{margin:0;padding:12px;background:color-mix(in srgb,var(--card) 65%,transparent);
   border-color:color-mix(in srgb,var(--edge) 65%,transparent);backdrop-filter:blur(4px)}
 .stage-recognition{min-height:0}
+.stage-recognition>summary{font:650 13px/1.4 system-ui,sans-serif;color:var(--hi);cursor:pointer}
+.stage-recognition>summary .scope-subheading{display:inline;margin:0;font:inherit}
+.stage-recognition[open]>summary{margin-bottom:12px}
+.stage-recognition>summary:focus-visible{outline:2px solid var(--hi);outline-offset:3px}
 .stage-status{font:12px/1.5 system-ui,sans-serif;margin:0 0 12px;color:var(--dim);overflow-wrap:anywhere}
 .stage-status[data-level="error"]{color:var(--bad)}
 .stage-rail{list-style:none;margin:0 0 16px;padding:0;display:grid;gap:5px}

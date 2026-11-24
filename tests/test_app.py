@@ -78,6 +78,22 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(content_type.startswith(mime))
             self.assertGreater(len(body), 0)
 
+    def test_performance_is_cached_and_independent_of_hardware(self):
+        status, _, body = self.request('GET', '/api/performance')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['status'], 'unavailable')
+        self.server.performance = SimpleNamespace(snapshot=Mock(return_value={
+            'status': 'ready', 'sampled_at': 123., 'cpu': {'percent': 8.}}))
+        try:
+            status, _, body = self.request('GET', '/api/performance')
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)['cpu']['percent'], 8.)
+            self.server.performance.snapshot.assert_called_once_with()
+            for asset in ('performance.js', 'performance.css'):
+                self.assertEqual(self.request('GET', '/static/' + asset)[0], 200)
+        finally:
+            del self.server.performance
+
     def test_only_explicit_static_routes_are_served(self):
         for path in ("/static/../app.py", "/static/app.py", "/missing"):
             with self.subTest(path=path):

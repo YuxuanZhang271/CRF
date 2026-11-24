@@ -2,7 +2,8 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ABML General Surgical Platform</title>
 <script src="/static/theme.js"></script>
-<link rel="stylesheet" href="/static/dashboard.css"></head><body>
+<link rel="stylesheet" href="/static/dashboard.css">
+<link rel="stylesheet" href="/static/performance.css"></head><body>
 <header class="platform-header">
   <h1>ABML General Surgical Platform</h1>
   <div class="brand-actions">
@@ -170,14 +171,40 @@
   <div class="camera-stage">
     <div class="camera">
       <img id="camera-feed" alt="Live SCOPE camera with perception overlays">
-      <section class="panel stage-panel" id="surgical-stage" aria-labelledby="stage-heading" aria-disabled="true" data-inactive="true">
+      <section class="panel stage-panel" id="surgical-stage" aria-labelledby="stage-heading" data-inactive="true">
         <div class="panel-scroll">
-          <section class="card stage-recognition" aria-label="Stage recognition">
-            <h3 id="stage-heading" class="scope-subheading">Surgical stage</h3>
-            <p id="stage-status" class="stage-status" role="status">Inactive in Test mode</p>
-            <ul id="stage-rail" class="stage-rail" aria-label="Surgical stages"></ul>
-            <p id="stage-context" class="stage-context">Elapsed / statistical duration (seconds).</p>
-          </section>
+          <details class="card stage-recognition" open>
+            <summary><h3 id="stage-heading" class="scope-subheading">Surgical stage</h3></summary>
+            <div id="stage-content" aria-disabled="true">
+              <p id="stage-status" class="stage-status" role="status">Inactive in Test mode</p>
+              <ul id="stage-rail" class="stage-rail" aria-label="Surgical stages"></ul>
+              <p id="stage-context" class="stage-context">Elapsed / statistical duration (seconds).</p>
+            </div>
+          </details>
+        </div>
+      </section>
+      <section class="panel performance-panel" id="hardware-performance" aria-labelledby="performance-heading">
+        <div class="panel-scroll">
+          <details class="card performance-card" open>
+            <summary id="performance-heading">Performance</summary>
+            <p id="performance-status" class="stage-context" role="status">Connecting to server PC…</p>
+            <div class="performance-metrics" role="group" aria-label="Performance chart metric">
+              <button type="button" data-performance-metric="cpu" aria-pressed="true">CPU<strong id="performance-cpu">—</strong></button>
+              <button type="button" data-performance-metric="ram" aria-pressed="false">RAM<strong id="performance-ram">—</strong></button>
+              <button type="button" data-performance-metric="gpu" aria-pressed="false">GPU<strong id="performance-gpu">—</strong></button>
+            </div>
+            <div class="performance-plot">
+              <div class="performance-axis"><span>100%</span><span>0%</span></div>
+              <svg id="performance-chart" viewBox="0 0 240 90" preserveAspectRatio="none" role="img" aria-label="CPU usage over the last 60 seconds">
+                <path class="performance-grid" d="M0 1H240 M0 45H240 M0 89H240"/>
+                <g id="performance-lines"></g>
+              </svg>
+            </div>
+            <div class="performance-times"><span>60s ago</span><span>Now</span></div>
+            <ul id="performance-legend" class="performance-legend" aria-label="Chart series and current usage"></ul>
+            <p id="performance-detail" class="stage-context"></p>
+            <p id="performance-note" class="stage-context">CPU components use a share of the whole CPU.</p>
+          </details>
         </div>
       </section>
       <span id="perception-mode-label" class="camera-mode">Test · boxes</span>
@@ -252,6 +279,7 @@
 
 <script src="/static/stage.js"></script>
 <script src="/static/status.js"></script>
+<script src="/static/performance.js"></script>
 <script src="/static/dashboard.js"></script>
 <script src="/static/llm.js"></script>
 <script src="/static/keyboard.js"></script></body></html>
