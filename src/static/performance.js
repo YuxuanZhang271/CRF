@@ -34,9 +34,11 @@
     get('performance-chart').setAttribute('aria-label', `${metric.toUpperCase()} usage over the last 60 seconds, 0 to 100 percent`);
     const end = latest?.sampled_at;
     for (const row of rows) {
-      let path = '', drawing = false;
+      let path = '', drawing = false, previous = null;
       for (const state of history) {
         const value = series(state).find(item => item.id === row.id)?.value;
+        if (previous !== null && state.sampled_at - previous > 5) drawing = false;
+        previous = state.sampled_at;
         if (!Number.isFinite(value)) { drawing = false; continue; }
         const x = Math.max(0, Math.min(240, (state.sampled_at - end + 60) * 4));
         const y = 89 - Math.max(0, Math.min(100, value)) * .88;
@@ -82,6 +84,27 @@
         item.setAttribute('aria-pressed', String(item === button));
       render();
     });
+  }
+
+  // Replay supplies recorded samples and a cursor-relative history; it must
+  // never poll the current machine or compare saved clocks to today's time.
+  if (panel.dataset.playback === 'true') {
+    window.addEventListener('recording-performance', event => {
+      const state = event.detail.state;
+      if (!state) { clear('No performance sample at this time.'); return; }
+      latest = state;
+      history.length = 0;
+      history.push(...event.detail.history);
+      panel.dataset.unavailable = 'false';
+      get('performance-status').textContent = 'Recorded server PC · at cursor';
+      get('performance-cpu').textContent = percent(state.cpu?.percent);
+      get('performance-ram').textContent = percent(state.memory?.percent);
+      const values = (state.gpus || []).map(gpu => gpu.percent).filter(Number.isFinite);
+      get('performance-gpu').textContent = values.length ? percent(Math.max(...values)) : '—';
+      render();
+    });
+    clear('Performance is available in new recordings.');
+    return;
   }
 
   async function poll() {

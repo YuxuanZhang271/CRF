@@ -216,7 +216,9 @@ included only in host totals. RAM uses process RSS over installed RAM; shared
 pages can be counted by multiple processes, so these are not additive partitions
 of host memory. GPU utilization/VRAM is reported per device, without invented
 per-thread/model attribution. GPU summary shows the busiest monitored device.
-Telemetry is neither added to the recording schema nor the passive `/live` view.
+While RECORD is active, telemetry is saved as deduplicated `performance` events
+at the monitor's nominal 1 Hz rate, plus the initial session snapshot. It remains
+absent from the passive `/live` view.
 The overlay uses the stage card's translucent style, caps both cards below half
 the image width to avoid overlap, and leaves image zoom independent of the cards.
 
@@ -319,14 +321,16 @@ extension; unavailable devices produce unavailable/null state, not invented data
 | Water/gas and cleaning | Recorded | Sampled Flex readiness, spray action/phase/error/message, plus command/task transitions and outcomes. No pressure or flow measurements are exposed by the current system. |
 | Perception and tracking | Recorded | `yolo` for every completed inference: all returned boxes/confidences/class IDs, segmentation polygons, selected target, pixel error, freshness, capture frame/time and revision. Test mode's configured category filtering still applies. No dense masks, features or unreturned class scores. |
 | Surgical stage | Recorded, but omitted from viewer event list | `surgical_stage` at independent 1 Hz sampling when Full mode is ready: top-three scores, frame/time, sample count, phase visit start; sampled status also includes elapsed time and bounded history. Now visible in viewer event lists. |
+| Server performance | Missing | `performance` at nominal 1 Hz when the cached monitor sample changes, plus initial snapshot: server CPU/RAM, thread and child-process CPU, process RSS, per-device GPU utilization/VRAM, availability and sample age. Same attribution limits as the dashboard; no hardware queries on the recording thread. |
 | Perception mode/category | Recorded | Mode transition event, mode-tagged camera/inference, and sampled metadata/configuration including available categories and stage metadata. |
 | Commands and task lifecycle | Recorded | HTTP command bodies/results, shared task selection/stopping/error/completion events, ownership revisions, zoom and sampled current task. Held key requests/releases and focus heartbeats follow the same audited HTTP path; no global keyboard recording. |
 | Configuration | Recorded; voice settings path only | Initial/segment config plus changes: launch arguments, JSON-safe module constants, control/Flex limits/calibration, camera selection, and now voice settings contents. Model weights and executable binaries are not duplicated. |
 | Console/diagnostics | Recorded while RECORD is active | Python and forwarded dashboard console events, state/media errors, dispatch tracebacks. Separate per-run warning/error log remains independent of RECORD. Worker stderr logs are referenced by path, not copied in full into recordings. |
 | Recorder health and timing | Recorded | UTC timestamps, session monotonic/Unix origins, sequence, segment index, nominal state rate, per-kind dropped-record counts and final stop event. Bounded queues drop incoming records under overload instead of blocking producers. |
 
-Schema **2** adds `raw_image` and `audio` references; old JSONL/MJPEG recordings
-remain readable. A slice contains `events.jsonl`, optional `camera.mjpeg`, optional
+Schema **2** adds `raw_image` and `audio` references; schema **3** adds
+`performance` events and initial performance state. Old JSONL/MJPEG recordings
+remain readable and report missing streams as unavailable. A slice contains `events.jsonl`, optional `camera.mjpeg`, optional
 `camera_raw.mjpeg`, and optional `microphone.wav`. No microphone file is created
 until PCM arrives while RECORD is active. At 16 kHz PCM16, continuous mono audio
 uses approximately **9.6 MB per five-minute slice**, plus JSON indexes. Keeping
@@ -347,10 +351,17 @@ buffered records unavailable.
 
 Browser replay reads bounded timeline windows and indexed JPEG byte ranges.
 The clean-image checkbox selects the alternate reference; older recordings show
-an unavailable message. The audio button requests a bounded 15-second WAV clip
-from the cursor, with separate native playback controls (not synchronized with
-the viewer's play/speed controls). Audio reads validate paths, offsets and format.
-Neither viewer starts hardware or speech models.
+an unavailable message. `recording_audio.js` automatically queues 30-second WAV
+chunks using one Web Audio clock for audio and camera playback. Play/pause,
+seek, speed changes, session changes and page exit stop or reschedule sources;
+mute uses a gain node. At most three decoded chunks are cached. The audio API's
+`silence=1` option returns silent gaps for continuous replay, retaining bounded
+reads and path/offset/format validation. Each WAV is opened once per request,
+including when a chunk crosses slices. Audio buffering failures pause replay.
+The performance card reuses `performance.js` in playback mode, receiving only
+saved samples and cursor-relative history, with stale readings cleared after
+five seconds; it never polls live telemetry. The desktop viewer/export includes
+CPU/RAM/GPU summary traces. Neither viewer starts hardware or speech models.
 
 The browser viewer has its own assets in `src/static/recording.*`; `src/recording_web.py` serves it without opening camera or robot connections. Both viewers read the recording format maintained by `src/status.py`.
 

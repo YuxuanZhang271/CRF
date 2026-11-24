@@ -23,7 +23,7 @@ SEGMENT_SECONDS = 300
 STATE_HZ = 20
 QUEUE_ITEMS = 4096
 QUEUE_BYTES = 32 * 1024 * 1024
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Runtime settings retained with every segment and whenever they change.
 CONFIG_FIELDS = (
@@ -123,8 +123,9 @@ class Status:
             config['llm'] = {'config_path': str(llm.config), 'microphone': llm.device,
                              'settings': self.voice_settings, 'offline': True,
                              'models': voice.pop('models')}
+        monitor = getattr(self.server, 'performance', None)
         return {'config': config, 'robot': state, 'camera': camera,
-                'llm': voice}
+                'llm': voice, 'performance': monitor.snapshot() if monitor else None}
 
 
 class _LogHandler(logging.Handler):
@@ -205,6 +206,7 @@ class Recorder:
             self._audio = None
             self._audio_file = None
             self._sequence = 0
+            self._performance_key = None
             self._queue = queue.Queue(self.queue_items)
             self._pending_bytes = 0
             self._closing.clear()
@@ -312,6 +314,15 @@ class Recorder:
         self._write('state', {'robot': snapshot['robot'], 'camera': snapshot['camera'],
                               'llm': snapshot.get('llm'),
                               'recording': {'dropped': self.status()['dropped']}}, stamp)
+        # The passive monitor samples at 1 Hz. Avoid duplicating it at the 20 Hz
+        # robot-state rate, while retaining unavailable/stale monitor states.
+        performance = snapshot.get('performance')
+        if performance is not None:
+            key = (performance.get('status'), performance.get('sequence'),
+                   performance.get('sampled_at'), performance.get('error'))
+            if key != getattr(self, '_performance_key', None):
+                self._write('performance', performance, stamp)
+                self._performance_key = key
 
     def _flush(self):
         # Make image bytes available before publishing their JSON index.

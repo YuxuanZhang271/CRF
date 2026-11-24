@@ -36,6 +36,9 @@ class ArchiveTests(unittest.TestCase):
                 archive.audio('session', 0, 31)
             with self.assertRaises(ValueError):
                 archive.audio('session', 5, 1)
+            self.assertTrue(archive.window('session', 0, 10)['has_audio'])
+            with wave.open(io.BytesIO(archive.audio('session', 5, 1, allow_empty=True)), 'rb') as stream:
+                self.assertEqual(stream.readframes(16000), b'\0' * 32000)
             write('../../outside.wav')
             with self.assertRaisesRegex(ValueError, 'outside'):
                 archive.audio('session', 1, 1)
@@ -50,6 +53,8 @@ class ArchiveTests(unittest.TestCase):
                 rows.append(json.dumps({'elapsed_s': t, 'type': kind, 'data': payload})+'\n')
             row(0, 'segment_start', {'config': {'speed': 10}})
             row(0, 'state', {'robot': {'task': {'id': 0}}})
+            row(0, 'session_start', {'snapshot': {'performance': {'sequence': 1}}})
+            row(6, 'performance', {'sequence': 2, 'cpu': {'percent': 20}})
             row(5, 'task', {'id': 3, 'name': 'Zoom in'})
             row(8, 'camera_frame', {'image': {'path': '00000/camera.mjpeg', 'offset_bytes': 6, 'length_bytes': 4},
                 'raw_image': {'path': '00000/camera_raw.mjpeg', 'offset_bytes': 0, 'length_bytes': 5}})
@@ -65,6 +70,9 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(data['configs'][0][1], {'speed': 10})
             self.assertEqual(data['frames'], [{'time': 8, 'index': 0}])
             self.assertEqual(data['invalid'], 1)
+            self.assertEqual(data['performance'][-1][1]['sequence'], 2)
+            self.assertFalse(data['has_audio'])
+            self.assertEqual(archive.window('session', 7, 1)['performance'][0][1]['sequence'], 1)
             self.assertEqual(archive.image('session', 0), b'JPEG')
             self.assertEqual(archive.image('session', 0, raw=True), b'CLEAN')
             self.assertTrue(archive.window('session', 0, 10)['events'])
@@ -76,6 +84,24 @@ class ArchiveTests(unittest.TestCase):
             (segment/'camera.mjpeg').write_bytes(b'prefix')
             self.assertIsNone(archive.image('session', 0))
             self.assertEqual(RecordingArchive(root/'session').sessions()[0]['id'], 'session')
+
+    def test_audio_queues_across_slice_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for i, start in enumerate((299.98, 300.)):
+                segment = root / 'session' / f'{i:05d}'
+                segment.mkdir(parents=True)
+                with wave.open(str(segment / 'microphone.wav'), 'wb') as stream:
+                    stream.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+                    stream.writeframes(bytes([i+1, 0])*320)
+                rows = [{'elapsed_s': i*300, 'type': 'segment_start', 'data': {'session_origin_monotonic_s': 100}},
+                        {'elapsed_s': start, 'type': 'microphone_audio', 'data': {
+                            'audio_start_monotonic_s': 100+start, 'audio': {
+                                'path': f'{i:05d}/microphone.wav', 'offset_samples': 0, 'sample_count': 320}}}]
+                (segment / 'events.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+            archive = RecordingArchive(root)
+            with wave.open(io.BytesIO(archive.audio('session', 299.98, .04)), 'rb') as stream:
+                self.assertEqual(stream.readframes(640), b'\1\0'*320 + b'\2\0'*320)
 
 
 if __name__ == '__main__':

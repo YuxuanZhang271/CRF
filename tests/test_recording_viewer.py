@@ -95,6 +95,14 @@ class ViewerTests(unittest.TestCase):
         self.assertEqual(data.start, 300.)
         self.assertEqual(len(data.states), 1)
 
+    def test_performance_retains_preceding_sample_for_offline_seek(self):
+        self.append(0., 'session_start', {'snapshot': {'performance': {'sequence': 1}}})
+        self.append(4., 'performance', {'sequence': 2, 'cpu': {'percent': 20}})
+        self.append(7., 'performance', {'sequence': 3, 'cpu': {'percent': 30}})
+        data = RecordingData(self.session, start=5, duration=1).refresh()
+        self.assertEqual(data.at(data.performance, 5.)['sequence'], 2)
+        self.assertEqual(data.summary()['performance']['cpu']['percent'], 20)
+
 
 if __name__ == '__main__':
     unittest.main()

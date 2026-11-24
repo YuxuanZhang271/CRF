@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from status import Recorder
+from status import Recorder, Status
 
 
 class RecordingTests(unittest.TestCase):
@@ -36,6 +36,34 @@ class RecordingTests(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for path in sorted(Path(self.recorder.status()['session']).glob('*/events.jsonl'))
                 for line in path.read_text(encoding='utf-8').splitlines()]
+
+    def test_performance_samples_recorded_once_and_restart_resets_baseline(self):
+        performance = {'status': 'ready', 'sequence': 4, 'sampled_at': 123.,
+                       'sample_age_s': .1, 'cpu': {'percent': 12.},
+                       'memory': {'percent': 45.}, 'gpus': [], 'components': []}
+        source_snapshot = self.source.snapshot
+        self.source.snapshot = lambda: {**source_snapshot(), 'performance': dict(performance)}
+        for _ in range(2):
+            self.recorder.start()
+            time.sleep(.12)
+            self.recorder.stop()
+            rows = self.rows()
+            self.assertEqual(next(r for r in rows if r['type'] == 'session_start')['data']['snapshot']['performance']['sequence'], 4)
+            samples = [r['data'] for r in rows if r['type'] == 'performance']
+            self.assertEqual(len(samples), 1, 'Repeated 20 Hz snapshots must not duplicate 1 Hz readings')
+            self.assertEqual(samples[0]['cpu']['percent'], 12.)
+
+    def test_status_reads_cached_performance_without_sampling_hardware(self):
+        source = Status.__new__(Status)
+        source.launch_config = source.defaults = {}
+        source.server = SimpleNamespace(
+            node=SimpleNamespace(get_state_snapshot=lambda: {}),
+            tasks=SimpleNamespace(snapshot=lambda: {}), relay=None,
+            stopping=False, interrupting=False, camera=SimpleNamespace(status=lambda: {}),
+            performance=SimpleNamespace(snapshot=lambda: {'status': 'ready', 'sequence': 12}))
+        self.assertEqual(source.snapshot()['performance']['sequence'], 12)
+        del source.server.performance
+        self.assertIsNone(source.snapshot()['performance'])
 
     def test_mixed_sources_rotation_configuration_and_images(self):
         @dataclass(frozen=True)

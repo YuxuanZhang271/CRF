@@ -1,24 +1,64 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CRF Recording Viewer</title><script src="/static/theme.js"></script>
-<link rel="stylesheet" href="/static/dashboard.css"><link rel="stylesheet" href="/static/recording.css"></head>
+<link rel="stylesheet" href="/static/dashboard.css"><link rel="stylesheet" href="/static/performance.css"><link rel="stylesheet" href="/static/recording.css"></head>
 <body>
-<header class="replay-header"><div><h1>Recording viewer</h1><p>Camera, robot state, tasks and speech on one timeline</p></div>
-<button id="theme-toggle" type="button">THEME</button></header>
-<main class="replay-layout">
-<section class="card replay-controls">
-<label for="sessions">Recording</label><select id="sessions"></select><button id="load">LOAD</button>
-<button id="refresh">REFRESH</button><button id="play" disabled>PLAY</button>
-<label for="speed">Speed</label><select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
-<output id="clock">0:00.00 / 0:00.00</output>
-<input id="seek" type="range" min="0" max="1" step="0.01" value="0" disabled aria-label="Playback time">
-<p id="notice" class="status" role="status">Choose a recording to load.</p>
+<header class="platform-header replay-header">
+  <div><h1>ABML General Surgical Platform</h1><p>Recording viewer · synchronized session replay</p></div>
+  <div class="brand-actions"><img class="lab-logo" src="/imgs/ABML_logo.png" alt="Advanced Bio-Medical Robotics Lab"><button id="theme-toggle" type="button" aria-pressed="false">Light mode</button></div>
+</header>
+<section class="card replay-library" aria-label="Recording selection">
+  <label for="sessions">Recording</label><select id="sessions" aria-label="Recording session"></select><button id="load">LOAD</button><button id="refresh">REFRESH</button>
+    <div class="replay-controls" aria-label="Playback controls">
+      <div class="replay-transport"><button id="play" disabled>PLAY</button><output id="clock">0:00.00 / 0:00.00</output><label for="speed">Speed</label><select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select><button id="mute-audio" type="button" aria-pressed="false" disabled>Mute audio</button></div>
+      <input id="seek" type="range" min="0" max="1" step="0.01" value="0" disabled aria-label="Playback time">
+      <p id="audio-status" class="status" role="status">Microphone audio follows playback automatically.</p>
+    </div>
+  <p id="notice" class="status" role="status">Choose a recording to load.</p>
 </section>
-<section class="card replay-video"><h3>Recorded camera</h3><label><input type="checkbox" id="raw-camera"> Clean camera image</label><div class="replay-image"><img id="frame" alt="Recorded camera frame"><p id="no-frame">No frame at this time</p></div><p id="frame-status" class="status"></p></section>
-<section class="card replay-summary"><h3>Session summary</h3><dl id="summary"></dl><h3>State at cursor</h3><dl id="state"></dl></section>
-<section class="card replay-charts"><h3>Motion traces</h3><canvas id="joints" aria-label="UR5 joint angles"></canvas><canvas id="flex" aria-label="Flex bend and roll"></canvas><canvas id="tendons" aria-label="Tendon travel"></canvas></section>
-<section class="card replay-events"><h3>Tasks, commands and console</h3><div id="events" role="log"></div></section>
-<section class="card replay-speech"><h3>Speech and parsed commands</h3><button id="listen-audio" type="button">Listen from cursor (15s)</button><audio id="voice-audio" controls preload="none"></audio><p id="audio-status" class="status" role="status">Microphone audio is available in new recordings.</p><div id="speech" role="log"></div></section>
-<details class="card replay-config"><summary>Configuration at cursor</summary><pre id="config"></pre></details>
-</main><script src="/static/recording.js"></script></body></html>
+<main class="replay-layout">
+  <aside class="replay-column replay-left" aria-label="LLM and console">
+    <section class="card replay-speech"><h3>LLM · speech &amp; parsed commands</h3><div id="speech" role="log"></div></section>
+    <section class="card replay-events"><h3>Tasks, commands &amp; console</h3><div id="events" role="log"></div></section>
+  </aside>
+  <div class="replay-column replay-center">
+    <section class="card replay-video">
+      <div class="replay-heading"><h3>SCOPE <span>Recorded camera</span></h3><label><input type="checkbox" id="raw-camera"> Clean image</label></div>
+      <div class="replay-image"><img id="frame" alt="Recorded camera frame"><p id="no-frame">No frame at this time</p></div>
+      <p id="frame-status" class="status"></p>
+      <div class="replay-status" aria-label="Recorded device status"><span id="replay-arm">ARM —</span><span id="replay-flex">FLEX —</span><span id="replay-motion">MOTION —</span><span id="replay-task">TASK —</span><span id="replay-llm">LLM —</span></div>
+    </section>
+  </div>
+  <aside class="replay-column replay-right" aria-label="Motion and performance">
+    <section class="card replay-charts"><h3>Motion traces</h3><div class="replay-trace-list"><canvas id="joints" aria-label="UR5 joint angles"></canvas><canvas id="flex" aria-label="Flex bend and roll"></canvas><canvas id="tendons" aria-label="Tendon travel"></canvas></div></section>
+    <section class="panel replay-performance" id="hardware-performance" data-playback="true" aria-labelledby="performance-heading">
+        <div class="panel-scroll">
+          <details class="card performance-card" open>
+            <summary id="performance-heading">Performance</summary>
+            <p id="performance-status" class="stage-context" role="status">Performance is available in new recordings.</p>
+            <div class="performance-metrics" role="group" aria-label="Performance chart metric">
+              <button type="button" data-performance-metric="cpu" aria-pressed="true">CPU<strong id="performance-cpu">—</strong></button>
+              <button type="button" data-performance-metric="ram" aria-pressed="false">RAM<strong id="performance-ram">—</strong></button>
+              <button type="button" data-performance-metric="gpu" aria-pressed="false">GPU<strong id="performance-gpu">—</strong></button>
+            </div>
+            <div class="performance-plot">
+              <div class="performance-axis"><span>100%</span><span>0%</span></div>
+              <svg id="performance-chart" viewBox="0 0 240 90" preserveAspectRatio="none" role="img" aria-label="CPU usage over the last 60 seconds">
+                <path class="performance-grid" d="M0 1H240 M0 45H240 M0 89H240"/>
+                <g id="performance-lines"></g>
+              </svg>
+            </div>
+            <div class="performance-times"><span>60s before cursor</span><span>Cursor</span></div>
+            <ul id="performance-legend" class="performance-legend" aria-label="Chart series and current usage"></ul>
+            <p id="performance-detail" class="stage-context"></p>
+            <p id="performance-note" class="stage-context">CPU components use a share of the whole CPU.</p>
+          </details>
+        </div>
+      </section>
+
+  </aside>
+  <aside class="replay-column replay-info" aria-label="Session summary and state">
+    <section class="card replay-summary"><h3>Session summary</h3><dl id="summary"></dl><h3>State at cursor</h3><dl id="state"></dl></section>
+  </aside>
+</main><script src="/static/status.js"></script><script src="/static/performance.js"></script><script src="/static/recording_audio.js"></script><script src="/static/recording.js"></script></body></html>

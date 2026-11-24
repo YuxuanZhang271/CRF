@@ -183,7 +183,8 @@ child-process memory; threads share their process's RAM. GPU utilization and
 VRAM are device-wide NVIDIA readings, with a separate color per GPU. Unsupported
 GPU monitoring and unavailable readings show a dash. Native Flex driver usage
 and unrelated processes are only represented in server totals. This monitor is
-independent of RECORD and is not saved in recordings.
+independent of RECORD. While RECORD is active, its samples are also saved for
+replay in the recording viewer.
 
 ### Separate live view
 
@@ -257,11 +258,11 @@ Look Tasks 5–8 and Reset require active RCM when the UR5 is connected. Trackin
 
 ## Record and replay
 
-Press **RECORD** or `Alt+R` to start or stop recording. Sessions are saved under `recordings/` in five-minute slices; the slice index starts at `00000` and the timer resets for each slice. Recordings include annotated and clean camera images, robot/pump state, commands, task events, detections/segmentation polygons, stage predictions, configuration, console messages, speech results, and microphone audio. Audio includes silence and speech while LISTEN is off; RECORD controls storage independently of task triggering. Audio is the unfiltered mono 16 kHz PCM supplied to ASR after input resampling, saved as WAV. Clean camera images use JPEG compression. See the [recording coverage table](docs/DEVELOPMENT.md#recording-and-diagnostics) for rates and limits.
+Press **RECORD** or `Alt+R` to start or stop recording. Sessions are saved under `recordings/` in five-minute slices; the slice index starts at `00000` and the timer resets for each slice. Recordings include annotated and clean camera images, robot/pump state, commands, task events, detections/segmentation polygons, stage predictions, server CPU/RAM/GPU performance, configuration, console messages, speech results, and microphone audio. Audio includes silence and speech while LISTEN is off; RECORD controls storage independently of task triggering. Audio is the unfiltered mono 16 kHz PCM supplied to ASR after input resampling, saved as WAV. Clean camera images use JPEG compression. See the [recording coverage table](docs/DEVELOPMENT.md#recording-and-diagnostics) for rates and limits.
 
 Click **Open recording viewer** beside the recording controls, or open [the dashboard viewer](http://127.0.0.1:8080/viewer). Select a session and use play/pause, seek, and playback speed to inspect the camera, motion charts, and event timeline.
 
-Select **Clean camera image** to inspect frames without overlays. **Listen from cursor (15s)** opens a microphone clip at the selected time with its own audio controls. Older recordings remain readable but do not contain these new media streams. Each slice's `microphone.wav` can also be opened directly; timeline indexes preserve recording boundaries and audio gaps.
+The viewer uses the dashboard's colors and light/dark preference, with recording selection and playback controls in one full-width bar at the top. The desktop workspace uses four columns: LLM and console (1/4 width, half the height each), camera (3/8), motion traces and performance (1/4, half the height each), and summary/state (1/8). Panels scroll internally; narrow screens stack the panels. Configuration at cursor is omitted from the web viewer. Select **Clean image** to inspect frames without overlays. Microphone audio plays automatically with the camera and follows play/pause, seeking, and playback speed; use **Mute audio** to silence it. Audio gaps remain silent, including across slices. The **Performance** card shows recorded CPU/RAM/GPU readings and the preceding 60 seconds at the cursor, with the same component colors as the dashboard. Older recordings remain readable; missing audio or performance is shown as unavailable. Each slice's `microphone.wav` can also be opened directly; timeline indexes preserve recording boundaries and audio gaps.
 
 To replay without starting cameras or robot connections:
 

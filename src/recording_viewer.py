@@ -67,6 +67,7 @@ class RecordingData:
         self.states = deque(maxlen=80000)
         self.frames = deque(maxlen=120000)
         self.yolo = deque(maxlen=20000)
+        self.performance = deque(maxlen=4000)
         self.events = deque(maxlen=2000)
         self.configs = deque(maxlen=512)
         self.counts = Counter()
@@ -125,6 +126,11 @@ class RecordingData:
                 self.configs.append((stamp, data.get('config', {})))
         elif kind == 'config' and keep_config:
             self.configs.append((stamp, data))
+        if keep_config:
+            performance = (data if kind == 'performance' else
+                           data.get('snapshot', {}).get('performance') if kind == 'session_start' else None)
+            if performance:
+                self.performance.append((stamp, performance))
         if not self.live and not self.start <= stamp <= self.start + self.duration:
             return
         if kind == 'state':
@@ -149,6 +155,8 @@ class RecordingData:
                 records.popleft()
         while len(self.configs) > 1 and self.configs[1][0] < low:
             self.configs.popleft()
+        while len(self.performance) > 1 and self.performance[1][0] < low:
+            self.performance.popleft()
 
     @property
     def window(self):
@@ -183,6 +191,7 @@ class RecordingData:
         return {'session': str(self.session), 'duration_s': self.latest, 'ended': self.ended,
                 'event_counts': dict(self.counts), 'invalid_complete_lines': self.invalid_lines,
                 'window_s': self.window, 'visible_states': len(self.states),
+                'performance': self.at(self.performance, self.window[1]),
                 'configuration': self.at(self.configs, self.window[1])}
 
 
@@ -216,13 +225,14 @@ class ActivityViewer:
 
         self.data, self.plt = data, plt
         self.figure = plt.figure(figsize=(15, 9), facecolor=VIEWER_COLORS['background'])
-        grid = self.figure.add_gridspec(3, 3, left=.06, right=.97, bottom=.14, top=.89,
+        grid = self.figure.add_gridspec(4, 3, left=.06, right=.97, bottom=.14, top=.89,
                                        hspace=.48, wspace=.26, width_ratios=(1.1, 1.1, 1.25))
         self.joints = self.figure.add_subplot(grid[0, :2])
         self.flex = self.figure.add_subplot(grid[1, :2])
         self.tendons = self.figure.add_subplot(grid[2, :2])
+        self.performance = self.figure.add_subplot(grid[3, :2])
         self.camera = self.figure.add_subplot(grid[:2, 2])
-        self.console = self.figure.add_subplot(grid[2, 2])
+        self.console = self.figure.add_subplot(grid[2:, 2])
         self.title = self.figure.text(.06, .955, '', fontsize=15, weight='bold', color=VIEWER_COLORS['purple'])
         self.status = self.figure.text(.06, .912, '', fontsize=10, color=VIEWER_COLORS['muted'])
         self.notice = self.figure.text(.06, .025, '', fontsize=9, color=VIEWER_COLORS['muted'])
@@ -287,20 +297,35 @@ class ActivityViewer:
 
         for axis, title, unit in ((self.joints, 'UR5 joints', 'degrees'),
                                    (self.flex, 'FlexEndo bend / roll', 'degrees'),
-                                   (self.tendons, 'FlexEndo tendons', 'mm')):
+                                   (self.tendons, 'FlexEndo tendons', 'mm'),
+                                   (self.performance, 'Recorded server performance', '%')):
             axis.clear()
             self._style_axis(axis)
             axis.set(title=title, ylabel=unit, xlim=(low, high))
             axis.grid(color=VIEWER_COLORS['edge'], alpha=1, lw=.7)
             axis.tick_params(labelsize=8)
-        self.tendons.set_xlabel('Session elapsed time (s)')
+        self.performance.set_xlabel('Session elapsed time (s)')
+        perf = list(data.performance)
+        def usage(sample, metric):
+            if sample.get('status') != 'ready' or (sample.get('sample_age_s') or 0) > 5:
+                return np.nan
+            if metric == 'GPU':
+                values = [g['percent'] for g in sample.get('gpus', []) if isinstance(g.get('percent'), (int, float))]
+                return max(values) if values else np.nan
+            return sample.get('cpu' if metric == 'CPU' else 'memory', {}).get('percent', np.nan)
+        for metric in ('CPU', 'RAM', 'GPU'):
+            self.performance.plot([t for t, _ in perf], [usage(s, metric) for _, s in perf], lw=1, label=metric)
+        self.performance.set_ylim(0, 100)
+        if not perf:
+            self.performance.text(.5, .5, 'No recorded performance data', ha='center',
+                                  transform=self.performance.transAxes, color=VIEWER_COLORS['muted'], fontsize=9)
         for index in range(6):
             self.joints.plot(t, [value(s, 'joints_deg', index) for _, s in states], lw=1, label=f'J{index + 1}')
         for key in ('bend', 'roll'):
             self.flex.plot(t, [value(s, key) for _, s in states], lw=1.3, label=key)
         for index in range(4):
             self.tendons.plot(t, [value(s, 'tendon', index) for _, s in states], lw=1, label=f'T{index + 1}')
-        for axis in (self.joints, self.flex, self.tendons):
+        for axis in (self.joints, self.flex, self.tendons, self.performance):
             axis.legend(loc='upper left', ncol=6, fontsize=8, framealpha=.9,
                         facecolor=VIEWER_COLORS['panel'], edgecolor=VIEWER_COLORS['edge'],
                         labelcolor=VIEWER_COLORS['text'])
@@ -310,7 +335,7 @@ class ActivityViewer:
                 self.joints.text(stamp, .05, event.get('command', ''), rotation=90,
                                  transform=self.joints.get_xaxis_transform(), fontsize=6, color=VIEWER_COLORS['gold'])
         self.cursors = [axis.axvline(self.slider.val, color=VIEWER_COLORS['purple'], lw=1, ls='--') for axis in
-                        (self.joints, self.flex, self.tendons)]
+                        (self.joints, self.flex, self.tendons, self.performance)]
         self.title.set_text(f'CRF recording activities  ·  {data.session.name if data.session else "Waiting for recordings"}')
         self.slider.valmin, self.slider.valmax = low, high
         self.slider.ax.set_xlim(low, high)

@@ -1,9 +1,10 @@
 (() => {
   const $ = id => document.getElementById(id);
-  let session = '', data = null, cursor = 0, duration = 0, playing = false, last = 0;
-  let windowStart = 0, loading = false, generation = 0, frameIndex = null, frameLoading = false;
-  let nextFrame = null, lastEvents = '', lastConfig = '';
-  let audioUrl = null;
+  let session = '', data = null, cursor = 0, duration = 0, playing = false;
+  let windowStart = 0, loading = false, generation = 0, frameIndex = null, frameLoading = false, windowPending = false;
+  let nextFrame = null, lastEvents = '';
+  let playRevision = 0, starting = false, clockStart = 0, clockCursor = 0, lastDraw = 0, lastPerformance = '';
+  const audio = new window.RecordingAudio(error => { pause(); $('audio-status').textContent=error.message; });
   const colors = ['#c995d1','#e9bc62','#5bc5a4','#79b2f2','#edaa78','#d8d2de'];
   const format = t => `${Math.floor(t/60)}:${(t%60).toFixed(2).padStart(5,'0')}`;
   async function json(url) {
@@ -17,7 +18,7 @@
   }
   function readings(id, values) {
     const node=$(id); node.replaceChildren();
-    for(const [key,value] of values) { const dt=document.createElement('dt'),dd=document.createElement('dd'); dt.textContent=key; dd.textContent=String(value ?? '—'); node.append(dt,dd); }
+    for(const [key,value] of values) { const dt=document.createElement('dt'),dd=document.createElement('dd'); dt.textContent=key; dd.textContent=Number.isFinite(value)&&!Number.isInteger(value)?value.toFixed(2):String(value ?? '—'); node.append(dt,dd); }
   }
   async function sessions() {
     const result=await json('/api/viewer/sessions'); $('sessions').replaceChildren();
@@ -26,40 +27,62 @@
     $('notice').textContent=result.sessions.length ? 'Select LOAD to inspect a recording.' : 'No recordings found in the configured directory.';
   }
   async function loadWindow() {
-    if(loading || !session) return;
+    if(!session) return;
+    if(loading) { windowPending=true; return; }
     loading=true; const token=generation;
     try {
       const start=Math.max(0,Math.floor(cursor/30)*30-15);
       const result=await json(`/api/viewer/window?session=${encodeURIComponent(session)}&start=${start}&duration=60`);
       if(token!==generation) return;
       data=result; windowStart=start; duration=result.duration_s; $('seek').max=String(duration); $('seek').disabled=false; $('play').disabled=false;
+      $('mute-audio').disabled=!result.has_audio;
+      if(!playing && !starting) $('audio-status').textContent=result.has_audio?'Microphone audio follows playback automatically. Gaps play as silence.':'No microphone audio in this recording. Camera playback is available.';
       readings('summary', [['Duration',format(duration)],['Session',result.ended?'Saved':'Incomplete / live'],['Camera frames',result.counts.camera_frame||0],['State samples',result.counts.state||0],['Task events',result.counts.task||0],['Speech events',result.counts.llm||0],['Invalid lines',result.invalid],['Dropped records',Object.values(result.dropped).reduce((a,b)=>a+b,0)]]);
       $('notice').textContent='Drag the timeline to seek. Charts show a 60-second window around playback.';
-      lastEvents=''; lastConfig=''; draw();
+      lastEvents=''; draw();
     } catch(error) { $('notice').textContent=error.message; pause(); }
-    finally { loading=false; }
+    finally { loading=false; if(windowPending){windowPending=false;loadWindow();} }
   }
-  function pause() { playing=false; $('play').textContent='PLAY'; }
+  function currentTime() { return audio.active ? audio.position() : Math.min(duration,clockCursor+(performance.now()-clockStart)/1000*Number($('speed').value)); }
+  function pause() {
+    if(playing)cursor=currentTime();
+    playing=false; starting=false; playRevision++; audio.stop(); $('play').textContent='PLAY';
+  }
+  async function play() {
+    if(!data)return;
+    if(cursor>=duration)cursor=0;
+    const token=++playRevision;
+    starting=true; $('play').textContent='PAUSE';
+    try {
+      if(data.has_audio) {
+        $('audio-status').textContent='Buffering synchronized audio…';
+        if(!await audio.start(session,cursor,Number($('speed').value),duration))return;
+      }
+      if(token!==playRevision)return;
+      clockCursor=cursor;clockStart=performance.now();playing=true;starting=false;
+      $('audio-status').textContent=data.has_audio?'Microphone audio synchronized · gaps play as silence.':'No microphone audio in this recording.';
+      if(cursor<windowStart||cursor>windowStart+50)loadWindow();
+    }catch(error){if(token===playRevision){pause();$('audio-status').textContent=error.message;}}
+  }
   async function load() {
-    $('voice-audio').pause(); $('voice-audio').removeAttribute('src');
-    if(audioUrl) { URL.revokeObjectURL(audioUrl); audioUrl=null; }
-    pause(); generation++; session=$('sessions').value; cursor=0; data=null; frameIndex=null;
+    pause(); audio.reset(); generation++; session=$('sessions').value; cursor=0; data=null; frameIndex=null;
+    lastPerformance='';window.dispatchEvent(new CustomEvent('recording-performance',{detail:{state:null,history:[]}}));
     $('frame').removeAttribute('src'); $('no-frame').hidden=false;
-    $('play').disabled=true; $('notice').textContent='Loading recording index…';
+    $('play').disabled=true; $('seek').disabled=true; $('mute-audio').disabled=true; $('notice').textContent='Loading recording index…';
     while(loading) await new Promise(resolve=>setTimeout(resolve,40));
     await loadWindow();
   }
   function plot(id,title,series) {
     const canvas=$(id), ctx=canvas.getContext('2d'), ratio=window.devicePixelRatio||1;
-    const width=canvas.clientWidth, height=160; canvas.width=width*ratio; canvas.height=height*ratio; ctx.scale(ratio,ratio);
+    const width=canvas.clientWidth, height=canvas.clientHeight||160; canvas.width=width*ratio; canvas.height=height*ratio; ctx.scale(ratio,ratio);
     const style=getComputedStyle(document.documentElement), fg=style.getPropertyValue('--dim'), edge=style.getPropertyValue('--edge');
     const values=series.flatMap(s=>s.values.map(v=>v[1])).filter(Number.isFinite);
     let low=values.length?Math.min(...values):0, high=values.length?Math.max(...values):1;
     if(high-low<.1){low-=1;high+=1;} const pad=(high-low)*.08; low-=pad;high+=pad;
-    const x=t=>45+(width-60)*(t-windowStart)/60, y=v=>height-24-(height-52)*(v-low)/(high-low);
+    const x=t=>45+(width-60)*(t-windowStart)/60, y=v=>height-24-(height-72)*(v-low)/(high-low);
     ctx.font='11px system-ui';ctx.fillStyle=fg;ctx.fillText(title,5,13);
     for(let i=0;i<3;i++){const v=low+(high-low)*i/2;ctx.fillText(v.toFixed(1),0,y(v)+4);ctx.strokeStyle=edge;ctx.beginPath();ctx.moveTo(43,y(v));ctx.lineTo(width-10,y(v));ctx.stroke();}
-    series.forEach((s,i)=>{ctx.strokeStyle=colors[i%colors.length];ctx.beginPath();let open=false;for(const [t,v]of s.values){if(!Number.isFinite(v)){open=false;continue;}if(!open){ctx.moveTo(x(t),y(v));open=true;}else ctx.lineTo(x(t),y(v));}ctx.stroke();ctx.fillStyle=colors[i%colors.length];ctx.fillText(s.name,120+i*52,13);});
+    series.forEach((s,i)=>{ctx.strokeStyle=colors[i%colors.length];ctx.beginPath();let open=false;for(const [t,v]of s.values){if(!Number.isFinite(v)){open=false;continue;}if(!open){ctx.moveTo(x(t),y(v));open=true;}else ctx.lineTo(x(t),y(v));}ctx.stroke();ctx.fillStyle=colors[i%colors.length];ctx.fillText(s.name,45+i*(width-50)/series.length,30);});
     ctx.strokeStyle=colors[0];ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(x(cursor),22);ctx.lineTo(x(cursor),height-24);ctx.stroke();ctx.setLineDash([]);
     ctx.fillStyle=fg;ctx.fillText(format(windowStart),45,height-5);ctx.fillText(format(windowStart+60),width-65,height-5);
   }
@@ -93,6 +116,22 @@
     const state=at(data.states,cursor),robot=state?.robot||{},flex=robot.flex_hardware||{};
     const task=robot.task;
     readings('state',[['Task',task?`${task.id} · ${task.name}`:'—'],['Phase',task?.phase],['ARM',robot.joints_received?'Connected':'Unavailable'],['Flex',flex.connected?'Connected':'Unavailable'],['Bend',flex.bend??robot.flex_theta_total_deg],['Roll',flex.roll??robot.flex_base_yaw],['Tracking',flex.tracking_state],['Camera',state?.camera?.ready?'Ready':'Unavailable']]);
+    const chips=systemStatus(robot);
+    for(const [id,label,chip] of [
+      ['replay-arm','ARM',chips['arm-status']],['replay-flex','FLEX',chips['flex-connection']],
+      ['replay-motion','MOTION',chips['motion-status']],['replay-task','TASK',taskStatus(task)],
+      ['replay-llm','LLM',speechStatus(state?.llm||{})]
+    ]) {$(id).textContent=`${label} ${chip.label}`;$(id).dataset.tone=chip.tone;}
+    const history=(data.performance||[]).filter(([t])=>t<=cursor && t>=cursor-60);
+    const latest=at(data.performance||[],cursor);
+    const row=[...(data.performance||[])].reverse().find(([t])=>t<=cursor);
+    const valid=latest?.status==='ready' && Number.isFinite(latest.sample_age_s) && row && cursor-row[0]+latest.sample_age_s<=5;
+    const signature=`${valid}:${row?.[0]}:${windowStart}`;
+    if(signature!==lastPerformance){
+      lastPerformance=signature;
+      window.dispatchEvent(new CustomEvent('recording-performance',{detail:{state:valid?latest:null,
+        history:history.filter(([,s])=>s.status==='ready' && s.sample_age_s<=5).map(([,s])=>s)}}));
+    }
     const value=(s,key,index)=>{const r=s.robot||{},f=r.flex_hardware||{};if(key==='bend')return f.bend??r.flex_theta_total_deg;if(key==='roll')return f.roll??(Number.isFinite(r.flex_base_yaw)?r.flex_base_yaw*180/Math.PI:null);if(key==='tendon'){const t=f.tendons??r.tendons;return Array.isArray(t)?t[index]:t?.[['R','G','B','Y'][index]]?.[0];}return r[key]?.[index];};
     const series=(name,key,index)=>({name,values:data.states.map(([t,s])=>[t,value(s,key,index)])});
     plot('joints','UR5 · degrees',Array.from({length:6},(_,i)=>series(`J${i+1}`,'joints_deg',i)));
@@ -101,32 +140,22 @@
     const frame=at(data.frames.map(f=>[f.time,f]),cursor);
     if(frame)showFrame(frame.index);else{$('frame').removeAttribute('src');$('no-frame').hidden=false;frameIndex=null;nextFrame=null;}
     const yolo=at(data.yolo,cursor);$('frame-status').textContent=frame?`Frame ${frame.index} · ${format(frame.time)} · ${yolo?.detections?.length??0} detections`: 'No recorded frame before this time';
-    events();const config=JSON.stringify(at(data.configs,cursor)||{},null,2);if(config!==lastConfig){$('config').textContent=config;lastConfig=config;}
+    events();
   }
   function tick(now) {
-    if(playing&&data&&!loading){cursor=Math.min(duration,cursor+Math.min(.25,(now-last)/1000)*Number($('speed').value));if(cursor>=duration)pause();if(cursor>windowStart+50)loadWindow();draw();}
-    last=now;requestAnimationFrame(tick);
+    if(playing&&data){cursor=currentTime();if(cursor>=duration)pause();if(cursor<windowStart||cursor>windowStart+50)loadWindow();if(now-lastDraw>40){draw();lastDraw=now;}}
+    requestAnimationFrame(tick);
   }
   $('load').addEventListener('click',load);$('refresh').addEventListener('click',async()=>{try{await sessions();if(session)await loadWindow();}catch(e){$('notice').textContent=e.message;}});
-  $('play').addEventListener('click',()=>{if(cursor>=duration)cursor=0;playing=!playing;$('play').textContent=playing?'PAUSE':'PLAY';if(cursor<windowStart)loadWindow();});
-  $('seek').addEventListener('input',()=>{cursor=Number($('seek').value);if(cursor<windowStart||cursor>windowStart+55)loadWindow();else draw();});
-  $('seek').addEventListener('change',()=>loadWindow());
+  $('play').addEventListener('click',()=>{if(playing||starting){pause();draw();}else play();});
+  let resumeAfterSeek=false;
+  $('seek').addEventListener('input',()=>{resumeAfterSeek=resumeAfterSeek||playing||starting;pause();cursor=Number($('seek').value);if(cursor<windowStart||cursor>windowStart+55)loadWindow();else draw();});
+  $('seek').addEventListener('change',async()=>{await loadWindow();if(resumeAfterSeek){resumeAfterSeek=false;if(cursor<duration)play();else draw();}});
+  $('speed').addEventListener('change',()=>{const resume=playing||starting;if(audio.active)cursor=audio.position();else if(playing)cursor=Math.min(duration,clockCursor+(performance.now()-clockStart)/1000*previousSpeed);playing=false;pause();previousSpeed=Number($('speed').value);if(resume)play();});
+  let previousSpeed=Number($('speed').value);
+  $('mute-audio').addEventListener('click',()=>{audio.mute(!audio.muted);$('mute-audio').setAttribute('aria-pressed',String(audio.muted));$('mute-audio').textContent=audio.muted?'Unmute audio':'Mute audio';});
   $('raw-camera').addEventListener('change',()=>{frameIndex=null;draw();});
-  $('listen-audio').addEventListener('click',async()=>{
-    if(!session)return;
-    const token=generation, start=cursor;
-    $('voice-audio').pause(); $('listen-audio').disabled=true;
-    try {
-      const response=await fetch(`/api/viewer/audio?session=${encodeURIComponent(session)}&start=${start}&duration=15`,{signal:AbortSignal.timeout(20000)});
-      if(!response.ok){const result=await response.json();throw new Error(result.error);}
-      const blob=await response.blob(); if(token!==generation)return;
-      if(audioUrl)URL.revokeObjectURL(audioUrl);
-      audioUrl=URL.createObjectURL(blob);$('voice-audio').src=audioUrl;
-      $('audio-status').textContent=`Microphone audio from ${format(start)}. Missing audio is silent.`;
-      await $('voice-audio').play();
-    }catch(error){$('audio-status').textContent=error.message;}
-    finally{$('listen-audio').disabled=false;}
-  });
+  window.addEventListener('pagehide',()=>pause());
   window.addEventListener('resize',draw);new MutationObserver(draw).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
   sessions().catch(e=>{$('notice').textContent=e.message;});requestAnimationFrame(tick);
 })();
