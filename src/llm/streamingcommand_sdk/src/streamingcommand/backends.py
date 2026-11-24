@@ -13,13 +13,15 @@ async def build_backends(config: StreamingConfig):
     from ._runtime.device_policy import resolve_device
     store = ModelStore.from_config(config)
     spec = config.asr
+    names = list(ASR_RESOURCES) if spec.backend != 'fake' else []
+    if config.command.enabled:
+        names.extend(('llm-base', config.command.model))
+    resolved = await asyncio.to_thread(store.ensure_many, names, parallel=config.parallel_start)
     if spec.backend == "fake":
         from ._runtime.asr_backend import FakeASR
         asr = FakeASR()
     else:
-        resources = {}
-        for name in ASR_RESOURCES:
-            resources[name] = await asyncio.to_thread(store.ensure, name)
+        resources = {name: resolved[name] for name in ASR_RESOURCES}
         # These model locations are resolved once for the single resident runtime.
         paths._overrides.update({name: str(value) for name, value in resources.items()})
         from ._runtime import acoustic_speech
@@ -46,6 +48,9 @@ async def build_backends(config: StreamingConfig):
             asr.worker = paths.WORKERS / "portable_worker.py"
             asr.worker_environment.update(STREAMINGCOMMAND_ASR_BACKEND=spec.backend)
         asr.warmup = spec.warmup
+        asr.parallel_start = config.parallel_start
+        if hasattr(asr, '_acoustic_language'):
+            asr._acoustic_language.parallel_start = config.parallel_start
         asr.worker_environment['STREAMINGCOMMAND_LOADING_WORKERS'] = str(spec.num_workers)
         asr.status['num_workers'] = spec.num_workers
         asr.gpu_uuid = spec.expected_gpu_uuid or expected_uuid
@@ -57,8 +62,8 @@ async def build_backends(config: StreamingConfig):
     command = None
     if config.command.enabled:
         llm = config.command
-        base = await asyncio.to_thread(store.ensure, "llm-base")
-        checkpoint = await asyncio.to_thread(store.ensure, llm.model)
+        base = resolved['llm-base']
+        checkpoint = resolved[llm.model]
         from ._runtime.selectable_commands import SelectableCommandParser
         command = SelectableCommandParser(model=llm.model, device=llm.device,
             python=llm.python, base_model_dir=str(base), candidates_file=llm.candidates_file,

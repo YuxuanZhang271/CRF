@@ -270,6 +270,36 @@ Except for Stop, non-tracking commands require target `none`. Tracking accepts t
 
 Fast Stop detects the standalone English word in ASR partials/finals only while LISTEN is enabled. Other partial, unresolved, duplicate, stale-generation, or superseded command results cannot start tasks. Stop invalidates older pending voice results. Keep all accepted voice tasks on the same coordinator path as dashboard tasks.
 
+### Voice loading benchmark
+
+With `crf` activated, close any running CRF speech session and run:
+
+```powershell
+python tests/benchmark_llm_loading.py --workers 8 1 4 --repeats 2
+# Also exercise recognition using the bundled recording:
+python tests/benchmark_llm_loading.py --workers 4 --repeats 1 --audio src/llm/streamingcommand_sdk/example/cantonese.wav
+```
+
+This loads the configured cached models offline, with normal verification and
+warmup, without opening a microphone, camera or robot connection. Each trial
+uses a fresh Python process and reverses worker-count order on alternate
+repeats. The OS file cache is retained, so these are repeated-launch timings,
+not measurements after reboot. Python interpreter/app imports before SDK
+startup and dashboard/perception work are outside the reported startup time.
+The benchmark reports total, resource, ASR engine, language-worker, speech-helper
+and LLM durations, plus a real parser check. Concurrent phase times overlap;
+do not add them together. JSON results and worker logs are under ignored
+`logs/llm-loading/`; use `--output PATH` to retain another run.
+
+`--sequential` disables all startup overlap for a memory-constrained comparison;
+it also serializes ASR and LLM startup. `num_workers` adjusts only Transformers'
+weight-loading pool. With `parallel_start` enabled, verification uses a separate
+bounded pool of four threads, and both CPU language helpers start alongside the
+ASR engine. Startup task groups cancel and join unfinished siblings before
+releasing their resources. Hash checks, model bank semantics, language-helper
+quantization and inference warmups are unchanged. The sequential setting keeps
+the previous resource/helper ordering.
+
 ## Recording and diagnostics
 
 Sessions use five-minute JSONL/MJPEG/WAV segments under `recordings/`. RECORD

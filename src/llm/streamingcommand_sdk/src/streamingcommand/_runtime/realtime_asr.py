@@ -9,6 +9,7 @@ from .acoustic_language import AcousticLanguageHint
 from .acoustic_vad import DEFAULT_GATE_CONFIG
 from .asr_backend import default_context, WHISPER
 from .asr_profiles import ASR_PROFILE_VERSIONS
+from .startup import start_together
 
 
 def realtime_asr_class(base_class):
@@ -53,10 +54,14 @@ def realtime_asr_class(base_class):
                         and self._acoustic_language.is_loaded):
                     return self.status.get('worker_ready', dict(self.status))
                 try:
-                    ready = await super().start()
-                    self._phase('warming')
                     self._acoustic_language.logs_dir = self.logs_dir
-                    await self._acoustic_language.start()
+                    if getattr(self, 'parallel_start', False):
+                        ready, _ = await start_together(
+                            super().start(), self._acoustic_language.start())
+                    else:
+                        ready = await super().start()
+                        self._phase('warming')
+                        await self._acoustic_language.start()
                     self._phase('ready')
                     return ready
                 except BaseException:

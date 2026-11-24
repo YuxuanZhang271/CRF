@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from .config import BUNDLED_CHECKPOINTS, CHECKPOINTS, PUBLISHED_MODEL
 from ._runtime.paths import ASSETS, CACHE, model_path
@@ -109,6 +110,16 @@ class ModelStore:
                 if step != entry["expected_step"]:
                     raise ValueError(f"{name}: expected step {entry['expected_step']}, found {step} in {path}")
         return path
+
+    def ensure_many(self, names, *, parallel=False):
+        """Verify independent resources with bounded I/O concurrency and unchanged hash checks."""
+        names = list(names)
+        if parallel and len(names) > 1:
+            # Hashing releases the GIL. Bound simultaneous reads and buffers, rather
+            # than tying disk concurrency to Transformers' tensor-loading threads.
+            with ThreadPoolExecutor(max_workers=min(4, len(names))) as pool:
+                return dict(zip(names, pool.map(self.ensure, names)))
+        return {name: self.ensure(name) for name in names}
 
     def _resolve(self, name, entry):
         """Resolve local or packaged files, or return a pinned Hugging Face model directory."""

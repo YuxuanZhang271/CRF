@@ -49,15 +49,8 @@ class StreamingCommand:
                     backend.status['startup_seconds'] = time.perf_counter() - started
                 backends = [b for b in (self.asr, self.commands) if b is not None]
                 if self.config.parallel_start:
-                    # Cancel and join sibling startup before releasing either backend.
-                    jobs = [asyncio.create_task(start_backend(b)) for b in backends]
-                    try:
-                        await asyncio.gather(*jobs)
-                    finally:
-                        for job in jobs:
-                            if not job.done():
-                                job.cancel()
-                        await asyncio.gather(*jobs, return_exceptions=True)
+                    from ._runtime.startup import start_together
+                    await start_together(*(start_backend(b) for b in backends))
                 else:
                     for backend in backends:
                         await start_backend(backend)

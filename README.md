@@ -199,6 +199,10 @@ The app recognizes speech in the background. Press **LISTEN** or `Alt+L` to enab
 
 Beside **LISTEN**, **Loading 12.3s** shows elapsed model startup time; once both ASR and LLM are ready, **Loaded in 12.3s** retains the total startup duration, including resource verification and warmup. Reloading the dashboard or toggling LISTEN preserves this time.
 
+Speech startup loads ASR, LLM and CPU language helpers concurrently. See
+[voice setup](src/llm/README.md) for loading-thread settings and a hardware-free
+startup benchmark.
+
 With LISTEN enabled, the standalone English word **stop** triggers Task 0 as soon as it appears in recognition. Turning LISTEN off leaves an already-running task active; use INTERRUPT or `I` to stop it. Voice tracking resolves names against the active perception mode's categories; a command without a named target uses the selected category. Surgical names require Full mode.
 
 ## Keyboard shortcuts

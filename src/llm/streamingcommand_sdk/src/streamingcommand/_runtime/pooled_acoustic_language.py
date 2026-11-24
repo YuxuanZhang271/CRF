@@ -6,6 +6,7 @@ from collections import OrderedDict
 import hashlib
 
 from .acoustic_language import AcousticLanguageHint
+from .startup import start_together
 
 
 class PooledAcousticLanguageHint(AcousticLanguageHint):
@@ -17,6 +18,7 @@ class PooledAcousticLanguageHint(AcousticLanguageHint):
         if workers < 1 or cache_size < 0:
             raise ValueError('Invalid language pool bounds')
         self.worker_count = workers
+        self.parallel_start = False
         self.cache_size = cache_size
         self._peers = []
         self._available = None
@@ -36,7 +38,6 @@ class PooledAcousticLanguageHint(AcousticLanguageHint):
             if self._available is not None:
                 return
             try:
-                await super().start()
                 for _ in range(self.worker_count - 1):
                     peer = AcousticLanguageHint('cpu', self.model_dir, int8=self.int8,
                         condition_english=self.condition_english,
@@ -44,7 +45,12 @@ class PooledAcousticLanguageHint(AcousticLanguageHint):
                         feature_dither=self.feature_dither)
                     peer.logs_dir = self.logs_dir
                     self._peers.append(peer)
-                    await peer.start()
+                if self.parallel_start:
+                    await start_together(super().start(), *(peer.start() for peer in self._peers))
+                else:
+                    await super().start()
+                    for peer in self._peers:
+                        await peer.start()
                 self._available = asyncio.Queue()
                 for worker in [self, *self._peers]:
                     self._available.put_nowait(worker)

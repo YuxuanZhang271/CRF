@@ -6,6 +6,7 @@ from .asr_profiles import ASR_PROFILE_VERSIONS
 from .temporal_language import history_agrees
 from .pooled_acoustic_language import PooledAcousticLanguageHint
 from .acoustic_speech import AcousticSpeechEvidence
+from .startup import start_together
 
 
 def temporal_stream_asr_class(base_class):
@@ -56,11 +57,14 @@ def temporal_stream_asr_class(base_class):
             readiness.
             """
             try:
-                ready=await super().start()
-                if self._speech_evidence is not None:
-                    self._phase('warming')
-                    await self._speech_evidence.start()
-                    self._phase('ready')
+                if self._speech_evidence is not None and getattr(self, 'parallel_start', False):
+                    ready, _ = await start_together(super().start(), self._speech_evidence.start())
+                else:
+                    ready=await super().start()
+                    if self._speech_evidence is not None:
+                        self._phase('warming')
+                        await self._speech_evidence.start()
+                self._phase('ready')
                 return ready
             except BaseException:
                 await self.close()

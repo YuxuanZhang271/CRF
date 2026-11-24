@@ -78,17 +78,24 @@ timeouts report their cause without starting tracking.
 App options: `--llm-config PATH` selects another SDK JSON configuration and
 `--microphone NAME` selects an input device by name. LISTEN starts off.
 
-The app's `settings.json` enables `parallel_start` and sets `asr.num_workers`
-and `command.num_workers` to **8** each (valid range 1–32). ASR and LLM start
-concurrently in their existing isolated processes; these counts control weight
-loading threads, without creating extra inference engines. Set `parallel_start`
-to `false` for sequential startup if simultaneous loading uses too much memory,
-or reduce either worker count. Restart the app after changing settings. Startup
-seconds (total, resource resolution/verification, and each backend), worker settings, and worker log paths appear in model-ready
-diagnostics and recordings. Performance depends on storage, CPU and available
-memory; no fixed speedup is assumed. Cached model hash verification and ASR/LLM
-warmup still run. The app and native ASR worker select this checkout's vendored
-SDK, so a stale editable install pointing at another copy cannot override it.
+The app's `settings.json` enables `parallel_start`. ASR and LLM start
+concurrently in their existing isolated processes. The CPU language workers
+also load alongside the ASR engine and each other. Resource verification uses
+at most four concurrent file-checking threads, with all pinned sizes and SHA-256
+hashes still checked on every startup. All model warmups finish before the
+recognizer is ready. `asr.num_workers` and `command.num_workers` default to **4**
+each (valid range 1–32) and control only Transformers weight-loading threads;
+they do not create inference engines or accelerate the language helpers, verification, imports,
+or warmup. More threads need not reduce startup time. Set `parallel_start` to
+`false` for sequential startup if simultaneous loading uses too much memory.
+Restart the app after changing settings. Startup seconds (total, resource
+resolution/verification, and each backend), worker settings, and worker log
+paths appear in model-ready diagnostics and recordings. Performance depends
+on storage, CPU and available memory; no fixed speedup is assumed. Use the
+hardware-free [loading benchmark](../../docs/DEVELOPMENT.md#voice-loading-benchmark)
+to compare worker counts on your PC. The app and native ASR worker select this
+checkout's vendored SDK, so a stale editable install pointing at another copy
+cannot override it.
 
 Transformers **5.23.0**, pinned by CRF, already loads asynchronously and uses an
 internal `core_model_loading.GLOBAL_WORKERS` limit (normally four). The vendored
